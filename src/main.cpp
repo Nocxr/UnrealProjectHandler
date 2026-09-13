@@ -77,6 +77,7 @@ struct AppState {
     int log_selection_anchor = -1;
     std::atomic<bool> process_running{false};
     std::atomic<bool> stop_requested{false};
+    std::atomic<bool> catalog_running{false};
     std::mutex mutex;
 };
 
@@ -1191,6 +1192,29 @@ static std::string install_code_for_tool(const ToolRow& tool) {
     return meta_for_tool(tool).code;
 }
 
+static void check_catalog_update_async(bool update) {
+    if (g.catalog_running.exchange(true)) {
+        log_line("[ERROR] Catalog update already running.");
+        return;
+    }
+    log_line(update ? "[SYSTEM] Updating tool catalog..." : "[SYSTEM] Checking tool catalog...");
+    std::thread([update] {
+        auto remote = fetch_github_tool_catalog();
+        if (remote.empty()) {
+            log_line("[ERROR] Could not fetch GitHub tool catalog.");
+        } else if (update) {
+            write_file_text(tool_catalog_path(), remote);
+            load_tool_catalog();
+            log_line("[SYSTEM] Tool catalog updated from GitHub.");
+        } else if (normalized_text(remote) == normalized_text(read_file_text(tool_catalog_path()))) {
+            log_line("[SYSTEM] Tool catalog is up to date.");
+        } else {
+            log_line("[SYSTEM] Tool catalog update available.");
+        }
+        g.catalog_running = false;
+    }).detach();
+}
+
 static bool tool_override_uses_folder(const ToolRow& tool) {
     auto name = tool.name;
     return name.find("SDK") != std::string::npos ||
@@ -1201,28 +1225,19 @@ static bool tool_override_uses_folder(const ToolRow& tool) {
 }
 
 static void draw_settings_ui() {
-    if (ImGui::Button("Reload Tool Catalog")) {
-        load_tool_catalog();
-    }
+    if (ImGui::Button("Reload Tool Catalog")) load_tool_catalog();
     ImGui::SameLine();
-    if (ImGui::Button("Check Catalog Update")) {
-        auto remote = fetch_github_tool_catalog();
-        if (remote.empty()) log_line("[ERROR] Could not fetch GitHub tool catalog.");
-        else if (normalized_text(remote) == normalized_text(read_file_text(tool_catalog_path()))) log_line("[SYSTEM] Tool catalog is up to date.");
-        else log_line("[SYSTEM] Tool catalog update available.");
-    }
+    if (g.catalog_running) ImGui::BeginDisabled();
+    if (ImGui::Button("Check Catalog Update")) check_catalog_update_async(false);
     ImGui::SameLine();
-    if (ImGui::Button("Update Catalog")) {
-        auto remote = fetch_github_tool_catalog();
-        if (remote.empty()) log_line("[ERROR] Could not fetch GitHub tool catalog.");
-        else {
-            write_file_text(tool_catalog_path(), remote);
-            load_tool_catalog();
-            log_line("[SYSTEM] Tool catalog updated from GitHub.");
-        }
-    }
+    if (ImGui::Button("Update Catalog")) check_catalog_update_async(true);
+    if (g.catalog_running) ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Open Catalog Folder")) open_path(tool_catalog_path().parent_path());
+    if (g.catalog_running) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Working...");
+    }
     ImGui::TextDisabled("%s", tool_catalog_path().string().c_str());
     if (!g.tool_catalog_versions.empty()) {
         g.tool_catalog_version = std::clamp(g.tool_catalog_version, 0, (int)g.tool_catalog_versions.size() - 1);
@@ -1257,7 +1272,9 @@ static void draw_settings_ui() {
                 auto current = g.tool_overrides.contains(key) ? g.tool_overrides[key].string() : std::string{};
                 std::array<char, 4096> buffer{};
                 std::snprintf(buffer.data(), buffer.size(), "%s", current.c_str());
-                ImGui::SetNextItemWidth(-150.0f);
+                float actions_width = ImGui::CalcTextSize("Browse...").x + ImGui::CalcTextSize("Clear").x +
+                                      ImGui::GetStyle().FramePadding.x * 4.0f + ImGui::GetStyle().ItemSpacing.x * 2.0f;
+                ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - actions_width));
                 if (ImGui::InputTextWithHint("##override", "Manual override path", buffer.data(), buffer.size())) {
                     if (buffer[0]) g.tool_overrides[key] = buffer.data();
                     else g.tool_overrides.erase(key);
@@ -1277,7 +1294,6 @@ static void draw_settings_ui() {
                 auto install = install_command_for_tool(tool);
                 if (!install.empty()) ImGui::TextWrapped("%s", install.c_str());
                 auto code = install_code_for_tool(tool);
-                ImGui::SameLine();
                 if (code.empty()) ImGui::BeginDisabled();
                 if (ImGui::Button("Copy Code")) SDL_SetClipboardText(code.c_str());
                 if (code.empty()) ImGui::EndDisabled();
