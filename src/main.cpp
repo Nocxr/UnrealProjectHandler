@@ -1191,6 +1191,15 @@ static std::string install_code_for_tool(const ToolRow& tool) {
     return meta_for_tool(tool).code;
 }
 
+static bool tool_override_uses_folder(const ToolRow& tool) {
+    auto name = tool.name;
+    return name.find("SDK") != std::string::npos ||
+           name.find("platform support") != std::string::npos ||
+           name.find("Automation scripts") != std::string::npos ||
+           name.find("Managed binaries") != std::string::npos ||
+           name.find("UnrealSharp plugin") != std::string::npos;
+}
+
 static void draw_settings_ui() {
     if (ImGui::Button("Reload Tool Catalog")) {
         load_tool_catalog();
@@ -1213,11 +1222,7 @@ static void draw_settings_ui() {
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Open Catalog")) open_path(tool_catalog_path());
-    ImGui::SameLine();
     if (ImGui::Button("Open Catalog Folder")) open_path(tool_catalog_path().parent_path());
-    ImGui::SameLine();
-    if (ImGui::Button("Copy Catalog Path")) SDL_SetClipboardText(tool_catalog_path().string().c_str());
     ImGui::TextDisabled("%s", tool_catalog_path().string().c_str());
     if (!g.tool_catalog_versions.empty()) {
         g.tool_catalog_version = std::clamp(g.tool_catalog_version, 0, (int)g.tool_catalog_versions.size() - 1);
@@ -1252,19 +1257,17 @@ static void draw_settings_ui() {
                 auto current = g.tool_overrides.contains(key) ? g.tool_overrides[key].string() : std::string{};
                 std::array<char, 4096> buffer{};
                 std::snprintf(buffer.data(), buffer.size(), "%s", current.c_str());
-                ImGui::SetNextItemWidth(-280.0f);
+                ImGui::SetNextItemWidth(-150.0f);
                 if (ImGui::InputTextWithHint("##override", "Manual override path", buffer.data(), buffer.size())) {
                     if (buffer[0]) g.tool_overrides[key] = buffer.data();
                     else g.tool_overrides.erase(key);
                     refresh = true;
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Browse File")) {
-                    pick_override_file(key, current.empty() ? tool.path : fs::path(current));
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Browse Folder")) {
-                    pick_override_folder(key, current.empty() ? tool.path.parent_path() : fs::path(current));
+                if (ImGui::Button("Browse...")) {
+                    auto initial = current.empty() ? tool.path : fs::path(current);
+                    if (tool_override_uses_folder(tool)) pick_override_folder(key, fs::is_regular_file(initial) ? initial.parent_path() : initial);
+                    else pick_override_file(key, initial);
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Clear")) {
@@ -1272,11 +1275,7 @@ static void draw_settings_ui() {
                     refresh = true;
                 }
                 auto install = install_command_for_tool(tool);
-                ImGui::SameLine();
-                if (install.empty()) ImGui::BeginDisabled();
-                if (ImGui::Button("Copy Install")) SDL_SetClipboardText(install.c_str());
-                if (install.empty()) ImGui::EndDisabled();
-                if (!install.empty()) tooltip(install.c_str());
+                if (!install.empty()) ImGui::TextWrapped("%s", install.c_str());
                 auto code = install_code_for_tool(tool);
                 ImGui::SameLine();
                 if (code.empty()) ImGui::BeginDisabled();

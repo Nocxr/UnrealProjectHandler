@@ -1,6 +1,6 @@
 # UPH - Unreal Project Handler
 
-Native C++ desktop application using Dear ImGui and SDL3. Python and Tk are not required.
+Native C++ desktop application using Dear ImGui and SDL3.
 
 ## macOS
 
@@ -14,12 +14,22 @@ make run
 
 The binary is written to `build/uph`.
 
-## Windows (MSYS2 MinGW64)
+## Windows (Scoop + vcpkg)
 
-Install the compiler and SDL3 packages from an MSYS2 MinGW64 shell:
+Install the build tools and SDL3:
 
-```sh
-pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-SDL3 make pkgconf
+```powershell
+scoop install make gcc pkgconf vcpkg
+vcpkg install sdl3:x64-mingw-dynamic
+```
+
+Build from PowerShell:
+
+```powershell
+$gccBin = "$env:USERPROFILE\scoop\apps\gcc\current\bin"
+$vcpkgRoot = "$env:USERPROFILE\scoop\apps\vcpkg\current\installed\x64-mingw-dynamic"
+$env:PATH = "$gccBin;$vcpkgRoot\bin;$env:PATH"
+$env:PKG_CONFIG_PATH = "$vcpkgRoot\lib\pkgconfig"
 make -f Makefile.windows
 make -f Makefile.windows run
 ```
