@@ -1227,11 +1227,12 @@ static bool tool_override_uses_folder(const ToolRow& tool) {
 static void draw_settings_ui() {
     if (ImGui::Button("Reload Tool Catalog")) load_tool_catalog();
     ImGui::SameLine();
-    if (g.catalog_running) ImGui::BeginDisabled();
+    bool catalog_running = g.catalog_running;
+    if (catalog_running) ImGui::BeginDisabled();
     if (ImGui::Button("Check Catalog Update")) check_catalog_update_async(false);
     ImGui::SameLine();
     if (ImGui::Button("Update Catalog")) check_catalog_update_async(true);
-    if (g.catalog_running) ImGui::EndDisabled();
+    if (catalog_running) ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Open Catalog Folder")) open_path(tool_catalog_path().parent_path());
     if (g.catalog_running) {
