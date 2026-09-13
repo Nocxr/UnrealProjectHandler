@@ -1822,7 +1822,7 @@ int main(int, char**) {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     g_window = SDL_CreateWindow("UPH - Unreal Project Handler", 900, 900, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!g_window) { SDL_Log("Window creation failed: %s", SDL_GetError()); SDL_Quit(); return 1; }
-    SDL_SetWindowMinimumSize(g_window, 760, 360);
+    SDL_SetWindowMinimumSize(g_window, 900, 720);
     auto context = SDL_GL_CreateContext(g_window);
     SDL_GL_MakeCurrent(g_window, context);
     SDL_GL_SetSwapInterval(1);
@@ -1872,18 +1872,8 @@ int main(int, char**) {
         ImGui::SetNextWindowSize(main_viewport->WorkSize, ImGuiCond_Always);
         ImGui::Begin("UPH", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
-        float content_height = draw_ui();
+        draw_ui();
         ImGui::End();
-        int window_w = 0, window_h = 0;
-        SDL_GetWindowSize(g_window, &window_w, &window_h);
-        auto display = SDL_GetDisplayForWindow(g_window);
-        SDL_Rect usable{};
-        if (display && SDL_GetDisplayUsableBounds(display, &usable)) {
-            float chrome = 42.0f;
-            int desired_h = static_cast<int>(std::ceil(content_height + chrome));
-            desired_h = std::clamp(desired_h, 360, std::max(360, usable.h - 24));
-            if (std::abs(desired_h - window_h) > 8) SDL_SetWindowSize(g_window, std::max(window_w, 760), desired_h);
-        }
         if (g.show_log) draw_log_window();
         ImGui::Render();
         int width, height;
