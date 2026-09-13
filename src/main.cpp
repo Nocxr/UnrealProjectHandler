@@ -43,6 +43,7 @@ struct Target { std::string name; std::string type; };
 struct Engine { std::string label; fs::path path; };
 struct ToolRow { std::string group; std::string name; fs::path path; bool found; };
 struct ToolMeta { std::string version; std::string install; std::string code; };
+struct FavoritePlugin { std::string name; std::string url; };
 struct LogEntry { std::string text; bool error = false; };
 
 struct AppState {
@@ -58,6 +59,7 @@ struct AppState {
     int tool_catalog_version = 0;
     std::string selected_tool_catalog_version;
     std::string pending_override_key;
+    std::vector<FavoritePlugin> favorite_plugins;
     std::vector<LogEntry> logs;
     std::array<const char*, 4> configs{"Development", "Debug", "Shipping", "Test"};
     std::array<const char*, 5> platforms{"Windows", "Mac", "Android", "iOS", "VisionOS"};
@@ -147,17 +149,18 @@ static std::string json_escape(const std::string& text) {
     return escaped;
 }
 
-static std::string json_field(const std::string& line, const std::string& name) {
-    auto key = "\"" + name + "\"";
-    auto p = line.find(key);
+static std::string json_string_value(const std::string& text, const std::string& key) {
+    auto search = "\"" + key + "\"";
+    auto p = text.find(search);
     if (p == std::string::npos) return {};
-    p = line.find(':', p);
-    p = line.find('"', p);
+    p = text.find(':', p);
+    if (p == std::string::npos) return {};
+    p = text.find('"', p);
     if (p == std::string::npos) return {};
     std::string value;
     bool escape = false;
-    for (++p; p < line.size(); ++p) {
-        char c = line[p];
+    for (++p; p < text.size(); ++p) {
+        char c = text[p];
         if (escape) {
             value += c == 'n' ? '\n' : c;
             escape = false;
@@ -170,6 +173,10 @@ static std::string json_field(const std::string& line, const std::string& name) 
         }
     }
     return value;
+}
+
+static std::string json_field(const std::string& line, const std::string& name) {
+    return json_string_value(line, name);
 }
 
 static std::string tool_key(const std::string& group, const std::string& name) {
@@ -310,6 +317,8 @@ static void save_settings() {
     out << "dock_log=" << g.dock_log << '\n';
     if (!g.selected_tool_catalog_version.empty()) out << "tool_catalog_version=" << g.selected_tool_catalog_version << '\n';
     for (const auto& [key, path] : g.tool_overrides) if (!path.empty()) out << "tool_override=" << key << '|' << path.string() << '\n';
+    for (const auto& plugin : g.favorite_plugins) if (!plugin.name.empty() && !plugin.url.empty())
+        out << "favorite_plugin=" << plugin.name << '|' << plugin.url << '\n';
     for (size_t i = 0; i < g.operations.size(); ++i) out << "operation" << i << '=' << g.operations[i] << '\n';
 }
 
@@ -338,6 +347,11 @@ static void load_settings() {
             else if (key == "tool_override") {
                 auto split_override = value.find('|');
                 if (split_override != std::string::npos) g.tool_overrides[value.substr(0, split_override)] = value.substr(split_override + 1);
+            }
+            else if (key == "favorite_plugin") {
+                auto split_override = value.find('|');
+                if (split_override != std::string::npos && !value.substr(split_override + 1).empty())
+                    g.favorite_plugins.push_back({value.substr(0, split_override), value.substr(split_override + 1)});
             }
             else if (key.rfind("operation", 0) == 0) {
                 auto index = static_cast<size_t>(std::stoi(key.substr(9)));
@@ -931,6 +945,17 @@ static void open_path(const fs::path& path) {
 #endif
 }
 
+static void open_url(const std::string& url) {
+    if (url.empty()) return;
+#ifdef _WIN32
+    auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", std::wstring(url.begin(), url.end()).c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+    if (result <= 32) log_line("[ERROR] Could not open URL: " + url);
+#else
+    std::string command = "open " + quote(fs::path(url));
+    std::system(command.c_str());
+#endif
+}
+
 static void launch_editor(bool game) {
     if (!fs::exists(editor_path()) || !fs::exists(g.project)) { log_line("[ERROR] Select a valid engine and project first."); return; }
 #ifdef _WIN32
@@ -1309,18 +1334,165 @@ static void draw_settings_ui() {
     }
 }
 
-static void draw_project_ui() {
-    if (ImGui::CollapsingHeader("Project", ImGuiTreeNodeFlags_DefaultOpen)) {
-        path_row("Project", g.project, "Browse...", pick_project);
-        bool can_launch_project = fs::is_regular_file(g.project) && fs::exists(editor_path());
-        if (ImGui::Button("Open Project Folder")) open_path(g.project.parent_path());
-        ImGui::SameLine();
-        if (readiness_button("Launch in Editor", can_launch_project)) launch_editor(false);
-        ImGui::SameLine();
-        if (readiness_button("Run Game", can_launch_project)) launch_editor(true);
+static std::vector<fs::path> list_plugins(const fs::path& root) {
+    std::vector<fs::path> result;
+    std::error_code ec;
+    if (root.empty() || !fs::exists(root, ec)) return result;
+    for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
+        if (entry.path().extension() != ".uplugin") continue;
+        auto dir = entry.path().parent_path();
+        if (std::find(result.begin(), result.end(), dir) == result.end()) result.push_back(dir);
     }
-    if (ImGui::CollapsingHeader("Engine", ImGuiTreeNodeFlags_DefaultOpen)) {
-        std::string current = g.engine.empty() ? "No Unreal installations found" : engine_version(g.engine);
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+static fs::path engine_marketplace_dir() {
+    if (g.engine.empty()) return {};
+    return g.engine / "Engine/Plugins/Marketplace";
+}
+
+static std::string plugin_display_name(const fs::path& dir) {
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (entry.path().extension() != ".uplugin") continue;
+        auto friendly = json_string_value(read_text(entry.path()), "FriendlyName");
+        if (!friendly.empty()) return friendly;
+        return entry.path().stem().string();
+    }
+    return dir.filename().string();
+}
+
+static std::string name_from_plugin_url(const std::string& url) {
+    auto name = url;
+    auto slash = name.find_last_of("/\\");
+    if (slash != std::string::npos) name = name.substr(slash + 1);
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".git") == 0) name.erase(name.size() - 4);
+    if (name.empty()) name = url;
+    return name;
+}
+
+static void draw_plugin_list(const fs::path& root) {
+    if (root.empty()) { ImGui::TextDisabled("Select a project on the Project tab first."); return; }
+    if (!fs::exists(root)) { ImGui::TextDisabled("No plugins in %s", root.string().c_str()); return; }
+    auto plugins = list_plugins(root);
+    if (plugins.empty()) { ImGui::TextDisabled("No plugins found in %s", root.string().c_str()); return; }
+    for (const auto& dir : plugins) {
+        ImGui::PushID(dir.string().c_str());
+        ImGui::TextUnformatted(plugin_display_name(dir).c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", dir.string().c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Open")) open_path(dir);
+        ImGui::PopID();
+    }
+}
+
+static void draw_engine_marketplace_plugins() {
+    if (!ImGui::CollapsingHeader("Engine Marketplace", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    auto root = engine_marketplace_dir();
+    if (root.empty()) { ImGui::TextDisabled("Select an engine on the Engines tab first."); return; }
+    if (!fs::exists(root)) { ImGui::TextDisabled("No marketplace folder at %s", root.string().c_str()); return; }
+    draw_plugin_list(root);
+}
+
+static void draw_project_plugins() {
+    if (!ImGui::CollapsingHeader("Project Plugins", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    draw_plugin_list(g.project.empty() ? fs::path{} : g.project.parent_path() / "Plugins");
+}
+
+static void draw_favorite_plugins() {
+    if (!ImGui::CollapsingHeader("Favorite Plugins", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    ImGui::TextDisabled("Git URLs to pull plugins from. Clone installs a copy into your project's Plugins folder.");
+    static char name_buf[256];
+    static char url_buf[512];
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::InputTextWithHint("##fav_name", "Name", name_buf, sizeof(name_buf));
+    ImGui::SameLine();
+    auto add_width = ImGui::CalcTextSize("Add").x + ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+    ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - 200.0f - ImGui::GetStyle().ItemSpacing.x - add_width));
+    bool add_clicked = ImGui::InputTextWithHint("##fav_url", "https://github.com/org/plugin.git", url_buf, sizeof(url_buf),
+                                                ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (ImGui::Button("Add")) add_clicked = true;
+    if (add_clicked && url_buf[0]) {
+        g.favorite_plugins.push_back({name_buf[0] ? name_buf : name_from_plugin_url(url_buf), url_buf});
+        name_buf[0] = 0; url_buf[0] = 0;
+        save_settings();
+    }
+    if (g.favorite_plugins.empty()) { ImGui::TextDisabled("No favorite plugins yet."); return; }
+    ImGui::Separator();
+    int remove = -1;
+    for (int i = 0; i < (int)g.favorite_plugins.size(); ++i) {
+        auto& plugin = g.favorite_plugins[i];
+        ImGui::PushID(i);
+        bool can_clone = !g.project.empty() && !g.process_running;
+        if (!can_clone) ImGui::BeginDisabled();
+        if (ImGui::SmallButton("Clone")) {
+            auto target = g.project.parent_path() / "Plugins" / plugin.name;
+            run_command("git clone " + quote(fs::path(plugin.url)) + ' ' + quote(target), "Clone Plugin " + plugin.name);
+        }
+        if (!can_clone) {
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Select a project to clone into.");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Open URL")) open_url(plugin.url);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", plugin.url.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove")) remove = i;
+        ImGui::SameLine();
+        ImGui::TextUnformatted(plugin.name.c_str());
+        ImGui::PopID();
+    }
+    if (remove >= 0) {
+        g.favorite_plugins.erase(g.favorite_plugins.begin() + remove);
+        save_settings();
+    }
+}
+
+static void draw_plugins_ui() {
+    draw_engine_marketplace_plugins();
+    draw_project_plugins();
+    draw_favorite_plugins();
+}
+
+static const Engine* active_engine() {
+    for (const auto& engine : g.engines) if (engine.path == g.engine) return &engine;
+    return nullptr;
+}
+
+static std::string engine_display_label(const Engine& engine) {
+    std::string label = engine.label;
+    int matches = 0;
+    for (const auto& other : g.engines) if (other.label == engine.label) ++matches;
+    if (matches > 1) {
+        auto suffix = engine.path.filename().string();
+        if (suffix.empty()) suffix = engine.path.string();
+        label += " (" + suffix + ")";
+    }
+    return label;
+}
+
+static void engine_combo_items() {
+    const Engine* selected = nullptr;
+    for (const auto& engine : g.engines) {
+        ImGui::PushID(&engine);
+        if (ImGui::Selectable(engine_display_label(engine).c_str(), engine.path == g.engine)) selected = &engine;
+        ImGui::PopID();
+    }
+    if (selected) {
+        g.engine = selected->path;
+        discover_engines();
+        save_settings();
+    }
+}
+
+static void draw_engine_ui() {
+    if (ImGui::CollapsingHeader("Engines", ImGuiTreeNodeFlags_DefaultOpen)) {
+        auto* active = active_engine();
+        std::string current = g.engine.empty() ? "No Unreal installations found"
+                                                : (active ? engine_display_label(*active) : engine_version(g.engine));
         float spacing = ImGui::GetStyle().ItemSpacing.x;
         float label_width = ImGui::CalcTextSize("Engine Version").x;
         float add_width = ImGui::CalcTextSize("Add Engine...").x + ImGui::GetStyle().FramePadding.x * 2.0f;
@@ -1328,9 +1500,7 @@ static void draw_project_ui() {
         float combo_width = ImGui::GetContentRegionAvail().x - label_width - add_width - refresh_width - spacing * 5.0f;
         ImGui::SetNextItemWidth(std::max(160.0f, combo_width));
         if (ImGui::BeginCombo("##engine_version", current.c_str())) {
-            for (const auto& engine : g.engines) if (ImGui::Selectable(engine.label.c_str(), engine.path == g.engine)) {
-                g.engine = engine.path; save_settings();
-            }
+            engine_combo_items();
             ImGui::EndCombo();
         }
         ImGui::SameLine();
@@ -1344,6 +1514,35 @@ static void draw_project_ui() {
         if (ImGui::Button("Open Engine Folder")) open_path(g.engine);
         ImGui::SameLine();
         if (readiness_button("Launch Editor", can_launch_editor)) launch_editor_home();
+    }
+}
+
+static void draw_project_ui() {
+    if (ImGui::CollapsingHeader("Project", ImGuiTreeNodeFlags_DefaultOpen)) {
+        path_row("Project", g.project, "Browse...", pick_project);
+        bool can_launch_project = fs::is_regular_file(g.project) && fs::exists(editor_path());
+        if (ImGui::Button("Open Project Folder")) open_path(g.project.parent_path());
+        ImGui::SameLine();
+        if (readiness_button("Launch in Editor", can_launch_project)) launch_editor(false);
+        ImGui::SameLine();
+        if (readiness_button("Run Game", can_launch_project)) launch_editor(true);
+    }
+    if (ImGui::CollapsingHeader("Selected Engine", ImGuiTreeNodeFlags_DefaultOpen)) {
+        auto* active = active_engine();
+        std::string current = g.engine.empty() ? "No Unreal installations found"
+                                                : (active ? engine_display_label(*active) : engine_version(g.engine));
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::BeginCombo("##selected_engine", current.c_str())) {
+            engine_combo_items();
+            ImGui::EndCombo();
+        }
+        tooltip("Pick the active Unreal Engine here or on the Engines tab.");
+        if (g.engine.empty()) {
+            ImGui::TextDisabled("No engine selected. Add an installation to continue.");
+            if (ImGui::Button("Add Engine...")) pick_folder(DialogKind::Engine, g.engine);
+        } else {
+            ImGui::TextDisabled("%s", g.engine.string().c_str());
+        }
     }
     if (ImGui::CollapsingHeader("Compile", ImGuiTreeNodeFlags_DefaultOpen)) {
         std::string target = g.targets.empty() ? "No project targets found" : g.targets[std::min<int>(g.compile_target, g.targets.size()-1)].name;
@@ -1466,11 +1665,16 @@ static float draw_ui() {
             draw_project_ui();
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Engines")) {
+            draw_engine_ui();
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Tooling")) {
             draw_tooling_ui();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Plugins")) {
+            draw_plugins_ui();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Settings")) {
@@ -1644,7 +1848,7 @@ int main(int, char**) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
-        if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) {
+        if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) {
             g.show_log = !g.show_log;
             save_settings();
         }
