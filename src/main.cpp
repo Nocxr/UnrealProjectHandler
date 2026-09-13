@@ -1474,6 +1474,12 @@ static std::string engine_display_label(const Engine& engine) {
     return label;
 }
 
+static std::string selected_engine_text() {
+    if (g.engine.empty()) return "Selected: no engine";
+    if (auto* active = active_engine()) return "Selected: " + engine_display_label(*active);
+    return "Selected: " + engine_version(g.engine);
+}
+
 static void engine_combo_items() {
     const Engine* selected = nullptr;
     for (const auto& engine : g.engines) {
@@ -1680,6 +1686,14 @@ static float draw_ui() {
         if (ImGui::BeginTabItem("Settings")) {
             draw_settings_ui();
             ImGui::EndTabItem();
+        }
+        auto selected = selected_engine_text();
+        float selected_width = ImGui::CalcTextSize(selected.c_str()).x;
+        float right_x = ImGui::GetWindowContentRegionMax().x - selected_width;
+        if (right_x > ImGui::GetCursorPosX() + ImGui::GetStyle().ItemSpacing.x) {
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(right_x);
+            ImGui::TextDisabled("%s", selected.c_str());
         }
         ImGui::EndTabBar();
     }
