@@ -71,7 +71,7 @@ struct AppState {
     bool clean_output = false;
     bool auto_scroll = true;
     bool clear_on_run = false;
-    bool show_log = true;
+    bool show_log = false;
     bool dock_log = true;
     std::set<int> selected_logs;
     int log_selection_anchor = -1;
@@ -1455,6 +1455,7 @@ static void draw_project_ui() {
     if (!g.show_log) ImGui::BeginDisabled();
     ImGui::Checkbox("Lock Log to Side", &g.dock_log);
     if (!g.show_log) ImGui::EndDisabled();
+    ImGui::TextDisabled("Press ` to show or hide the build log.");
     save_settings();
 }
 
@@ -1642,6 +1643,10 @@ int main(int, char**) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
+        if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) {
+            g.show_log = !g.show_log;
+            save_settings();
+        }
         auto* main_viewport = ImGui::GetMainViewport();
         ImGui::SetNextWindowViewport(main_viewport->ID);
         ImGui::SetNextWindowPos(main_viewport->WorkPos, ImGuiCond_Always);
