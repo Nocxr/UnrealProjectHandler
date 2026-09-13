@@ -11,10 +11,12 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <memory>
 #include <optional>
@@ -25,6 +27,7 @@
 #include <vector>
 
 #ifdef _WIN32
+#include <shellapi.h>
 #include <windows.h>
 #define popen _popen
 #define pclose _pclose
@@ -39,6 +42,7 @@ namespace fs = std::filesystem;
 struct Target { std::string name; std::string type; };
 struct Engine { std::string label; fs::path path; };
 struct ToolRow { std::string group; std::string name; fs::path path; bool found; };
+struct ToolMeta { std::string version; std::string install; std::string code; };
 struct LogEntry { std::string text; bool error = false; };
 
 struct AppState {
@@ -48,6 +52,12 @@ struct AppState {
     std::vector<Engine> engines;
     std::vector<Target> targets;
     std::vector<ToolRow> tools;
+    std::map<std::string, fs::path> tool_overrides;
+    std::map<std::string, std::map<std::string, ToolMeta>> tool_catalogs;
+    std::vector<std::string> tool_catalog_versions;
+    int tool_catalog_version = 0;
+    std::string selected_tool_catalog_version;
+    std::string pending_override_key;
     std::vector<LogEntry> logs;
     std::array<const char*, 4> configs{"Development", "Debug", "Shipping", "Test"};
     std::array<const char*, 5> platforms{"Windows", "Mac", "Android", "iOS", "VisionOS"};
@@ -61,6 +71,7 @@ struct AppState {
     bool clean_output = false;
     bool auto_scroll = true;
     bool clear_on_run = false;
+    bool show_log = true;
     bool dock_log = true;
     std::set<int> selected_logs;
     int log_selection_anchor = -1;
@@ -71,6 +82,8 @@ struct AppState {
 
 static AppState g;
 static SDL_Window* g_window = nullptr;
+static constexpr const char* TOOL_CATALOG_TEMPLATE_URL =
+    "https://raw.githubusercontent.com/Nocxr/UnrealProjectHandler/main/config/tool-catalog.json";
 
 static fs::path settings_path() {
 #ifdef _WIN32
@@ -79,6 +92,170 @@ static fs::path settings_path() {
     const char* base = std::getenv("HOME");
 #endif
     return fs::path(base ? base : ".") / ".uph-native.ini";
+}
+
+static fs::path tool_catalog_path() {
+    return settings_path().parent_path() / ".uph-tools.json";
+}
+
+static fs::path bundled_tool_catalog_path() {
+    return fs::current_path() / "config/tool-catalog.json";
+}
+
+static std::string read_file_text(const fs::path& path) {
+    std::ifstream in(path);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+static bool write_file_text(const fs::path& path, const std::string& text) {
+    std::ofstream out(path);
+    out << text;
+    return (bool)out;
+}
+
+static std::string normalized_text(std::string text) {
+    text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) text.pop_back();
+    return text;
+}
+
+static std::string fetch_github_tool_catalog() {
+#ifdef _WIN32
+    std::string command = std::string("powershell -NoProfile -ExecutionPolicy Bypass -Command \"")
+        + "$ProgressPreference='SilentlyContinue'; "
+        + "(Invoke-WebRequest -UseBasicParsing '" + TOOL_CATALOG_TEMPLATE_URL + "').Content\"";
+#else
+    std::string command = std::string("curl -fsSL '") + TOOL_CATALOG_TEMPLATE_URL + "'";
+#endif
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) return {};
+    char buffer[4096]{};
+    std::string output;
+    while (fgets(buffer, sizeof(buffer), pipe)) output += buffer;
+    if (pclose(pipe) != 0) return {};
+    return output;
+}
+
+static std::string json_escape(const std::string& text) {
+    std::string escaped;
+    for (char c : text) {
+        if (c == '\\' || c == '"') escaped += '\\';
+        if (c == '\n') escaped += "\\n";
+        else escaped += c;
+    }
+    return escaped;
+}
+
+static std::string json_field(const std::string& line, const std::string& name) {
+    auto key = "\"" + name + "\"";
+    auto p = line.find(key);
+    if (p == std::string::npos) return {};
+    p = line.find(':', p);
+    p = line.find('"', p);
+    if (p == std::string::npos) return {};
+    std::string value;
+    bool escape = false;
+    for (++p; p < line.size(); ++p) {
+        char c = line[p];
+        if (escape) {
+            value += c == 'n' ? '\n' : c;
+            escape = false;
+        } else if (c == '\\') {
+            escape = true;
+        } else if (c == '"') {
+            break;
+        } else {
+            value += c;
+        }
+    }
+    return value;
+}
+
+static std::string tool_key(const std::string& group, const std::string& name) {
+    return group + "|" + name;
+}
+
+static void ensure_default_tool_catalog() {
+    auto path = tool_catalog_path();
+    if (fs::exists(path)) return;
+    auto bundled = bundled_tool_catalog_path();
+    if (fs::exists(bundled)) {
+        write_file_text(path, read_file_text(bundled));
+        return;
+    }
+    std::ofstream out(path);
+    auto item = [&](const char* group, const char* tool, const std::string& version, const std::string& install, const std::string& code, bool comma = true) {
+        out << "      {\"group\":\"" << json_escape(group) << "\",\"tool\":\"" << json_escape(tool)
+            << "\",\"version\":\"" << json_escape(version) << "\",\"install\":\"" << json_escape(install)
+            << "\",\"code\":\"" << json_escape(code) << "\"}" << (comma ? "," : "") << "\n";
+    };
+    out << "{\n  \"versions\": {\n";
+#ifdef _WIN32
+    out << "    \"Default\": [\n";
+    item("Windows", "Windows command processor", "Windows built-in", "", "");
+    item("Windows", "Unreal build script", "Installed with Unreal Engine", "Install Unreal Engine with Epic Games Launcher, then refresh engine discovery.", "");
+    item("Windows", "Unreal AutomationTool", "Installed with Unreal Engine", "Install Unreal Engine with Epic Games Launcher, then refresh engine discovery.", "");
+    item("Windows", "Unreal Editor", "Installed with Unreal Engine", "Install Unreal Engine with Epic Games Launcher, then refresh engine discovery.", "");
+    item("Android", "ADB platform tools", "Android SDK platform-tools", "Install Android SDK platform-tools or run Unreal SetupAndroid.", "winget install Google.PlatformTools");
+    item("Android", "Android SDK", "Android command line tools", "Install Android Studio command line tools or run Unreal SetupAndroid.", "winget install Google.AndroidStudio");
+    item("Android", "Java runtime", "JDK 21 recommended", "Install Temurin JDK 21.", "winget install EclipseAdoptium.Temurin.21.JDK");
+    item("iOS", "OpenSSH client", "Windows OpenSSH", "Install OpenSSH client.", "winget install Microsoft.OpenSSH.Beta");
+    item("UnrealSharp Windows", "UnrealSharp plugin", "Project plugin", "Install or repair UnrealSharp in your project's Plugins folder.", "", false);
+    out << "    ]";
+    for (const char* version : {"5.4", "5.5", "5.6", "5.7", "5.8"}) {
+        out << ",\n    \"" << version << "\": [\n";
+        item("Android", "Java runtime", "JDK 21 recommended", "Install Temurin JDK 21.", "winget install EclipseAdoptium.Temurin.21.JDK");
+        item("Android", "Android SDK", std::string("UE ") + version + " Android tooling", std::string("Run SetupAndroid.bat from your UE ") + version + " install.", "");
+        item("Android", "ADB platform tools", std::string("UE ") + version + " Android tooling", std::string("Run SetupAndroid.bat from your UE ") + version + " install.", "", false);
+        out << "    ]";
+    }
+#else
+    out << "    \"Default\": [\n";
+    item("macOS", "Xcode build tools", "Current Xcode CLI tools", "Install Xcode command line tools.", "xcode-select --install");
+    item("macOS", "Apple Clang", "Current Xcode CLI tools", "Install Xcode command line tools.", "xcode-select --install");
+    item("macOS", "Metal shader compiler", "Current Xcode CLI tools", "Install Xcode command line tools.", "xcode-select --install");
+    item("macOS", "Metal library linker", "Current Xcode CLI tools", "Install Xcode command line tools.", "xcode-select --install");
+    item("iOS", "Xcode signing tools", "Current Xcode CLI tools", "Install Xcode command line tools.", "xcode-select --install");
+    item("iOS", "OpenSSH client", "OpenSSH", "Install OpenSSH.", "brew install openssh");
+    item("Android", "Java runtime", "JDK 21 recommended", "Install OpenJDK 21.", "brew install openjdk@21", false);
+    out << "    ]";
+#endif
+    out << "\n  }\n}\n";
+}
+
+static void load_tool_catalog() {
+    ensure_default_tool_catalog();
+    auto selected = !g.selected_tool_catalog_version.empty() ? g.selected_tool_catalog_version :
+        (g.tool_catalog_versions.empty() ? std::string{} :
+            g.tool_catalog_versions[std::clamp(g.tool_catalog_version, 0, (int)g.tool_catalog_versions.size() - 1)]);
+    g.tool_catalogs.clear();
+    g.tool_catalog_versions.clear();
+    std::ifstream in(tool_catalog_path());
+    std::string line, section;
+    while (std::getline(in, line)) {
+        auto quote = line.find('"');
+        auto end_quote = quote == std::string::npos ? std::string::npos : line.find('"', quote + 1);
+        if (quote != std::string::npos && end_quote != std::string::npos && line.find('[') != std::string::npos) {
+            section = line.substr(quote + 1, end_quote - quote - 1);
+            if (!g.tool_catalogs.contains(section)) {
+                g.tool_catalogs[section] = {};
+                g.tool_catalog_versions.push_back(section);
+            }
+            continue;
+        }
+        if (line.find("\"group\"") == std::string::npos) continue;
+        auto group = json_field(line, "group");
+        auto tool = json_field(line, "tool");
+        if (group.empty() || tool.empty() || section.empty()) continue;
+        g.tool_catalogs[section][tool_key(group, tool)] = {
+            json_field(line, "version"),
+            json_field(line, "install"),
+            json_field(line, "code")
+        };
+    }
+    auto match = std::find(g.tool_catalog_versions.begin(), g.tool_catalog_versions.end(), selected);
+    g.tool_catalog_version = match == g.tool_catalog_versions.end() ? 0 : (int)std::distance(g.tool_catalog_versions.begin(), match);
+    if (!g.tool_catalog_versions.empty()) g.selected_tool_catalog_version = g.tool_catalog_versions[g.tool_catalog_version];
 }
 
 static std::string quote(const fs::path& value) {
@@ -128,7 +305,10 @@ static void save_settings() {
     out << "unrealsharp_target=" << g.unrealsharp_target << '\n';
     out << "unrealsharp=" << g.unrealsharp << '\n';
     out << "clean_output=" << g.clean_output << '\n';
+    out << "show_log=" << g.show_log << '\n';
     out << "dock_log=" << g.dock_log << '\n';
+    if (!g.selected_tool_catalog_version.empty()) out << "tool_catalog_version=" << g.selected_tool_catalog_version << '\n';
+    for (const auto& [key, path] : g.tool_overrides) if (!path.empty()) out << "tool_override=" << key << '|' << path.string() << '\n';
     for (size_t i = 0; i < g.operations.size(); ++i) out << "operation" << i << '=' << g.operations[i] << '\n';
 }
 
@@ -151,7 +331,13 @@ static void load_settings() {
             else if (key == "unrealsharp_target") g.unrealsharp_target = std::stoi(value);
             else if (key == "unrealsharp") g.unrealsharp = std::stoi(value) != 0;
             else if (key == "clean_output") g.clean_output = std::stoi(value) != 0;
+            else if (key == "show_log") g.show_log = std::stoi(value) != 0;
             else if (key == "dock_log") g.dock_log = std::stoi(value) != 0;
+            else if (key == "tool_catalog_version") g.selected_tool_catalog_version = value;
+            else if (key == "tool_override") {
+                auto split_override = value.find('|');
+                if (split_override != std::string::npos) g.tool_overrides[value.substr(0, split_override)] = value.substr(split_override + 1);
+            }
             else if (key.rfind("operation", 0) == 0) {
                 auto index = static_cast<size_t>(std::stoi(key.substr(9)));
                 if (index < g.operations.size()) g.operations[index] = std::stoi(value) != 0;
@@ -185,6 +371,59 @@ static bool valid_engine(const fs::path& path) {
     return fs::exists(path / "Engine/Build/Build.version") && fs::exists(path / "Engine/Binaries");
 }
 
+#ifdef _WIN32
+static bool excluded_engine_path(const fs::path& path) {
+    auto text = path.string();
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    return text.find("fortnite") != std::string::npos;
+}
+#endif
+
+#ifdef _WIN32
+static std::vector<fs::path> registry_engine_paths() {
+    std::vector<fs::path> paths;
+    auto add_value_paths = [&](HKEY root, const char* subkey) {
+        HKEY key{};
+        if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS) return;
+        for (DWORD index = 0;; ++index) {
+            char value_name[512]{};
+            char value_data[MAX_PATH * 4]{};
+            DWORD value_name_size = sizeof(value_name);
+            DWORD value_data_size = sizeof(value_data);
+            DWORD type{};
+            auto result = RegEnumValueA(key, index, value_name, &value_name_size, nullptr, &type,
+                                        reinterpret_cast<LPBYTE>(value_data), &value_data_size);
+            if (result == ERROR_NO_MORE_ITEMS) break;
+            if (result == ERROR_SUCCESS && type == REG_SZ && value_data[0]) paths.emplace_back(value_data);
+        }
+        RegCloseKey(key);
+    };
+    auto add_version_paths = [&](HKEY root, const char* subkey) {
+        HKEY key{};
+        if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS) return;
+        for (DWORD index = 0;; ++index) {
+            char child[256]{};
+            DWORD child_size = sizeof(child);
+            auto result = RegEnumKeyExA(key, index, child, &child_size, nullptr, nullptr, nullptr, nullptr);
+            if (result == ERROR_NO_MORE_ITEMS) break;
+            if (result != ERROR_SUCCESS) continue;
+            std::string child_key = std::string(subkey) + "\\" + child;
+            char install_dir[MAX_PATH * 4]{};
+            DWORD install_dir_size = sizeof(install_dir);
+            DWORD type{};
+            if (RegGetValueA(root, child_key.c_str(), "InstalledDirectory", RRF_RT_REG_SZ, &type,
+                             install_dir, &install_dir_size) == ERROR_SUCCESS && install_dir[0]) {
+                paths.emplace_back(install_dir);
+            }
+        }
+        RegCloseKey(key);
+    };
+    add_value_paths(HKEY_CURRENT_USER, "Software\\Epic Games\\Unreal Engine\\Builds");
+    add_version_paths(HKEY_LOCAL_MACHINE, "SOFTWARE\\EpicGames\\Unreal Engine");
+    return paths;
+}
+#endif
+
 static fs::path find_on_path(const std::string& name) {
     const char* raw = std::getenv("PATH");
     if (!raw) return {};
@@ -207,6 +446,7 @@ static fs::path first_existing(std::initializer_list<fs::path> candidates) {
     return {};
 }
 
+#ifndef _WIN32
 static fs::path command_path(const std::string& command) {
     FILE* pipe = popen(command.c_str(), "r");
     if (!pipe) return {};
@@ -216,13 +456,21 @@ static fs::path command_path(const std::string& command) {
     while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
     return fs::path(line);
 }
+#endif
 
 static void inspect_tooling() {
     g.tools.clear();
     auto add = [](std::string group, std::string name, fs::path path) {
+        auto key = tool_key(group, name);
+        if (auto override = g.tool_overrides.find(key); override != g.tool_overrides.end() && !override->second.empty()) path = override->second;
         g.tools.push_back({std::move(group), std::move(name), path, !path.empty() && fs::exists(path)});
     };
     auto add_with_status = [](std::string group, std::string name, fs::path path, bool ready) {
+        auto key = tool_key(group, name);
+        if (auto override = g.tool_overrides.find(key); override != g.tool_overrides.end() && !override->second.empty()) {
+            path = override->second;
+            ready = fs::exists(path);
+        }
         g.tools.push_back({std::move(group), std::move(name), std::move(path), ready});
     };
     add("Windows", "Windows command processor", find_on_path("cmd.exe"));
@@ -324,6 +572,9 @@ static void inspect_tooling() {
 static void discover_engines() {
     g.engines.clear();
     auto add = [](const fs::path& path) {
+#ifdef _WIN32
+        if (excluded_engine_path(path)) return;
+#endif
         if (!valid_engine(path)) return;
         auto canonical = fs::weakly_canonical(path);
         if (std::none_of(g.engines.begin(), g.engines.end(), [&](const Engine& e){ return e.path == canonical; }))
@@ -331,6 +582,7 @@ static void discover_engines() {
     };
     if (!g.engine.empty()) add(g.engine);
 #ifdef _WIN32
+    for (const auto& path : registry_engine_paths()) add(path);
     for (const char* root : {"C:/Program Files/Epic Games", "D:/Epic Games"}) {
 #else
     for (const char* root : {"/Users/Shared/Epic Games", "/Applications"}) {
@@ -367,15 +619,15 @@ static void inspect_project() {
     inspect_tooling();
 }
 
-enum class DialogKind { Project, Engine, Output, SaveLog };
-struct DialogRequest { DialogKind kind; };
-struct DialogResult { DialogKind kind; fs::path path; std::string error; };
+enum class DialogKind { Project, Engine, Output, SaveLog, ToolOverrideFile, ToolOverrideFolder };
+struct DialogRequest { DialogKind kind; std::string key; };
+struct DialogResult { DialogKind kind; fs::path path; std::string error; std::string key; };
 constexpr Uint32 DIALOG_RESULT_EVENT = SDL_EVENT_USER + 1;
 
 static void SDLCALL dialog_result(void* userdata, const char* const* files, int) {
     auto request = std::unique_ptr<DialogRequest>(static_cast<DialogRequest*>(userdata));
     if (files && !files[0]) return;
-    auto* result = new DialogResult{request->kind, files ? fs::path(files[0]) : fs::path{}, files ? "" : SDL_GetError()};
+    auto* result = new DialogResult{request->kind, files ? fs::path(files[0]) : fs::path{}, files ? "" : SDL_GetError(), request->key};
     SDL_Event event{};
     event.type = DIALOG_RESULT_EVENT;
     event.user.data1 = result;
@@ -399,6 +651,12 @@ static void apply_dialog_result(std::unique_ptr<DialogResult> result) {
         g.engine = result->path;
         discover_engines();
         log_line("[SYSTEM] Engine: " + result->path.string());
+    } else if (result->kind == DialogKind::ToolOverrideFile || result->kind == DialogKind::ToolOverrideFolder) {
+        if (!result->key.empty()) {
+            g.tool_overrides[result->key] = result->path;
+            inspect_tooling();
+            log_line("[SYSTEM] Tool override: " + result->path.string());
+        }
     } else {
         if (result->kind == DialogKind::SaveLog) {
             std::ofstream out(result->path);
@@ -415,19 +673,32 @@ static void apply_dialog_result(std::unique_ptr<DialogResult> result) {
 static void pick_project() {
     static const SDL_DialogFileFilter filters[] = {{"Unreal Project", "uproject"}, {"All Files", "*"}};
     std::string initial = g.project.empty() ? std::string{} : g.project.parent_path().string();
-    SDL_ShowOpenFileDialog(dialog_result, new DialogRequest{DialogKind::Project}, g_window, filters, 2,
+    SDL_ShowOpenFileDialog(dialog_result, new DialogRequest{DialogKind::Project, {}}, g_window, filters, 2,
                            initial.empty() ? nullptr : initial.c_str(), false);
 }
 
 static void pick_folder(DialogKind kind, const fs::path& initial) {
     auto text = initial.string();
-    SDL_ShowOpenFolderDialog(dialog_result, new DialogRequest{kind}, g_window,
+    SDL_ShowOpenFolderDialog(dialog_result, new DialogRequest{kind, {}}, g_window,
+                             text.empty() ? nullptr : text.c_str(), false);
+}
+
+static void pick_override_file(const std::string& key, const fs::path& initial) {
+    static const SDL_DialogFileFilter filters[] = {{"All Files", "*"}};
+    auto text = initial.empty() ? std::string{} : (fs::is_directory(initial) ? initial : initial.parent_path()).string();
+    SDL_ShowOpenFileDialog(dialog_result, new DialogRequest{DialogKind::ToolOverrideFile, key}, g_window, filters, 1,
+                           text.empty() ? nullptr : text.c_str(), false);
+}
+
+static void pick_override_folder(const std::string& key, const fs::path& initial) {
+    auto text = initial.string();
+    SDL_ShowOpenFolderDialog(dialog_result, new DialogRequest{DialogKind::ToolOverrideFolder, key}, g_window,
                              text.empty() ? nullptr : text.c_str(), false);
 }
 
 static void save_log_dialog() {
     static const SDL_DialogFileFilter filters[] = {{"Text Log", "txt;log"}, {"All Files", "*"}};
-    SDL_ShowSaveFileDialog(dialog_result, new DialogRequest{DialogKind::SaveLog}, g_window, filters, 2, "uph-log.txt");
+    SDL_ShowSaveFileDialog(dialog_result, new DialogRequest{DialogKind::SaveLog, {}}, g_window, filters, 2, "uph-log.txt");
 }
 
 static fs::path build_script() {
@@ -588,7 +859,11 @@ static void run_command(std::string command, const std::string& name) {
     if (g.clear_on_run) { std::lock_guard lock(g.mutex); g.logs.clear(); }
     log_line("[SYSTEM] Starting " + name + ": " + command);
     std::thread([command = std::move(command), name] {
+#ifdef _WIN32
+        auto wrapped = "cmd /S /C \"" + command + " 2>&1\"";
+#else
         auto wrapped = command + " 2>&1";
+#endif
         FILE* pipe = popen(wrapped.c_str(), "r");
         if (!pipe) { log_line("[ERROR] Could not start " + name); g.process_running = false; return; }
         char buffer[4096];
@@ -647,23 +922,46 @@ static void run_command(std::string command, const std::string& name) {
 static void open_path(const fs::path& path) {
     if (path.empty() || !fs::exists(path)) { log_line("[ERROR] Path does not exist: " + path.string()); return; }
 #ifdef _WIN32
-    std::string command = "start \"\" " + quote(path);
+    auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", path.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+    if (result <= 32) log_line("[ERROR] Could not open path: " + path.string());
 #else
     std::string command = "open " + quote(path);
-#endif
     std::system(command.c_str());
+#endif
 }
 
 static void launch_editor(bool game) {
     if (!fs::exists(editor_path()) || !fs::exists(g.project)) { log_line("[ERROR] Select a valid engine and project first."); return; }
-    std::string command = quote(editor_path()) + " " + quote(g.project) + (game ? " -game -log" : "");
 #ifdef _WIN32
-    command = "start \"\" " + command;
+    std::wstring args = L"\"" + g.project.wstring() + L"\"" + (game ? L" -game -log" : L"");
+    auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", editor_path().wstring().c_str(),
+                                                          args.c_str(), nullptr, SW_SHOWNORMAL));
+    if (result <= 32) {
+        log_line("[ERROR] Could not launch Unreal Editor.");
+        return;
+    }
 #else
+    std::string command = quote(editor_path()) + " " + quote(g.project) + (game ? " -game -log" : "");
     command += " >/dev/null 2>&1 &";
-#endif
     std::system(command.c_str());
+#endif
     log_line(game ? "[SYSTEM] Game launched." : "[SYSTEM] Unreal Editor launched.");
+}
+
+static void launch_editor_home() {
+    if (!fs::exists(editor_path())) { log_line("[ERROR] Select a valid engine first."); return; }
+#ifdef _WIN32
+    auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", editor_path().wstring().c_str(),
+                                                          nullptr, nullptr, SW_SHOWNORMAL));
+    if (result <= 32) {
+        log_line("[ERROR] Could not launch Unreal Editor.");
+        return;
+    }
+#else
+    std::string command = quote(editor_path()) + " >/dev/null 2>&1 &";
+    std::system(command.c_str());
+#endif
+    log_line("[SYSTEM] Unreal Editor launched.");
 }
 
 static bool protected_output(const fs::path& path) {
@@ -709,9 +1007,45 @@ static void path_row(const char* label, const fs::path& path, const char* button
     if (ImGui::Button(button)) action();
 }
 
+static std::string wrapped_for_preview(const std::string& text, float max_width) {
+    std::string wrapped;
+    std::string line;
+    std::string word;
+    auto flush_word = [&] {
+        if (word.empty()) return;
+        auto candidate = line.empty() ? word : line + " " + word;
+        if (!line.empty() && ImGui::CalcTextSize(candidate.c_str()).x > max_width) {
+            wrapped += line + '\n';
+            line = word;
+        } else {
+            line = candidate;
+        }
+        word.clear();
+    };
+    for (char c : text) {
+        if (c == '\n') {
+            flush_word();
+            wrapped += line + '\n';
+            line.clear();
+        } else if (std::isspace(static_cast<unsigned char>(c))) {
+            flush_word();
+        } else {
+            word += c;
+        }
+    }
+    flush_word();
+    wrapped += line;
+    return wrapped;
+}
+
 static void command_preview(const std::string& command, const char* id) {
     auto shown = command.empty() ? std::string("Select an engine and project to preview the command.") : command;
-    ImGui::InputTextMultiline(id, shown.data(), shown.size() + 1, ImVec2(-1, 58), ImGuiInputTextFlags_ReadOnly);
+    float preview_width = std::max(120.0f, ImGui::GetContentRegionAvail().x - ImGui::GetStyle().FramePadding.x * 2.0f);
+    auto wrapped = wrapped_for_preview(shown, preview_width);
+    std::vector<char> buffer(wrapped.begin(), wrapped.end());
+    buffer.push_back('\0');
+    ImGui::InputTextMultiline(id, buffer.data(), buffer.size(), ImVec2(-1, 72),
+                              ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoHorizontalScroll);
 }
 
 static void tooltip(const char* text) {
@@ -784,77 +1118,216 @@ static bool package_platform_ready(int platform) {
     return ready;
 }
 
-static void draw_ui() {
+static void draw_tooling_ui() {
+    if (ImGui::Button("Refresh Tooling")) inspect_tooling();
+    if (ImGui::BeginTabBar("##tooling_tabs")) {
+        for (const char* group : {"Windows", "macOS", "Linux", "iOS", "VisionOS", "Android", "UnrealSharp"}) {
+            int found = 0, total = 0;
+            for (const auto& tool : g.tools) {
+                bool belongs = std::string(group) == "UnrealSharp" ? tool.group.rfind("UnrealSharp ", 0) == 0 : tool.group == group;
+                if (belongs) { ++total; if (tool.found) ++found; }
+            }
+            auto label = std::string(group) + " " + std::to_string(found) + "/" + std::to_string(total);
+            push_tool_tab_colors(found, total);
+            if (ImGui::BeginTabItem(label.c_str())) {
+                auto draw_rows = [](const std::string& selected_group) {
+                    for (const auto& tool : g.tools) if (tool.group == selected_group) {
+                        auto color = tool.found ? ImVec4(0.18f, 0.78f, 0.30f, 1.0f) : ImVec4(0.90f, 0.22f, 0.20f, 1.0f);
+                        ImGui::TextColored(color, "%-7s", tool.found ? "OK" : "MISSING");
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted(tool.name.c_str());
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tool.path.empty() ? "Not found" : tool.path.string().c_str());
+                    }
+                };
+                if (std::string(group) == "UnrealSharp") {
+                    if (ImGui::BeginTabBar("##unrealsharp_platform_tabs")) {
+                        for (const auto& subtab : std::array<std::pair<const char*, const char*>, 5>{{
+                            {"Windows", "UnrealSharp Windows"}, {"Mac", "UnrealSharp Mac"},
+                            {"iOS", "UnrealSharp iOS"}, {"Android", "UnrealSharp Android"},
+                            {"XROS", "UnrealSharp XROS"}}}) {
+                            int sub_found = 0, sub_total = 0;
+                            for (const auto& tool : g.tools) if (tool.group == subtab.second) { ++sub_total; if (tool.found) ++sub_found; }
+                            auto sub_label = std::string(subtab.first) + " " + std::to_string(sub_found) + "/" + std::to_string(sub_total);
+                            push_tool_tab_colors(sub_found, sub_total);
+                            if (ImGui::BeginTabItem(sub_label.c_str())) {
+                                draw_rows(subtab.second);
+                                ImGui::EndTabItem();
+                            }
+                            ImGui::PopStyleColor(4);
+                        }
+                        ImGui::EndTabBar();
+                    }
+                } else {
+                    draw_rows(group);
+                }
+                ImGui::EndTabItem();
+            }
+            ImGui::PopStyleColor(4);
+        }
+        ImGui::EndTabBar();
+    }
+}
+
+static ToolMeta meta_for_tool(const ToolRow& tool) {
+    auto key = tool_key(tool.group, tool.name);
+    auto section = g.tool_catalog_versions.empty() ? std::string{} :
+        g.tool_catalog_versions[std::clamp(g.tool_catalog_version, 0, (int)g.tool_catalog_versions.size() - 1)];
+    if (auto catalog = g.tool_catalogs.find(section); catalog != g.tool_catalogs.end())
+        if (auto found = catalog->second.find(key); found != catalog->second.end()) return found->second;
+    if (auto catalog = g.tool_catalogs.find("Default"); catalog != g.tool_catalogs.end())
+        if (auto found = catalog->second.find(key); found != catalog->second.end()) return found->second;
+    return {};
+}
+
+static std::string install_command_for_tool(const ToolRow& tool) {
+    return meta_for_tool(tool).install;
+}
+
+static std::string version_hint_for_tool(const ToolRow& tool) {
+    return meta_for_tool(tool).version;
+}
+
+static std::string install_code_for_tool(const ToolRow& tool) {
+    return meta_for_tool(tool).code;
+}
+
+static void draw_settings_ui() {
+    if (ImGui::Button("Reload Tool Catalog")) {
+        load_tool_catalog();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Check Catalog Update")) {
+        auto remote = fetch_github_tool_catalog();
+        if (remote.empty()) log_line("[ERROR] Could not fetch GitHub tool catalog.");
+        else if (normalized_text(remote) == normalized_text(read_file_text(tool_catalog_path()))) log_line("[SYSTEM] Tool catalog is up to date.");
+        else log_line("[SYSTEM] Tool catalog update available.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Update Catalog")) {
+        auto remote = fetch_github_tool_catalog();
+        if (remote.empty()) log_line("[ERROR] Could not fetch GitHub tool catalog.");
+        else {
+            write_file_text(tool_catalog_path(), remote);
+            load_tool_catalog();
+            log_line("[SYSTEM] Tool catalog updated from GitHub.");
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Open Catalog")) open_path(tool_catalog_path());
+    ImGui::SameLine();
+    if (ImGui::Button("Open Catalog Folder")) open_path(tool_catalog_path().parent_path());
+    ImGui::SameLine();
+    if (ImGui::Button("Copy Catalog Path")) SDL_SetClipboardText(tool_catalog_path().string().c_str());
+    ImGui::TextDisabled("%s", tool_catalog_path().string().c_str());
+    if (!g.tool_catalog_versions.empty()) {
+        g.tool_catalog_version = std::clamp(g.tool_catalog_version, 0, (int)g.tool_catalog_versions.size() - 1);
+        std::vector<const char*> labels;
+        for (const auto& version : g.tool_catalog_versions) labels.push_back(version.c_str());
+        if (ImGui::Combo("Catalog Version", &g.tool_catalog_version, labels.data(), (int)labels.size())) {
+            g.selected_tool_catalog_version = g.tool_catalog_versions[g.tool_catalog_version];
+            save_settings();
+        }
+    }
+    if (ImGui::CollapsingHeader("Tool Overrides")) {
+        ImGui::TextDisabled("Optional paths used instead of auto-detected tooling.");
+        bool refresh = false;
+        std::vector<std::string> groups;
+        for (const auto& tool : g.tools)
+            if (std::find(groups.begin(), groups.end(), tool.group) == groups.end()) groups.push_back(tool.group);
+        for (const auto& group : groups) {
+            int found = 0, total = 0;
+            for (const auto& tool : g.tools) if (tool.group == group) { ++total; if (tool.found) ++found; }
+            auto label = group + " " + std::to_string(found) + "/" + std::to_string(total);
+            if (!ImGui::CollapsingHeader(label.c_str())) continue;
+            for (const auto& tool : g.tools) if (tool.group == group) {
+                auto key = tool_key(tool.group, tool.name);
+                ImGui::PushID(key.c_str());
+                ImGui::SeparatorText(tool.name.c_str());
+                ImGui::TextColored(tool.found ? ImVec4(0.18f, 0.78f, 0.30f, 1.0f) : ImVec4(0.90f, 0.22f, 0.20f, 1.0f),
+                                   "%s", tool.found ? "OK" : "MISSING");
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", tool.path.empty() ? "No path detected" : tool.path.string().c_str());
+                auto version = version_hint_for_tool(tool);
+                if (!version.empty()) ImGui::TextDisabled("Version: %s", version.c_str());
+                auto current = g.tool_overrides.contains(key) ? g.tool_overrides[key].string() : std::string{};
+                std::array<char, 4096> buffer{};
+                std::snprintf(buffer.data(), buffer.size(), "%s", current.c_str());
+                ImGui::SetNextItemWidth(-280.0f);
+                if (ImGui::InputTextWithHint("##override", "Manual override path", buffer.data(), buffer.size())) {
+                    if (buffer[0]) g.tool_overrides[key] = buffer.data();
+                    else g.tool_overrides.erase(key);
+                    refresh = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Browse File")) {
+                    pick_override_file(key, current.empty() ? tool.path : fs::path(current));
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Browse Folder")) {
+                    pick_override_folder(key, current.empty() ? tool.path.parent_path() : fs::path(current));
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Clear")) {
+                    g.tool_overrides.erase(key);
+                    refresh = true;
+                }
+                auto install = install_command_for_tool(tool);
+                ImGui::SameLine();
+                if (install.empty()) ImGui::BeginDisabled();
+                if (ImGui::Button("Copy Install")) SDL_SetClipboardText(install.c_str());
+                if (install.empty()) ImGui::EndDisabled();
+                if (!install.empty()) tooltip(install.c_str());
+                auto code = install_code_for_tool(tool);
+                ImGui::SameLine();
+                if (code.empty()) ImGui::BeginDisabled();
+                if (ImGui::Button("Copy Code")) SDL_SetClipboardText(code.c_str());
+                if (code.empty()) ImGui::EndDisabled();
+                if (!code.empty()) tooltip(code.c_str());
+                ImGui::PopID();
+            }
+        }
+        if (refresh) {
+            inspect_tooling();
+            save_settings();
+        }
+    }
+}
+
+static void draw_project_ui() {
     if (ImGui::CollapsingHeader("Project", ImGuiTreeNodeFlags_DefaultOpen)) {
         path_row("Project", g.project, "Browse...", pick_project);
+        bool can_launch_project = fs::is_regular_file(g.project) && fs::exists(editor_path());
         if (ImGui::Button("Open Project Folder")) open_path(g.project.parent_path());
+        ImGui::SameLine();
+        if (readiness_button("Launch in Editor", can_launch_project)) launch_editor(false);
+        ImGui::SameLine();
+        if (readiness_button("Run Game", can_launch_project)) launch_editor(true);
     }
     if (ImGui::CollapsingHeader("Engine", ImGuiTreeNodeFlags_DefaultOpen)) {
         std::string current = g.engine.empty() ? "No Unreal installations found" : engine_version(g.engine);
-        if (ImGui::BeginCombo("Engine Version", current.c_str())) {
+        float spacing = ImGui::GetStyle().ItemSpacing.x;
+        float label_width = ImGui::CalcTextSize("Engine Version").x;
+        float add_width = ImGui::CalcTextSize("Add Engine...").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        float refresh_width = ImGui::CalcTextSize("Refresh").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        float combo_width = ImGui::GetContentRegionAvail().x - label_width - add_width - refresh_width - spacing * 5.0f;
+        ImGui::SetNextItemWidth(std::max(160.0f, combo_width));
+        if (ImGui::BeginCombo("##engine_version", current.c_str())) {
             for (const auto& engine : g.engines) if (ImGui::Selectable(engine.label.c_str(), engine.path == g.engine)) {
                 g.engine = engine.path; save_settings();
             }
             ImGui::EndCombo();
         }
         ImGui::SameLine();
+        ImGui::TextUnformatted("Engine Version");
+        ImGui::SameLine();
         if (ImGui::Button("Add Engine...")) pick_folder(DialogKind::Engine, g.engine);
         ImGui::SameLine();
         if (ImGui::Button("Refresh")) discover_engines();
         ImGui::TextDisabled("%s", g.engine.empty() ? "No engine selected" : g.engine.string().c_str());
+        bool can_launch_editor = fs::exists(editor_path());
         if (ImGui::Button("Open Engine Folder")) open_path(g.engine);
-        bool can_launch = fs::is_regular_file(g.project) && fs::exists(editor_path());
-        ImGui::SameLine(); if (readiness_button("Launch Editor", can_launch)) launch_editor(false);
-        ImGui::SameLine(); if (readiness_button("Run Game", can_launch)) launch_editor(true);
-    }
-    if (ImGui::CollapsingHeader("Tooling")) {
-        if (ImGui::Button("Refresh Tooling")) inspect_tooling();
-        if (ImGui::BeginTabBar("##tooling_tabs")) {
-            for (const char* group : {"Windows", "macOS", "Linux", "iOS", "VisionOS", "Android", "UnrealSharp"}) {
-                int found = 0, total = 0;
-                for (const auto& tool : g.tools) {
-                    bool belongs = std::string(group) == "UnrealSharp" ? tool.group.rfind("UnrealSharp ", 0) == 0 : tool.group == group;
-                    if (belongs) { ++total; if (tool.found) ++found; }
-                }
-                auto label = std::string(group) + " " + std::to_string(found) + "/" + std::to_string(total);
-                push_tool_tab_colors(found, total);
-                if (ImGui::BeginTabItem(label.c_str())) {
-                    auto draw_rows = [](const std::string& selected_group) {
-                        for (const auto& tool : g.tools) if (tool.group == selected_group) {
-                            auto color = tool.found ? ImVec4(0.18f, 0.78f, 0.30f, 1.0f) : ImVec4(0.90f, 0.22f, 0.20f, 1.0f);
-                            ImGui::TextColored(color, "%-7s", tool.found ? "OK" : "MISSING");
-                            ImGui::SameLine();
-                            ImGui::TextUnformatted(tool.name.c_str());
-                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tool.path.empty() ? "Not found" : tool.path.string().c_str());
-                        }
-                    };
-                    if (std::string(group) == "UnrealSharp") {
-                        if (ImGui::BeginTabBar("##unrealsharp_platform_tabs")) {
-                            for (const auto& subtab : std::array<std::pair<const char*, const char*>, 5>{{
-                                {"Windows", "UnrealSharp Windows"}, {"Mac", "UnrealSharp Mac"},
-                                {"iOS", "UnrealSharp iOS"}, {"Android", "UnrealSharp Android"},
-                                {"XROS", "UnrealSharp XROS"}}}) {
-                                int sub_found = 0, sub_total = 0;
-                                for (const auto& tool : g.tools) if (tool.group == subtab.second) { ++sub_total; if (tool.found) ++sub_found; }
-                                auto sub_label = std::string(subtab.first) + " " + std::to_string(sub_found) + "/" + std::to_string(sub_total);
-                                push_tool_tab_colors(sub_found, sub_total);
-                                if (ImGui::BeginTabItem(sub_label.c_str())) {
-                                    draw_rows(subtab.second);
-                                    ImGui::EndTabItem();
-                                }
-                                ImGui::PopStyleColor(4);
-                            }
-                            ImGui::EndTabBar();
-                        }
-                    } else {
-                        draw_rows(group);
-                    }
-                    ImGui::EndTabItem();
-                }
-                ImGui::PopStyleColor(4);
-            }
-            ImGui::EndTabBar();
-        }
+        ImGui::SameLine();
+        if (readiness_button("Launch Editor", can_launch_editor)) launch_editor_home();
     }
     if (ImGui::CollapsingHeader("Compile", ImGuiTreeNodeFlags_DefaultOpen)) {
         std::string target = g.targets.empty() ? "No project targets found" : g.targets[std::min<int>(g.compile_target, g.targets.size()-1)].name;
@@ -865,7 +1338,7 @@ static void draw_ui() {
         ImGui::Combo("Configuration##compile", &g.compile_config, g.configs.data(), (int)g.configs.size());
         bool can_compile = fs::is_regular_file(g.project) && fs::exists(build_script()) && !g.targets.empty() && !g.process_running;
         if (readiness_button("Compile Project", can_compile)) run_command(compile_command(), "Compile");
-        ImGui::SameLine(); if (readiness_button("Clean + Rebuild", can_compile)) run_command(compile_command(true), "Rebuild");
+        ImGui::SameLine(); if (readiness_button("Clean", can_compile)) run_command(compile_command(true), "Clean");
         ImGui::TextUnformatted("Compile Command Preview"); command_preview(compile_command(), "##compile_preview");
     }
     if (ImGui::CollapsingHeader("Package", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -962,8 +1435,34 @@ static void draw_ui() {
     ImGui::SeparatorText("Process Status");
     ImGui::TextColored(g.process_running ? ImVec4(0.90f, 0.22f, 0.20f, 1.0f) : ImVec4(0.18f, 0.78f, 0.30f, 1.0f),
                        "%s", g.process_running ? "BUSY - build operation running" : "READY - okay to compile or package");
+    ImGui::Checkbox("Show Log", &g.show_log);
+    ImGui::SameLine();
+    if (!g.show_log) ImGui::BeginDisabled();
     ImGui::Checkbox("Lock Log to Side", &g.dock_log);
+    if (!g.show_log) ImGui::EndDisabled();
     save_settings();
+}
+
+static float draw_ui() {
+    if (ImGui::BeginTabBar("##main_tabs")) {
+        if (ImGui::BeginTabItem("Project")) {
+            draw_project_ui();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Tooling")) {
+            draw_tooling_ui();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Plugins")) {
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Settings")) {
+            draw_settings_ui();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    return ImGui::GetCursorPosY();
 }
 
 static void draw_log_window() {
@@ -980,7 +1479,6 @@ static void draw_log_window() {
     ImGui::Checkbox("Auto-scroll", &g.auto_scroll); ImGui::SameLine(); ImGui::Checkbox("Clear on run", &g.clear_on_run);
     tooltip("Clear the log when a compile or package operation starts.");
     ImGui::SameLine(); if (ImGui::Button("Clear")) { std::lock_guard lock(g.mutex); g.logs.clear(); g.selected_logs.clear(); g.log_selection_anchor = -1; }
-    ImGui::SameLine();
     bool has_selection;
     {
         std::lock_guard lock(g.mutex);
@@ -1089,6 +1587,7 @@ int main(int, char**) {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     g_window = SDL_CreateWindow("UPH - Unreal Project Handler", 900, 900, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!g_window) { SDL_Log("Window creation failed: %s", SDL_GetError()); SDL_Quit(); return 1; }
+    SDL_SetWindowMinimumSize(g_window, 760, 360);
     auto context = SDL_GL_CreateContext(g_window);
     SDL_GL_MakeCurrent(g_window, context);
     SDL_GL_SetSwapInterval(1);
@@ -1112,6 +1611,7 @@ int main(int, char**) {
     ImGui_ImplSDL3_InitForOpenGL(g_window, context);
     ImGui_ImplOpenGL3_Init("#version 150");
     load_settings();
+    load_tool_catalog();
     discover_engines();
     inspect_project();
     log_line("[SYSTEM] UPH native started.");
@@ -1133,9 +1633,19 @@ int main(int, char**) {
         ImGui::SetNextWindowSize(main_viewport->WorkSize, ImGuiCond_Always);
         ImGui::Begin("UPH", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
-        draw_ui();
+        float content_height = draw_ui();
         ImGui::End();
-        draw_log_window();
+        int window_w = 0, window_h = 0;
+        SDL_GetWindowSize(g_window, &window_w, &window_h);
+        auto display = SDL_GetDisplayForWindow(g_window);
+        SDL_Rect usable{};
+        if (display && SDL_GetDisplayUsableBounds(display, &usable)) {
+            float chrome = 42.0f;
+            int desired_h = static_cast<int>(std::ceil(content_height + chrome));
+            desired_h = std::clamp(desired_h, 360, std::max(360, usable.h - 24));
+            if (std::abs(desired_h - window_h) > 8) SDL_SetWindowSize(g_window, std::max(window_w, 760), desired_h);
+        }
+        if (g.show_log) draw_log_window();
         ImGui::Render();
         int width, height;
         SDL_GetWindowSizeInPixels(g_window, &width, &height);

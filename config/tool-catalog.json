@@ -1,0 +1,40 @@
+{
+  "versions": {
+    "Default": [
+      {"group":"Windows","tool":"Windows command processor","version":"Windows built-in","install":"","code":""},
+      {"group":"Windows","tool":"Unreal build script","version":"Installed with Unreal Engine","install":"Install Unreal Engine with Epic Games Launcher, then refresh engine discovery.","code":""},
+      {"group":"Windows","tool":"Unreal AutomationTool","version":"Installed with Unreal Engine","install":"Install Unreal Engine with Epic Games Launcher, then refresh engine discovery.","code":""},
+      {"group":"Windows","tool":"Unreal Editor","version":"Installed with Unreal Engine","install":"Install Unreal Engine with Epic Games Launcher, then refresh engine discovery.","code":""},
+      {"group":"Android","tool":"ADB platform tools","version":"Android SDK platform-tools","install":"Install Android SDK platform-tools or run Unreal SetupAndroid.","code":"winget install Google.PlatformTools"},
+      {"group":"Android","tool":"Android SDK","version":"Android command line tools","install":"Install Android Studio command line tools or run Unreal SetupAndroid.","code":"winget install Google.AndroidStudio"},
+      {"group":"Android","tool":"Java runtime","version":"JDK 21 recommended","install":"Install Temurin JDK 21.","code":"winget install EclipseAdoptium.Temurin.21.JDK"},
+      {"group":"iOS","tool":"OpenSSH client","version":"Windows OpenSSH","install":"Install OpenSSH client.","code":"winget install Microsoft.OpenSSH.Beta"},
+      {"group":"UnrealSharp Windows","tool":"UnrealSharp plugin","version":"Project plugin","install":"Install or repair UnrealSharp in your project's Plugins folder.","code":""}
+    ],
+    "5.4": [
+      {"group":"Android","tool":"Java runtime","version":"JDK 21 recommended","install":"Install Temurin JDK 21.","code":"winget install EclipseAdoptium.Temurin.21.JDK"},
+      {"group":"Android","tool":"Android SDK","version":"UE 5.4 Android tooling","install":"Run SetupAndroid.bat from your UE 5.4 install.","code":""},
+      {"group":"Android","tool":"ADB platform tools","version":"UE 5.4 Android tooling","install":"Run SetupAndroid.bat from your UE 5.4 install.","code":""}
+    ],
+    "5.5": [
+      {"group":"Android","tool":"Java runtime","version":"JDK 21 recommended","install":"Install Temurin JDK 21.","code":"winget install EclipseAdoptium.Temurin.21.JDK"},
+      {"group":"Android","tool":"Android SDK","version":"UE 5.5 Android tooling","install":"Run SetupAndroid.bat from your UE 5.5 install.","code":""},
+      {"group":"Android","tool":"ADB platform tools","version":"UE 5.5 Android tooling","install":"Run SetupAndroid.bat from your UE 5.5 install.","code":""}
+    ],
+    "5.6": [
+      {"group":"Android","tool":"Java runtime","version":"JDK 21 recommended","install":"Install Temurin JDK 21.","code":"winget install EclipseAdoptium.Temurin.21.JDK"},
+      {"group":"Android","tool":"Android SDK","version":"UE 5.6 Android tooling","install":"Run SetupAndroid.bat from your UE 5.6 install.","code":""},
+      {"group":"Android","tool":"ADB platform tools","version":"UE 5.6 Android tooling","install":"Run SetupAndroid.bat from your UE 5.6 install.","code":""}
+    ],
+    "5.7": [
+      {"group":"Android","tool":"Java runtime","version":"JDK 21 recommended","install":"Install Temurin JDK 21.","code":"winget install EclipseAdoptium.Temurin.21.JDK"},
+      {"group":"Android","tool":"Android SDK","version":"UE 5.7 Android tooling","install":"Run SetupAndroid.bat from your UE 5.7 install.","code":""},
+      {"group":"Android","tool":"ADB platform tools","version":"UE 5.7 Android tooling","install":"Run SetupAndroid.bat from your UE 5.7 install.","code":""}
+    ],
+    "5.8": [
+      {"group":"Android","tool":"Java runtime","version":"JDK 21 recommended","install":"Install Temurin JDK 21.","code":"winget install EclipseAdoptium.Temurin.21.JDK"},
+      {"group":"Android","tool":"Android SDK","version":"UE 5.8 Android tooling","install":"Run SetupAndroid.bat from your UE 5.8 install.","code":""},
+      {"group":"Android","tool":"ADB platform tools","version":"UE 5.8 Android tooling","install":"Run SetupAndroid.bat from your UE 5.8 install.","code":""}
+    ]
+  }
+}
