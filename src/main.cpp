@@ -1217,6 +1217,8 @@ static std::string install_code_for_tool(const ToolRow& tool) {
     return meta_for_tool(tool).code;
 }
 
+static void draw_engine_ui();
+
 static void check_catalog_update_async(bool update) {
     if (g.catalog_running.exchange(true)) {
         log_line("[ERROR] Catalog update already running.");
@@ -1250,6 +1252,11 @@ static bool tool_override_uses_folder(const ToolRow& tool) {
 }
 
 static void draw_settings_ui() {
+    draw_engine_ui();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
     if (ImGui::Button("Reload Tool Catalog")) load_tool_catalog();
     ImGui::SameLine();
     bool catalog_running = g.catalog_running;
@@ -1390,7 +1397,7 @@ static void draw_plugin_list(const fs::path& root) {
 static void draw_engine_marketplace_plugins() {
     if (!ImGui::CollapsingHeader("Engine Marketplace", ImGuiTreeNodeFlags_DefaultOpen)) return;
     auto root = engine_marketplace_dir();
-    if (root.empty()) { ImGui::TextDisabled("Select an engine on the Engines tab first."); return; }
+    if (root.empty()) { ImGui::TextDisabled("Select an engine in Settings first."); return; }
     if (!fs::exists(root)) { ImGui::TextDisabled("No marketplace folder at %s", root.string().c_str()); return; }
     draw_plugin_list(root);
 }
@@ -1425,10 +1432,26 @@ static void draw_favorite_plugins() {
     for (int i = 0; i < (int)g.favorite_plugins.size(); ++i) {
         auto& plugin = g.favorite_plugins[i];
         ImGui::PushID(i);
+        auto target = g.project.empty() ? fs::path{} : g.project.parent_path() / "Plugins" / plugin.name;
+        auto submodule_path = fs::path("Plugins") / plugin.name;
+        bool submodule_exists = !target.empty() && fs::exists(target);
         bool can_clone = !g.project.empty() && !g.process_running;
         if (!can_clone) ImGui::BeginDisabled();
+        if (ImGui::SmallButton(submodule_exists ? "Remove Submodule" : "Add Submodule")) {
+            auto root = g.project.parent_path();
+            if (submodule_exists) {
+                auto remove_command = "git -C " + quote(root) + " submodule deinit -f -- " + quote(submodule_path) +
+                                      " && git -C " + quote(root) + " rm -f " + quote(submodule_path);
+                run_command(remove_command, "Remove Submodule " + plugin.name);
+            } else {
+                run_command("git -C " + quote(root) + " submodule add " + quote(fs::path(plugin.url)) + ' ' + quote(submodule_path),
+                            "Add Submodule " + plugin.name);
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", submodule_exists ? "Remove this plugin submodule from the project." : "Add this plugin as a project submodule.");
+        ImGui::SameLine();
         if (ImGui::SmallButton("Clone")) {
-            auto target = g.project.parent_path() / "Plugins" / plugin.name;
             run_command("git clone " + quote(fs::path(plugin.url)) + ' ' + quote(target), "Clone Plugin " + plugin.name);
         }
         if (!can_clone) {
@@ -1474,10 +1497,10 @@ static std::string engine_display_label(const Engine& engine) {
     return label;
 }
 
-static std::string selected_engine_text() {
-    if (g.engine.empty()) return "Selected: no engine";
-    if (auto* active = active_engine()) return "Selected: " + engine_display_label(*active);
-    return "Selected: " + engine_version(g.engine);
+static std::string current_engine_label() {
+    if (g.engine.empty()) return "No engine selected";
+    if (auto* active = active_engine()) return engine_display_label(*active);
+    return engine_version(g.engine);
 }
 
 static void engine_combo_items() {
@@ -1532,23 +1555,6 @@ static void draw_project_ui() {
         if (readiness_button("Launch in Editor", can_launch_project)) launch_editor(false);
         ImGui::SameLine();
         if (readiness_button("Run Game", can_launch_project)) launch_editor(true);
-    }
-    if (ImGui::CollapsingHeader("Selected Engine", ImGuiTreeNodeFlags_DefaultOpen)) {
-        auto* active = active_engine();
-        std::string current = g.engine.empty() ? "No Unreal installations found"
-                                                : (active ? engine_display_label(*active) : engine_version(g.engine));
-        ImGui::SetNextItemWidth(-1.0f);
-        if (ImGui::BeginCombo("##selected_engine", current.c_str())) {
-            engine_combo_items();
-            ImGui::EndCombo();
-        }
-        tooltip("Pick the active Unreal Engine here or on the Engines tab.");
-        if (g.engine.empty()) {
-            ImGui::TextDisabled("No engine selected. Add an installation to continue.");
-            if (ImGui::Button("Add Engine...")) pick_folder(DialogKind::Engine, g.engine);
-        } else {
-            ImGui::TextDisabled("%s", g.engine.string().c_str());
-        }
     }
     if (ImGui::CollapsingHeader("Compile", ImGuiTreeNodeFlags_DefaultOpen)) {
         std::string target = g.targets.empty() ? "No project targets found" : g.targets[std::min<int>(g.compile_target, g.targets.size()-1)].name;
@@ -1665,14 +1671,31 @@ static void draw_project_ui() {
     save_settings();
 }
 
+static void draw_top_engine_selector() {
+    std::string label = "Selected Engine";
+    std::string current = current_engine_label();
+    float combo_width = std::clamp(ImGui::CalcTextSize(current.c_str()).x + ImGui::GetStyle().FramePadding.x * 4.0f, 180.0f, 360.0f);
+    float label_width = ImGui::CalcTextSize(label.c_str()).x;
+    float width = label_width + ImGui::GetStyle().ItemSpacing.x + combo_width;
+    float right_x = ImGui::GetWindowContentRegionMax().x - width;
+    if (right_x <= ImGui::GetCursorPosX() + ImGui::GetStyle().ItemSpacing.x) return;
+
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(right_x);
+    ImGui::TextDisabled("%s", label.c_str());
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(combo_width);
+    if (ImGui::BeginCombo("##top_selected_engine", current.c_str())) {
+        engine_combo_items();
+        ImGui::EndCombo();
+    }
+    tooltip("Pick the active Unreal Engine.");
+}
+
 static float draw_ui() {
     if (ImGui::BeginTabBar("##main_tabs")) {
         if (ImGui::BeginTabItem("Project")) {
             draw_project_ui();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Engines")) {
-            draw_engine_ui();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Tooling")) {
@@ -1687,14 +1710,7 @@ static float draw_ui() {
             draw_settings_ui();
             ImGui::EndTabItem();
         }
-        auto selected = selected_engine_text();
-        float selected_width = ImGui::CalcTextSize(selected.c_str()).x;
-        float right_x = ImGui::GetWindowContentRegionMax().x - selected_width;
-        if (right_x > ImGui::GetCursorPosX() + ImGui::GetStyle().ItemSpacing.x) {
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(right_x);
-            ImGui::TextDisabled("%s", selected.c_str());
-        }
+        draw_top_engine_selector();
         ImGui::EndTabBar();
     }
     return ImGui::GetCursorPosY();
