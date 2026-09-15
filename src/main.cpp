@@ -44,6 +44,7 @@ struct Engine { std::string label; fs::path path; };
 struct ToolRow { std::string group; std::string name; fs::path path; bool found; };
 struct ToolMeta { std::string version; std::string install; std::string code; };
 struct FavoritePlugin { std::string name; std::string url; };
+struct PluginGitState { bool submodule = false; std::string revision; };
 struct LogEntry { std::string text; bool error = false; };
 
 struct AppState {
@@ -55,6 +56,7 @@ struct AppState {
     std::vector<Target> targets;
     std::vector<ToolRow> tools;
     std::map<std::string, std::vector<fs::path>> plugin_scan_cache;
+    std::map<std::string, PluginGitState> plugin_git_cache;
     std::map<std::string, fs::path> tool_overrides;
     std::map<std::string, std::map<std::string, ToolMeta>> tool_catalogs;
     std::vector<std::string> tool_catalog_versions;
@@ -82,11 +84,17 @@ struct AppState {
     std::atomic<bool> process_running{false};
     std::atomic<bool> stop_requested{false};
     std::atomic<bool> catalog_running{false};
+    std::atomic<bool> plugin_refresh_requested{false};
+    std::atomic<bool> plugin_details_running{false};
+    std::atomic<bool> plugin_details_ready{false};
     std::mutex mutex;
+    std::mutex plugin_mutex;
+    std::map<std::string, PluginGitState> pending_plugin_git_cache;
 };
 
 static AppState g;
 static SDL_Window* g_window = nullptr;
+static std::atomic<bool> g_package_after_output_pick{false};
 static constexpr const char* TOOL_CATALOG_TEMPLATE_URL =
     "https://raw.githubusercontent.com/Nocxr/UnrealProjectHandler/main/config/tool-catalog.json";
 
@@ -653,6 +661,21 @@ static void inspect_project() {
     inspect_tooling();
 }
 
+static std::string capture_command(const std::string& command) {
+#ifdef _WIN32
+    auto wrapped = "cmd /S /C \"" + command + " 2>NUL\"";
+#else
+    auto wrapped = command + " 2>/dev/null";
+#endif
+    FILE* pipe = popen(wrapped.c_str(), "r");
+    if (!pipe) return {};
+    char buffer[1024];
+    std::string output;
+    while (fgets(buffer, sizeof(buffer), pipe)) output += buffer;
+    if (pclose(pipe) != 0) return {};
+    return normalized_text(output);
+}
+
 static std::string normalized_path_key(const fs::path& path) {
     std::error_code ec;
     auto normalized = fs::weakly_canonical(path, ec);
@@ -701,7 +724,7 @@ static void match_project_engine(const fs::path& project) {
     }
 }
 
-static void select_project(const fs::path& project) {
+static void select_project(fs::path project) {
     if (g.process_running) { log_line("[ERROR] Stop the current operation before switching projects."); return; }
     if (project.empty()) return;
     g.project = project;
@@ -713,7 +736,7 @@ static void select_project(const fs::path& project) {
     save_settings();
 }
 
-enum class DialogKind { Project, Engine, Output, SaveLog, ToolOverrideFile, ToolOverrideFolder };
+enum class DialogKind { Project, Engine, Output, PackageOutput, SaveLog, ToolOverrideFile, ToolOverrideFolder };
 struct DialogRequest { DialogKind kind; std::string key; };
 struct DialogResult { DialogKind kind; fs::path path; std::string error; std::string key; };
 constexpr Uint32 DIALOG_RESULT_EVENT = SDL_EVENT_USER + 1;
@@ -763,6 +786,7 @@ static void apply_dialog_result(std::unique_ptr<DialogResult> result) {
         }
         g.output = result->path;
         log_line("[SYSTEM] Package output: " + result->path.string());
+        if (result->kind == DialogKind::PackageOutput) g_package_after_output_pick = true;
     }
     save_settings();
 }
@@ -950,12 +974,12 @@ static std::string package_command() {
     return command.str();
 }
 
-static void run_command(std::string command, const std::string& name) {
+static void run_command(std::string command, const std::string& name, bool refresh_plugins = false) {
     if (g.process_running.exchange(true)) { log_line("[ERROR] Another operation is already running."); return; }
     g.stop_requested = false;
     if (g.clear_on_run) { std::lock_guard lock(g.mutex); g.logs.clear(); }
     log_line("[SYSTEM] Starting " + name + ": " + command);
-    std::thread([command = std::move(command), name] {
+    std::thread([command = std::move(command), name, refresh_plugins] {
 #ifdef _WIN32
         auto wrapped = "cmd /S /C \"" + command + " 2>&1\"";
 #else
@@ -1012,6 +1036,7 @@ static void run_command(std::string command, const std::string& name) {
             }
         }
         log_line(status == 0 ? "[SYSTEM] " + name + " completed." : "[ERROR] " + name + " exited with an error.");
+        if (refresh_plugins) g.plugin_refresh_requested = true;
         g.process_running = false;
     }).detach();
 }
@@ -1225,6 +1250,475 @@ static bool package_platform_ready(int platform) {
     if (g.unrealsharp) ready = ready && tooling_group_ready(unrealsharp_groups[platform]);
     return ready;
 }
+
+
+#ifdef _WIN32
+static constexpr UINT WM_UPH_TRAY = WM_APP + 37;
+static constexpr UINT ID_TRAY_OPEN = 41001;
+static constexpr UINT ID_TRAY_PROJECT_COMPILE = 41002;
+static constexpr UINT ID_TRAY_PROJECT_EDITOR = 41003;
+static constexpr UINT ID_TRAY_PROJECT_PACKAGE = 41004;
+static constexpr UINT ID_TRAY_PROJECT_LAUNCH = 41005;
+static constexpr UINT ID_TRAY_EDITOR_LAUNCH = 41006;
+static constexpr UINT ID_TRAY_EXIT = 41007;
+static constexpr UINT ID_TRAY_RECENT_OPEN = 41008;
+static constexpr UINT ID_TRAY_PROJECT_FOLDER = 41009;
+static constexpr UINT ID_TRAY_ENGINE_FOLDER = 41010;
+static constexpr UINT ID_TRAY_ENGINE_ADD = 41011;
+static constexpr UINT ID_TRAY_PROJECT_NEW = 41012;
+static constexpr UINT ID_TRAY_RECENT_PROJECT_BASE = 41100;
+static constexpr UINT ID_TRAY_ENGINE_BASE = 41200;
+static constexpr UINT ID_TRAY_PACKAGE_PLATFORM_BASE = 41300;
+static constexpr UINT ID_TRAY_PACKAGE_CONFIG_BASE = 41400;
+
+static HWND g_tray_hwnd = nullptr;
+static WNDPROC g_original_window_proc = nullptr;
+static NOTIFYICONDATAW g_tray_icon{};
+static HICON g_tray_hicon = nullptr;
+static bool g_tray_installed = false;
+static UINT g_taskbar_created_message = 0;
+static std::atomic<bool> g_tray_exit_requested{false};
+
+static std::wstring tray_widen(const std::string& text) {
+    if (text.empty()) return {};
+    int count = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (count <= 0) return std::wstring(text.begin(), text.end());
+    std::wstring wide(static_cast<size_t>(count), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), count);
+    if (!wide.empty() && wide.back() == L'\0') wide.pop_back();
+    return wide;
+}
+
+static std::wstring tray_engine_label(const Engine& engine) {
+    std::string label = engine.label;
+    int matches = 0;
+    for (const auto& other : g.engines) if (other.label == engine.label) ++matches;
+    if (matches > 1) {
+        auto suffix = engine.path.filename().string();
+        if (suffix.empty()) suffix = engine.path.string();
+        label += " (" + suffix + ")";
+    }
+    return tray_widen(label);
+}
+
+static void set_imgui_platform_windows_visible(bool visible) {
+    if (!ImGui::GetCurrentContext()) return;
+    ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+    ImGuiViewport* main_viewport = ImGui::GetMainViewport();
+    for (ImGuiViewport* viewport : platform_io.Viewports) {
+        if (!viewport || viewport == main_viewport) continue;
+        HWND hwnd = static_cast<HWND>(viewport->PlatformHandleRaw ? viewport->PlatformHandleRaw : viewport->PlatformHandle);
+        if (hwnd) ShowWindow(hwnd, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+    }
+}
+
+static void restore_main_window_from_tray() {
+    if (!g_window) return;
+    SDL_ShowWindow(g_window);
+    set_imgui_platform_windows_visible(true);
+    SDL_RaiseWindow(g_window);
+    if (g_tray_hwnd) {
+        ShowWindow(g_tray_hwnd, SW_RESTORE);
+        SetForegroundWindow(g_tray_hwnd);
+    }
+}
+
+static void hide_main_window_to_tray() {
+    if (!g_window) return;
+    set_imgui_platform_windows_visible(false);
+    SDL_HideWindow(g_window);
+}
+
+static bool tray_can_compile() {
+    return fs::is_regular_file(g.project) && fs::exists(build_script()) && !g.targets.empty() && !g.process_running;
+}
+
+static bool tray_can_launch_project() {
+    return fs::is_regular_file(g.project) && fs::exists(editor_path());
+}
+
+static bool tray_can_package() {
+    return fs::is_regular_file(g.project) && fs::exists(run_uat()) && package_platform_ready(g.package_platform) &&
+           !g.process_running && (!g.unrealsharp || fs::exists(unrealsharp_scripts()));
+}
+
+static bool tray_can_launch_editor() {
+    return fs::exists(editor_path());
+}
+
+static void tray_compile() {
+    if (!tray_can_compile()) {
+        log_line("[ERROR] Compile is not available for the current project/settings.");
+        return;
+    }
+    auto command = compile_command();
+    if (!command.empty()) run_command(command, "Compile");
+}
+
+static void tray_launch_project_in_editor() {
+    if (!tray_can_launch_project()) {
+        log_line("[ERROR] Launch in Editor requires a valid project and engine.");
+        return;
+    }
+    launch_editor(false);
+}
+
+static void tray_launch_project() {
+    if (!tray_can_launch_project()) {
+        log_line("[ERROR] Launch requires a valid project and engine.");
+        return;
+    }
+    launch_editor(true);
+}
+
+static void tray_package() {
+    if (!tray_can_package()) {
+        log_line("[ERROR] Package is not available for the current project/settings.");
+        return;
+    }
+    if (g.clean_output) clean_output();
+    auto command = package_command();
+    if (!command.empty()) run_command(command, "Package");
+}
+
+static void tray_launch_editor() {
+    if (!tray_can_launch_editor()) {
+        log_line("[ERROR] Select a valid engine first.");
+        return;
+    }
+    launch_editor_home();
+}
+
+static void select_tray_engine(size_t index) {
+    if (g.process_running) {
+        log_line("[ERROR] Stop the current operation before switching engines.");
+        return;
+    }
+    if (index >= g.engines.size()) return;
+    g.engine = g.engines[index].path;
+    g.plugin_scan_cache.clear();
+    discover_engines();
+    inspect_project();
+    log_line("[SYSTEM] Engine: " + g.engine.string());
+    save_settings();
+}
+
+static void show_tray_menu() {
+    if (!g_tray_hwnd) return;
+
+    POINT menu_origin{};
+    GetCursorPos(&menu_origin);
+
+    for (;;) {
+        HMENU menu = CreatePopupMenu();
+        HMENU recent_menu = CreatePopupMenu();
+        HMENU engine_menu = CreatePopupMenu();
+        HMENU package_menu = CreatePopupMenu();
+        HMENU package_platform_menu = CreatePopupMenu();
+        HMENU package_config_menu = CreatePopupMenu();
+        if (!menu || !recent_menu || !engine_menu || !package_menu || !package_platform_menu || !package_config_menu) {
+            if (recent_menu) DestroyMenu(recent_menu);
+            if (engine_menu) DestroyMenu(engine_menu);
+            if (package_menu) DestroyMenu(package_menu);
+            if (package_platform_menu) DestroyMenu(package_platform_menu);
+            if (package_config_menu) DestroyMenu(package_config_menu);
+            if (menu) DestroyMenu(menu);
+            return;
+        }
+
+        AppendMenuW(menu, MF_STRING, ID_TRAY_OPEN, L"Open UPH");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+        // Standard Win32 popup menus do not expose per-item text colors without
+        // owner-drawing the entire item. Colored markers keep native menu styling.
+        std::wstring current_project = L"\U0001F535 Project: ";
+        if (g.project.empty()) current_project += L"None";
+        else {
+            auto label = g.project.stem().wstring();
+            current_project += label.empty() ? g.project.filename().wstring() : label;
+        }
+
+        if (g.recent_projects.empty()) {
+            AppendMenuW(recent_menu, MF_STRING | MF_GRAYED, 0, L"No recent projects");
+        } else {
+            const size_t count = std::min<size_t>(g.recent_projects.size(), 100);
+            for (size_t i = 0; i < count; ++i) {
+                const auto& project = g.recent_projects[i];
+                bool available = fs::is_regular_file(project);
+                bool selected = normalized_path_key(project) == normalized_path_key(g.project);
+                std::wstring label = project.stem().wstring();
+                if (label.empty()) label = project.filename().wstring();
+                if (!available) label += L" (missing)";
+                UINT flags = MF_STRING | (available && !g.process_running ? MF_ENABLED : MF_GRAYED);
+                if (selected) flags |= MF_CHECKED;
+                AppendMenuW(recent_menu, flags, ID_TRAY_RECENT_PROJECT_BASE + static_cast<UINT>(i), label.c_str());
+            }
+        }
+        AppendMenuW(recent_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(recent_menu, MF_STRING | (g.process_running ? MF_GRAYED : MF_ENABLED), ID_TRAY_RECENT_OPEN, L"Add...");
+        AppendMenuW(recent_menu, MF_STRING | (tray_can_launch_editor() ? MF_ENABLED : MF_GRAYED), ID_TRAY_PROJECT_NEW, L"New...");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(recent_menu), current_project.c_str());
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+        AppendMenuW(menu, MF_STRING | (tray_can_compile() ? MF_ENABLED : MF_GRAYED), ID_TRAY_PROJECT_COMPILE, L"Compile");
+        AppendMenuW(menu, MF_STRING | (tray_can_launch_project() ? MF_ENABLED : MF_GRAYED), ID_TRAY_PROJECT_EDITOR, L"Edit");
+
+        AppendMenuW(package_menu, MF_STRING | (tray_can_package() ? MF_ENABLED : MF_GRAYED),
+                    ID_TRAY_PROJECT_PACKAGE, L"Package Now");
+
+        for (size_t i = 0; i < g.platforms.size(); ++i) {
+            bool ready = package_platform_ready(static_cast<int>(i));
+            UINT flags = MF_STRING | ((!ready || g.process_running) ? MF_GRAYED : MF_ENABLED);
+            if (static_cast<int>(i) == g.package_platform) flags |= MF_CHECKED;
+            std::string label_text = std::string(g.platforms[i]) + (ready ? "" : " (tooling incomplete)");
+            std::wstring label = tray_widen(label_text);
+            AppendMenuW(package_platform_menu, flags,
+                        ID_TRAY_PACKAGE_PLATFORM_BASE + static_cast<UINT>(i), label.c_str());
+        }
+
+        for (size_t i = 0; i < g.configs.size(); ++i) {
+            UINT flags = MF_STRING | (g.process_running ? MF_GRAYED : MF_ENABLED);
+            if (static_cast<int>(i) == g.package_config) flags |= MF_CHECKED;
+            std::wstring label = tray_widen(g.configs[i]);
+            AppendMenuW(package_config_menu, flags,
+                        ID_TRAY_PACKAGE_CONFIG_BASE + static_cast<UINT>(i), label.c_str());
+        }
+
+        AppendMenuW(package_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(package_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(package_platform_menu), L"Platform");
+        AppendMenuW(package_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(package_config_menu), L"Config");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(package_menu), L"Package");
+
+        AppendMenuW(menu, MF_STRING | (tray_can_launch_project() ? MF_ENABLED : MF_GRAYED), ID_TRAY_PROJECT_LAUNCH, L"Run");
+        bool can_open_project_folder = !g.project.empty() && fs::is_directory(g.project.parent_path());
+        AppendMenuW(menu, MF_STRING | (can_open_project_folder ? MF_ENABLED : MF_GRAYED), ID_TRAY_PROJECT_FOLDER, L"Open Folder");
+
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+        std::wstring current_engine = L"\U0001F7E0 Engine: ";
+        if (g.engine.empty()) current_engine += L"None";
+        else {
+            const Engine* active = nullptr;
+            for (const auto& engine : g.engines) {
+                if (normalized_path_key(engine.path) == normalized_path_key(g.engine)) {
+                    active = &engine;
+                    break;
+                }
+            }
+            current_engine += active ? tray_engine_label(*active) : tray_widen(engine_version(g.engine));
+        }
+
+        if (g.engines.empty()) {
+            AppendMenuW(engine_menu, MF_STRING | MF_GRAYED, 0, L"No engines found");
+        } else {
+            const size_t count = std::min<size_t>(g.engines.size(), 100);
+            for (size_t i = 0; i < count; ++i) {
+                const auto& engine = g.engines[i];
+                std::wstring label = tray_engine_label(engine);
+                UINT flags = MF_STRING | (g.process_running ? MF_GRAYED : MF_ENABLED);
+                if (normalized_path_key(engine.path) == normalized_path_key(g.engine)) flags |= MF_CHECKED;
+                AppendMenuW(engine_menu, flags, ID_TRAY_ENGINE_BASE + static_cast<UINT>(i), label.c_str());
+            }
+        }
+        AppendMenuW(engine_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(engine_menu, MF_STRING | (g.process_running ? MF_GRAYED : MF_ENABLED), ID_TRAY_ENGINE_ADD, L"Add...");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(engine_menu), current_engine.c_str());
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+        bool can_open_engine_folder = !g.engine.empty() && fs::is_directory(g.engine);
+        AppendMenuW(menu, MF_STRING | (tray_can_launch_editor() ? MF_ENABLED : MF_GRAYED), ID_TRAY_EDITOR_LAUNCH, L"Launch");
+        AppendMenuW(menu, MF_STRING | (can_open_engine_folder ? MF_ENABLED : MF_GRAYED), ID_TRAY_ENGINE_FOLDER, L"Open Folder");
+
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Exit");
+
+        SetForegroundWindow(g_tray_hwnd);
+        UINT command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                                      menu_origin.x, menu_origin.y, 0, g_tray_hwnd, nullptr);
+        DestroyMenu(menu); // destroys attached submenus too
+        PostMessageW(g_tray_hwnd, WM_NULL, 0, 0);
+
+        if (command == 0) return;
+
+        // A native Win32 popup always dismisses when a command is chosen. For
+        // selector-style commands, rebuild it immediately so the tray menu stays up.
+        if (command >= ID_TRAY_RECENT_PROJECT_BASE && command < ID_TRAY_RECENT_PROJECT_BASE + 100) {
+            size_t index = static_cast<size_t>(command - ID_TRAY_RECENT_PROJECT_BASE);
+            if (index < g.recent_projects.size() && fs::is_regular_file(g.recent_projects[index])) {
+                fs::path project = g.recent_projects[index];
+                select_project(std::move(project));
+            }
+            continue;
+        }
+
+        if (command >= ID_TRAY_ENGINE_BASE && command < ID_TRAY_ENGINE_BASE + 100) {
+            select_tray_engine(static_cast<size_t>(command - ID_TRAY_ENGINE_BASE));
+            continue;
+        }
+
+        if (command >= ID_TRAY_PACKAGE_PLATFORM_BASE &&
+            command < ID_TRAY_PACKAGE_PLATFORM_BASE + static_cast<UINT>(g.platforms.size())) {
+            g.package_platform = static_cast<int>(command - ID_TRAY_PACKAGE_PLATFORM_BASE);
+            save_settings();
+            continue;
+        }
+
+        if (command >= ID_TRAY_PACKAGE_CONFIG_BASE &&
+            command < ID_TRAY_PACKAGE_CONFIG_BASE + static_cast<UINT>(g.configs.size())) {
+            g.package_config = static_cast<int>(command - ID_TRAY_PACKAGE_CONFIG_BASE);
+            save_settings();
+            continue;
+        }
+
+        switch (command) {
+            case ID_TRAY_OPEN:
+                restore_main_window_from_tray();
+                return;
+            case ID_TRAY_RECENT_OPEN:
+                restore_main_window_from_tray();
+                pick_project();
+                return;
+            case ID_TRAY_PROJECT_NEW:
+                tray_launch_editor();
+                return;
+            case ID_TRAY_PROJECT_COMPILE:
+                tray_compile();
+                return;
+            case ID_TRAY_PROJECT_EDITOR:
+                tray_launch_project_in_editor();
+                return;
+            case ID_TRAY_PROJECT_PACKAGE: {
+                fs::path initial = !g.output.empty() ? g.output :
+                                   (!g.project.empty() ? g.project.parent_path() : fs::path{});
+                pick_folder(DialogKind::PackageOutput, initial);
+                return;
+            }
+            case ID_TRAY_PROJECT_LAUNCH:
+                tray_launch_project();
+                return;
+            case ID_TRAY_PROJECT_FOLDER:
+                if (!g.project.empty()) open_path(g.project.parent_path());
+                return;
+            case ID_TRAY_EDITOR_LAUNCH:
+                tray_launch_editor();
+                return;
+            case ID_TRAY_ENGINE_ADD:
+                restore_main_window_from_tray();
+                pick_folder(DialogKind::Engine, g.engine);
+                return;
+            case ID_TRAY_ENGINE_FOLDER:
+                if (!g.engine.empty()) open_path(g.engine);
+                return;
+            case ID_TRAY_EXIT:
+                g_tray_exit_requested = true;
+                return;
+            default:
+                return;
+        }
+    }
+}
+
+static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_CLOSE && g_tray_installed) {
+        hide_main_window_to_tray();
+        return 0;
+    }
+
+    if (g_taskbar_created_message && message == g_taskbar_created_message && g_tray_installed) {
+        Shell_NotifyIconW(NIM_ADD, &g_tray_icon);
+        return 0;
+    }
+
+    if (message == WM_UPH_TRAY) {
+        switch (static_cast<UINT>(lparam)) {
+            case WM_RBUTTONUP:
+            case WM_CONTEXTMENU:
+                show_tray_menu();
+                return 0;
+            case WM_LBUTTONDBLCLK:
+                restore_main_window_from_tray();
+                return 0;
+            default:
+                break;
+        }
+    }
+
+    return g_original_window_proc ? CallWindowProcW(g_original_window_proc, hwnd, message, wparam, lparam)
+                                  : DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+static HICON default_application_icon() {
+    return LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+}
+
+static bool install_tray_icon() {
+    if (!g_window || g_tray_installed) return g_tray_installed;
+
+    auto properties = SDL_GetWindowProperties(g_window);
+    g_tray_hwnd = static_cast<HWND>(SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+    if (!g_tray_hwnd) {
+        log_line("[ERROR] Could not get the native window handle for the tray icon.");
+        return false;
+    }
+
+    g_original_window_proc = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(g_tray_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(uph_tray_window_proc)));
+    if (!g_original_window_proc) {
+        log_line("[ERROR] Could not install the tray window procedure.");
+        g_tray_hwnd = nullptr;
+        return false;
+    }
+
+    wchar_t executable[MAX_PATH]{};
+    SHFILEINFOW file_info{};
+    if (GetModuleFileNameW(nullptr, executable, MAX_PATH) &&
+        SHGetFileInfoW(executable, 0, &file_info, sizeof(file_info), SHGFI_ICON | SHGFI_SMALLICON)) {
+        g_tray_hicon = file_info.hIcon;
+    }
+    if (!g_tray_hicon) g_tray_hicon = default_application_icon();
+
+    g_tray_icon = {};
+    g_tray_icon.cbSize = sizeof(g_tray_icon);
+    g_tray_icon.hWnd = g_tray_hwnd;
+    g_tray_icon.uID = 1;
+    g_tray_icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_tray_icon.uCallbackMessage = WM_UPH_TRAY;
+    g_tray_icon.hIcon = g_tray_hicon;
+    lstrcpynW(g_tray_icon.szTip, L"UPH - Unreal Project Handler",
+              static_cast<int>(sizeof(g_tray_icon.szTip) / sizeof(g_tray_icon.szTip[0])));
+
+    if (!Shell_NotifyIconW(NIM_ADD, &g_tray_icon)) {
+        log_line("[ERROR] Could not add the UPH tray icon.");
+        SetWindowLongPtrW(g_tray_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_original_window_proc));
+        g_original_window_proc = nullptr;
+        HICON default_icon = default_application_icon();
+        if (g_tray_hicon && g_tray_hicon != default_icon) DestroyIcon(g_tray_hicon);
+        g_tray_hicon = nullptr;
+        g_tray_hwnd = nullptr;
+        return false;
+    }
+
+    g_taskbar_created_message = RegisterWindowMessageW(L"TaskbarCreated");
+    g_tray_installed = true;
+    return true;
+}
+
+static void remove_tray_icon() {
+    if (g_tray_installed) Shell_NotifyIconW(NIM_DELETE, &g_tray_icon);
+    g_tray_installed = false;
+
+    if (g_tray_hwnd && g_original_window_proc)
+        SetWindowLongPtrW(g_tray_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_original_window_proc));
+    g_original_window_proc = nullptr;
+    g_tray_hwnd = nullptr;
+
+    HICON default_icon = default_application_icon();
+    if (g_tray_hicon && g_tray_hicon != default_icon) DestroyIcon(g_tray_hicon);
+    g_tray_hicon = nullptr;
+}
+#else
+static void remove_tray_icon() {}
+#endif
 
 static void draw_tooling_ui() {
     if (ImGui::Button("Refresh Tooling")) inspect_tooling();
@@ -1479,16 +1973,168 @@ static std::string name_from_plugin_url(const std::string& url) {
     return name;
 }
 
-static void draw_plugin_list(const fs::path& root, bool refresh = false) {
+static bool valid_plugin_folder_name(const std::string& name) {
+    if (name.empty() || name == "." || name == "..") return false;
+    fs::path path(name);
+    return path == path.filename() && !path.is_absolute();
+}
+
+static std::string add_plugin_submodule_command(const fs::path& root, const fs::path& relative,
+                                                const std::string& url, const std::string& folder_name) {
+    auto target = root / relative;
+    std::string command = "git -C " + quote(root) + " submodule add " + quote(fs::path(url)) + ' ' + quote(relative) +
+                          " && git -C " + quote(target) + " submodule update --init --recursive";
+    auto identity = folder_name + " " + url;
+    std::transform(identity.begin(), identity.end(), identity.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    if (identity.find("unrealsharp") != std::string::npos) {
+        auto managed = target / "Managed";
+#ifdef _WIN32
+        command += " && cd /D " + quote(managed) + " && dotnet restore " + quote(fs::path("UnrealSharp/UnrealSharp.sln"));
+#else
+        command += " && cd " + quote(managed) + " && dotnet restore " + quote(fs::path("UnrealSharp/UnrealSharp.sln"));
+#endif
+    }
+    return command;
+}
+
+static PluginGitState inspect_plugin_git_state(const fs::path& dir, const fs::path& root) {
+    PluginGitState state;
+    if (root.empty()) return state;
+    std::error_code ec;
+    auto relative = fs::relative(dir, root, ec);
+    if (ec) return state;
+    auto status = capture_command("git -C " + quote(root) + " submodule status -- " + quote(relative));
+    if (status.empty()) return state;
+    state.submodule = true;
+    auto status_sha = status;
+    if (!status_sha.empty() && (status_sha.front() == ' ' || status_sha.front() == '-' || status_sha.front() == '+')) status_sha.erase(status_sha.begin());
+    if (auto end = status_sha.find_first_of(" \t\r\n"); end != std::string::npos) status_sha.erase(end);
+    auto branch = capture_command("git -C " + quote(dir) + " symbolic-ref --quiet --short HEAD");
+    auto sha = capture_command("git -C " + quote(dir) + " rev-parse --short HEAD");
+    if (sha.empty() && !status_sha.empty()) sha = status_sha.substr(0, std::min<size_t>(12, status_sha.size()));
+    state.revision = branch.empty() ? (sha.empty() ? "detached" : "detached @ " + sha) : branch;
+    return state;
+}
+
+static void request_plugin_details(std::vector<fs::path> plugins) {
+    if (plugins.empty() || g.project.empty() || g.plugin_details_running.exchange(true)) return;
+    auto root = g.project.parent_path();
+    g.plugin_details_ready = false;
+    std::thread([plugins = std::move(plugins), root] {
+        std::map<std::string, PluginGitState> details;
+        for (const auto& dir : plugins)
+            details[normalized_path_key(dir)] = inspect_plugin_git_state(dir, root);
+        {
+            std::lock_guard lock(g.plugin_mutex);
+            g.pending_plugin_git_cache = std::move(details);
+        }
+        g.plugin_details_ready = true;
+        g.plugin_details_running = false;
+    }).detach();
+}
+
+static void remove_gitmodules_entry(const fs::path& root, const fs::path& relative) {
+    auto path = root / ".gitmodules";
+    if (!fs::is_regular_file(path)) return;
+    std::ifstream in(path);
+    std::vector<std::vector<std::string>> blocks(1);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.front() == '[') blocks.emplace_back();
+        blocks.back().push_back(line);
+    }
+    in.close();
+    auto wanted = normalized_path_key(relative);
+    std::ofstream out(path, std::ios::trunc);
+    for (const auto& block : blocks) {
+        bool matches = false;
+        for (const auto& item : block) {
+            auto equal = item.find('=');
+            if (equal == std::string::npos) continue;
+            auto key = item.substr(0, equal);
+            key.erase(std::remove_if(key.begin(), key.end(), [](unsigned char c){ return std::isspace(c); }), key.end());
+            auto value = item.substr(equal + 1);
+            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
+            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
+            if (key == "path" && normalized_path_key(fs::path(value)) == wanted) matches = true;
+        }
+        if (!matches) for (const auto& item : block) out << item << '\n';
+    }
+}
+
+static void make_tree_writable(const fs::path& root) {
+    std::error_code ec;
+    if (!fs::exists(root, ec)) return;
+    fs::permissions(root, fs::perms::owner_all, fs::perm_options::add, ec);
+    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+    while (it != end) {
+        fs::permissions(it->path(), fs::perms::owner_all, fs::perm_options::add, ec);
+        ec.clear();
+        it.increment(ec);
+        if (ec) ec.clear();
+    }
+}
+
+static void remove_plugin_submodule(const fs::path& root, const fs::path& relative, const std::string& name) {
+    if (g.process_running.exchange(true)) { log_line("[ERROR] Another operation is already running."); return; }
+    g.stop_requested = false;
+    log_line("[SYSTEM] Removing plugin submodule " + relative.generic_string());
+    std::thread([root, relative, name] {
+        auto run = [&](const std::string& command, bool required = false) {
+            int status = std::system(command.c_str());
+            if (required && status != 0) log_line("[ERROR] Command failed: " + command);
+            return status == 0;
+        };
+        run("git -C " + quote(root) + " submodule deinit -f -- " + quote(relative));
+        auto target = root / relative;
+        make_tree_writable(target);
+        std::error_code ec;
+        fs::remove_all(target, ec);
+        bool worktree_removed = !fs::exists(target);
+        if (ec || !worktree_removed) log_line("[ERROR] Could not remove plugin worktree " + target.string() + (ec ? ": " + ec.message() : " (files are in use)"));
+        run("git -C " + quote(root) + " rm --cached -f --ignore-unmatch -- " + quote(relative), true);
+        remove_gitmodules_entry(root, relative);
+        auto metadata = root / ".git/modules" / relative;
+        make_tree_writable(metadata);
+        ec.clear();
+        fs::remove_all(metadata, ec);
+        if (ec) log_line("[ERROR] Could not remove submodule metadata " + metadata.string() + ": " + ec.message());
+        if (fs::is_regular_file(root / ".gitmodules")) run("git -C " + quote(root) + " add -- .gitmodules");
+        if (worktree_removed && !ec) log_line("[SYSTEM] Remove Submodule " + name + " completed.");
+        else log_line("[ERROR] Remove Submodule " + name + " finished with files still locked. Close only the application holding the reported path, then retry.");
+        g.plugin_refresh_requested = true;
+        g.process_running = false;
+    }).detach();
+}
+
+static void draw_plugin_list(const fs::path& root, bool refresh = false, bool show_git_details = false) {
     if (root.empty()) { ImGui::TextDisabled("Select a project on the Project tab first."); return; }
+    if (refresh && !g.plugin_details_running) g.plugin_git_cache.clear();
     if (!fs::exists(root)) { ImGui::TextDisabled("No plugins in %s", root.string().c_str()); return; }
     const auto& plugins = list_plugins(root, refresh);
     if (plugins.empty()) { ImGui::TextDisabled("No plugins found in %s", root.string().c_str()); return; }
+    if (show_git_details) {
+        std::vector<fs::path> missing;
+        for (const auto& dir : plugins)
+            if (!g.plugin_git_cache.contains(normalized_path_key(dir))) missing.push_back(dir);
+        request_plugin_details(std::move(missing));
+        if (g.plugin_details_running) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("Checking Git details...");
+        }
+    }
     for (const auto& dir : plugins) {
         ImGui::PushID(dir.string().c_str());
         ImGui::TextUnformatted(plugin_display_name(dir).c_str());
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", dir.string().c_str());
         ImGui::SameLine();
+        if (show_git_details) {
+            auto found = g.plugin_git_cache.find(normalized_path_key(dir));
+            if (found == g.plugin_git_cache.end()) ImGui::TextDisabled("Checking...");
+            else ImGui::TextColored(found->second.submodule ? ImVec4(0.30f, 0.68f, 1.0f, 1.0f) : ImVec4(0.58f, 0.58f, 0.58f, 1.0f),
+                                    "%s", found->second.submodule ? ("Submodule | " + found->second.revision).c_str() : "Local folder");
+            ImGui::SameLine();
+        }
         if (ImGui::SmallButton("Open")) open_path(dir);
         ImGui::PopID();
     }
@@ -1501,23 +2147,25 @@ static void draw_engine_marketplace_plugins() {
     if (!fs::exists(root)) { ImGui::TextDisabled("No marketplace folder at %s", root.string().c_str()); return; }
     bool refresh = ImGui::SmallButton("Refresh##engine_plugins");
     ImGui::SameLine(); ImGui::TextDisabled("Cached after first scan");
-    draw_plugin_list(root, refresh);
+    draw_plugin_list(root, refresh, false);
 }
 
 static void draw_project_plugins() {
     if (!ImGui::CollapsingHeader("Project Plugins", ImGuiTreeNodeFlags_DefaultOpen)) return;
     bool refresh = ImGui::SmallButton("Refresh##project_plugins");
+    if (refresh && g.plugin_details_running) g.plugin_refresh_requested = true;
     ImGui::SameLine(); ImGui::TextDisabled("Cached after first scan");
-    draw_plugin_list(g.project.empty() ? fs::path{} : g.project.parent_path() / "Plugins", refresh);
+    draw_plugin_list(g.project.empty() ? fs::path{} : g.project.parent_path() / "Plugins", refresh, true);
 }
 
 static void draw_favorite_plugins() {
     if (!ImGui::CollapsingHeader("Favorite Plugins", ImGuiTreeNodeFlags_DefaultOpen)) return;
-    ImGui::TextDisabled("Git URLs to pull plugins from. Clone installs a copy into your project's Plugins folder.");
+    ImGui::TextDisabled("Save a Git URL and its destination folder. Add Submodule tracks it in the project repository; Clone does not.");
     static char name_buf[256];
     static char url_buf[512] = "https://github.com/";
     ImGui::SetNextItemWidth(200.0f);
-    ImGui::InputTextWithHint("##fav_name", "Name", name_buf, sizeof(name_buf));
+    ImGui::InputTextWithHint("##fav_name", "Folder Name", name_buf, sizeof(name_buf));
+    tooltip("Folder created inside the project's Plugins directory. This is also the short label shown below.");
     ImGui::SameLine();
     auto add_width = ImGui::CalcTextSize("Add").x + ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetStyle().ItemSpacing.x;
     ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - 200.0f - ImGui::GetStyle().ItemSpacing.x - add_width));
@@ -1527,10 +2175,15 @@ static void draw_favorite_plugins() {
     if (ImGui::Button("Add")) add_clicked = true;
     if (add_clicked && url_buf[0]) {
         auto url = normalized_git_url(url_buf);
-        g.favorite_plugins.push_back({name_buf[0] ? name_buf : name_from_plugin_url(url), url});
-        name_buf[0] = 0;
-        std::snprintf(url_buf, sizeof(url_buf), "%s", "https://github.com/");
-        save_settings();
+        auto folder_name = name_buf[0] ? std::string(name_buf) : name_from_plugin_url(url);
+        if (!valid_plugin_folder_name(folder_name)) {
+            log_line("[ERROR] Folder Name must be a single folder name, without slashes or '..'.");
+        } else {
+            g.favorite_plugins.push_back({folder_name, url});
+            name_buf[0] = 0;
+            std::snprintf(url_buf, sizeof(url_buf), "%s", "https://github.com/");
+            save_settings();
+        }
     }
     if (g.favorite_plugins.empty()) { ImGui::TextDisabled("No favorite plugins yet."); return; }
     ImGui::Separator();
@@ -1538,39 +2191,45 @@ static void draw_favorite_plugins() {
     for (int i = 0; i < (int)g.favorite_plugins.size(); ++i) {
         auto& plugin = g.favorite_plugins[i];
         ImGui::PushID(i);
+        bool valid_folder = valid_plugin_folder_name(plugin.name);
         auto target = g.project.empty() ? fs::path{} : g.project.parent_path() / "Plugins" / plugin.name;
         auto submodule_path = fs::path("Plugins") / plugin.name;
-        bool submodule_exists = !target.empty() && fs::exists(target);
-        bool can_clone = !g.project.empty() && !g.process_running;
+        auto git_key = normalized_path_key(target);
+        bool target_exists = !target.empty() && fs::exists(target);
+        if (target_exists && !g.plugin_git_cache.contains(git_key)) request_plugin_details({target});
+        auto git_state = g.plugin_git_cache.find(git_key);
+        bool submodule_exists = target_exists && git_state != g.plugin_git_cache.end() && git_state->second.submodule;
+        bool can_clone = !g.project.empty() && !g.process_running && valid_folder;
         bool project_is_git = !g.project.empty() && fs::exists(g.project.parent_path() / ".git");
-        bool can_submodule = can_clone && project_is_git;
+        bool can_submodule = can_clone && project_is_git && (submodule_exists || !target_exists);
         if (!can_submodule) ImGui::BeginDisabled();
         if (ImGui::SmallButton(submodule_exists ? "Remove Submodule" : "Add Submodule")) {
             auto root = g.project.parent_path();
             if (submodule_exists) {
-                auto remove_command = "git -C " + quote(root) + " submodule deinit -f -- " + quote(submodule_path) +
-                                      " && git -C " + quote(root) + " rm -f " + quote(submodule_path);
-                run_command(remove_command, "Remove Submodule " + plugin.name);
+                remove_plugin_submodule(root, submodule_path, plugin.name);
             } else {
-                run_command("git -C " + quote(root) + " submodule add " + quote(fs::path(plugin.url)) + ' ' + quote(submodule_path),
-                            "Add Submodule " + plugin.name);
+                run_command(add_plugin_submodule_command(root, submodule_path, plugin.url, plugin.name),
+                            "Add Submodule " + plugin.name, true);
             }
         }
         if (!can_submodule) ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            if (!project_is_git) ImGui::SetTooltip("This project is not a Git repository. Use Clone, or initialize Git for the project first.");
+            if (!valid_folder) ImGui::SetTooltip("Folder Name must be a single folder name, without slashes or '..'.");
+            else if (!project_is_git) ImGui::SetTooltip("This project is not a Git repository. Use Clone, or initialize Git for the project first.");
+            else if (target_exists && !submodule_exists) ImGui::SetTooltip("That folder already exists and is not a submodule.");
             else if (g.process_running) ImGui::SetTooltip("Wait for the current operation to finish.");
             else ImGui::SetTooltip("Select a project first.");
         }
         ImGui::SameLine();
-        if (!can_clone) ImGui::BeginDisabled();
+        bool clone_ready = can_clone && !target_exists;
+        if (!clone_ready) ImGui::BeginDisabled();
         if (ImGui::SmallButton("Clone")) {
-            run_command("git clone " + quote(fs::path(plugin.url)) + ' ' + quote(target), "Clone Plugin " + plugin.name);
+            run_command("git clone " + quote(fs::path(plugin.url)) + ' ' + quote(target), "Clone Plugin " + plugin.name, true);
         }
-        if (!can_clone) {
+        if (!clone_ready) {
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("Select a project to clone into.");
+                ImGui::SetTooltip(target_exists ? "The destination folder already exists." : "Select a project and wait for the current operation to finish.");
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Open URL")) open_url(plugin.url);
@@ -1813,25 +2472,15 @@ static void draw_project_ui() {
     if (!g.show_log) ImGui::BeginDisabled();
     ImGui::Checkbox("Lock Log to Side", &g.dock_log);
     if (!g.show_log) ImGui::EndDisabled();
-    ImGui::TextDisabled("Press ` to show or hide the build log.");
     save_settings();
 }
 
 static void draw_top_context_selectors() {
     std::string project = current_project_label();
     std::string engine = current_engine_label();
-    float project_width = std::clamp(ImGui::CalcTextSize(project.c_str()).x + ImGui::GetStyle().FramePadding.x * 4.0f, 150.0f, 260.0f);
-    float engine_width = std::clamp(ImGui::CalcTextSize(engine.c_str()).x + ImGui::GetStyle().FramePadding.x * 4.0f, 170.0f, 300.0f);
-    float spacing = ImGui::GetStyle().ItemSpacing.x;
-    float width = ImGui::CalcTextSize("Project").x + project_width + ImGui::CalcTextSize("Engine").x + engine_width + spacing * 5.0f;
-    float right_x = ImGui::GetWindowContentRegionMax().x - width;
-    if (right_x <= ImGui::GetCursorPosX() + ImGui::GetStyle().ItemSpacing.x) return;
-
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(right_x);
     ImGui::TextDisabled("Project");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(project_width);
+    ImGui::SetNextItemWidth(220.0f);
     if (g.process_running) ImGui::BeginDisabled();
     if (ImGui::BeginCombo("##top_selected_project", project.c_str())) {
         project_combo_items();
@@ -1840,9 +2489,28 @@ static void draw_top_context_selectors() {
     if (g.process_running) ImGui::EndDisabled();
     tooltip(g.process_running ? "Project switching is locked while an operation is running." : "Switch projects or browse for another .uproject file.");
     ImGui::SameLine();
+    bool can_launch_project = fs::is_regular_file(g.project) && fs::exists(editor_path());
+    if (readiness_button("\xE2\x96\xB6 Play##top_project", can_launch_project)) launch_editor(false);
+    tooltip("Open the selected project in Unreal Editor.");
+    ImGui::SameLine();
+    bool can_compile = fs::is_regular_file(g.project) && fs::exists(build_script()) && !g.targets.empty() && !g.process_running;
+    if (readiness_button("\xE2\x9A\x99 Compile##top_project", can_compile)) run_command(compile_command(), "Compile");
+    tooltip("Compile with the target and configuration selected on the Project tab.");
+    ImGui::SameLine();
+    bool can_package = fs::is_regular_file(g.project) && fs::exists(run_uat()) && package_platform_ready(g.package_platform) &&
+                       !g.process_running && (!g.unrealsharp || fs::exists(unrealsharp_scripts()));
+    if (readiness_button("\xE2\x96\xA3 Package##top_project", can_package)) {
+        if (g.clean_output) clean_output();
+        auto command = package_command();
+        if (!command.empty()) run_command(command, "Package");
+    }
+    tooltip("Package with the settings selected on the Project tab.");
+    ImGui::SameLine();
+    ImGui::Spacing();
+    ImGui::SameLine();
     ImGui::TextDisabled("Engine");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(engine_width);
+    ImGui::SetNextItemWidth(200.0f);
     if (g.process_running) ImGui::BeginDisabled();
     if (ImGui::BeginCombo("##top_selected_engine", engine.c_str())) {
         engine_combo_items();
@@ -1850,9 +2518,36 @@ static void draw_top_context_selectors() {
     }
     if (g.process_running) ImGui::EndDisabled();
     tooltip(g.process_running ? "Engine switching is locked while an operation is running." : "Pick the active Unreal Engine.");
+    ImGui::SameLine();
+    if (readiness_button("\xE2\x96\xB6 Play##top_engine", fs::exists(editor_path()))) launch_editor_home();
+    tooltip("Launch Unreal Editor without a project to open the project browser/new-project window.");
+    ImGui::Separator();
+}
+
+static void draw_footer() {
+    const float footer_height = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 2.0f;
+    const float footer_y = ImGui::GetWindowHeight() - ImGui::GetStyle().WindowPadding.y - footer_height;
+    if (ImGui::GetCursorPosY() < footer_y) ImGui::SetCursorPosY(footer_y);
+    ImGui::Separator();
+    ImGui::TextDisabled("` Toggle Log Window    |    Ctrl + Q Quit");
 }
 
 static float draw_ui() {
+    if (g.plugin_details_ready.exchange(false)) {
+        std::lock_guard lock(g.plugin_mutex);
+        for (auto& [path, state] : g.pending_plugin_git_cache)
+            g.plugin_git_cache.insert_or_assign(path, std::move(state));
+        g.pending_plugin_git_cache.clear();
+    }
+    if (g.plugin_refresh_requested.exchange(false)) {
+        if (g.plugin_details_running) {
+            g.plugin_refresh_requested = true;
+        } else {
+            g.plugin_scan_cache.clear();
+            g.plugin_git_cache.clear();
+        }
+    }
+    draw_top_context_selectors();
     if (ImGui::BeginTabBar("##main_tabs")) {
         if (ImGui::BeginTabItem("Project")) {
             draw_project_ui();
@@ -1870,9 +2565,9 @@ static float draw_ui() {
             draw_settings_ui();
             ImGui::EndTabItem();
         }
-        draw_top_context_selectors();
         ImGui::EndTabBar();
     }
+    draw_footer();
     return ImGui::GetCursorPosY();
 }
 
@@ -2010,6 +2705,13 @@ int main(int, char**) {
     ImFontConfig font_config;
     font_config.SizePixels = 15.0f;
     io.Fonts->AddFontDefault(&font_config);
+#ifdef _WIN32
+    static const ImWchar icon_ranges[] = {0x25A0, 0x25FF, 0x2690, 0x26FF, 0};
+    ImFontConfig icon_config;
+    icon_config.MergeMode = true;
+    icon_config.PixelSnapH = true;
+    io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/seguisym.ttf", 15.0f, &icon_config, icon_ranges);
+#endif
     ImGui::StyleColorsDark();
     auto& style = ImGui::GetStyle();
     style.WindowRounding = 4.0f;
@@ -2027,6 +2729,9 @@ int main(int, char**) {
     discover_engines();
     if (!g.project.empty()) match_project_engine(g.project);
     inspect_project();
+#ifdef _WIN32
+    if (install_tray_icon()) log_line("[SYSTEM] Tray icon ready. Closing the main window hides UPH to the tray.");
+#endif
     log_line("[SYSTEM] UPH native started.");
     bool running = true;
     while (running) {
@@ -2036,22 +2741,46 @@ int main(int, char**) {
             ImGui_ImplSDL3_ProcessEvent(&current);
             if (current.type == DIALOG_RESULT_EVENT)
                 apply_dialog_result(std::unique_ptr<DialogResult>(static_cast<DialogResult*>(current.user.data1)));
-            if (current.type == SDL_EVENT_QUIT ||
-                (current.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && current.window.windowID == SDL_GetWindowID(g_window)))
+            if (current.type == SDL_EVENT_QUIT) {
+#ifdef _WIN32
+                if (!g_tray_installed) running = false;
+#else
                 running = false;
+#endif
+            }
+            if (current.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && current.window.windowID == SDL_GetWindowID(g_window)) {
+#ifdef _WIN32
+                if (g_tray_installed) hide_main_window_to_tray();
+                else running = false;
+#else
+                running = false;
+#endif
+            }
         };
         int idle_wait_ms = (g.process_running || g.catalog_running) ? 33 : 100;
         if (SDL_WaitEventTimeout(&event, idle_wait_ms)) {
             handle_event(event);
             while (SDL_PollEvent(&event)) handle_event(event);
         }
+#ifdef _WIN32
+        if (g_package_after_output_pick.exchange(false)) tray_package();
+        if (g_tray_exit_requested.exchange(false)) running = false;
+#endif
         if (!running) break;
+#ifdef _WIN32
+        if (g_tray_installed && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_HIDDEN)) continue;
+#endif
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
         if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) {
             g.show_log = !g.show_log;
             save_settings();
+        }
+        if (!ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl &&
+            ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
+            running = false;
+            continue;
         }
         auto* main_viewport = ImGui::GetMainViewport();
         ImGui::SetNextWindowViewport(main_viewport->ID);
@@ -2082,6 +2811,7 @@ int main(int, char**) {
         if (frame_elapsed < minimum_frame_time)
             SDL_Delay(static_cast<Uint32>((minimum_frame_time - frame_elapsed).count()));
     }
+    remove_tray_icon();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
