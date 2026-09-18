@@ -844,6 +844,9 @@ static fs::path find_android_apk() {
 }
 
 
+static std::string adb_prefix(const fs::path& adb, const std::string& serial);
+static void refresh_adb_status_async();
+
 static AndroidPackageArtifacts detect_android_package_artifacts() {
     AndroidPackageArtifacts result;
     auto output = package_output();
