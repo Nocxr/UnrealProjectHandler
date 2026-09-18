@@ -3454,6 +3454,133 @@ static bool replace_json_string_value(std::string& text, const std::string& key,
     return true;
 }
 
+static bool build_and_install_unrealsharp_managed(const fs::path& plugin_dir, const std::string& ue_config) {
+    const auto solution = plugin_dir / "Managed" / "UnrealSharp" / "UnrealSharp.sln";
+    if (!fs::is_regular_file(solution)) return true; // Not an UnrealSharp-style managed plugin.
+
+    log_line("[SYSTEM] Building UnrealSharp managed runtime and tooling assemblies...");
+
+    std::ostringstream command;
+#ifdef _WIN32
+    command << "set DOTNET_CLI_USE_MSBUILD_SERVER=0&& set MSBUILDUSESERVER=0&& dotnet build "
+            << quote(solution) << " -c Release -p:UETargetType=Editor -p:UEBuildConfig=" << ue_config;
+#else
+    command << "DOTNET_CLI_USE_MSBUILD_SERVER=0 MSBUILDUSESERVER=0 dotnet build "
+            << quote(solution) << " -c Release -p:UETargetType=Editor -p:UEBuildConfig=" << ue_config;
+#endif
+
+#ifdef _WIN32
+    auto wrapped = "cmd /S /C \"" + command.str() + " 2>&1\"";
+#else
+    auto wrapped = command.str() + " 2>&1";
+#endif
+    FILE* pipe = popen(wrapped.c_str(), "r");
+    if (!pipe) {
+        log_line("[ERROR] Could not start UnrealSharp managed build.");
+        return false;
+    }
+
+    char buffer[4096];
+    while (fgets(buffer, sizeof(buffer), pipe)) {
+        std::string line(buffer);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+        if (!line.empty()) log_line("[MANAGED] " + line);
+    }
+    const int status = pclose(pipe);
+    if (status != 0) {
+        log_line("[ERROR] UnrealSharp managed solution build failed.");
+        return false;
+    }
+
+    const auto managed_root = plugin_dir / "Managed" / "UnrealSharp";
+    const auto install_root = plugin_dir / "Binaries" / "Managed";
+    std::error_code ec;
+
+    struct Candidate {
+        fs::path path;
+        fs::file_time_type time{};
+    };
+    std::map<std::pair<std::string, std::string>, Candidate> newest;
+
+    for (fs::recursive_directory_iterator it(managed_root, fs::directory_options::skip_permission_denied, ec), end;
+         it != end; it.increment(ec)) {
+        if (ec) { ec.clear(); continue; }
+        if (!it->is_regular_file(ec)) continue;
+
+        const auto path = it->path();
+        std::string tfm;
+        for (const auto& part : path) {
+            const auto value = part.string();
+            if (value == "net10.0" || value == "netstandard2.0") tfm = value;
+        }
+        if (tfm.empty()) continue;
+
+        const auto parent = path.parent_path();
+        if (parent.filename() != tfm || parent.parent_path().filename() != "Release" ||
+            parent.parent_path().parent_path().filename() != "bin")
+            continue;
+
+        const auto ext = path.extension().string();
+        if (ext != ".dll" && ext != ".pdb" && ext != ".json" && ext != ".xml") continue;
+
+        auto time = fs::last_write_time(path, ec);
+        if (ec) { ec.clear(); continue; }
+
+        auto key = std::make_pair(tfm, path.filename().string());
+        auto found = newest.find(key);
+        if (found == newest.end() || time > found->second.time)
+            newest[key] = {path, time};
+    }
+
+    if (newest.empty()) {
+        log_line("[ERROR] UnrealSharp managed build succeeded but no managed outputs were found.");
+        return false;
+    }
+
+    size_t copied = 0;
+    for (const auto& [key, candidate] : newest) {
+        const auto destination_dir = install_root / key.first;
+        fs::create_directories(destination_dir, ec);
+        if (ec) {
+            log_line("[ERROR] Could not create managed install directory: " + destination_dir.string());
+            return false;
+        }
+
+        const auto destination = destination_dir / candidate.path.filename();
+        ec.clear();
+        fs::copy_file(candidate.path, destination, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            log_line("[ERROR] Could not install managed assembly " + candidate.path.string() +
+                     " -> " + destination.string() + ": " + ec.message());
+            return false;
+        }
+        ++copied;
+    }
+
+    const std::vector<fs::path> required = {
+        install_root / "net10.0" / "UnrealSharp.dll",
+        install_root / "net10.0" / "UnrealSharp.Binds.dll",
+        install_root / "net10.0" / "UnrealSharp.Core.dll",
+        install_root / "net10.0" / "UnrealSharp.Log.dll",
+        install_root / "net10.0" / "UnrealSharp.Plugins.dll",
+        install_root / "netstandard2.0" / "UnrealSharp.GlueGenerator.dll",
+        install_root / "netstandard2.0" / "UnrealSharp.Analyzers.dll",
+        install_root / "netstandard2.0" / "UnrealSharp.CodeFixer.dll",
+        install_root / "netstandard2.0" / "UnrealSharp.SourceGenerators.dll",
+        install_root / "netstandard2.0" / "Newtonsoft.Json.dll"
+    };
+    for (const auto& required_file : required) {
+        if (!fs::is_regular_file(required_file)) {
+            log_line("[ERROR] Required UnrealSharp managed assembly is still missing: " + required_file.string());
+            return false;
+        }
+    }
+
+    log_line("[SYSTEM] Installed " + std::to_string(copied) +
+             " UnrealSharp managed build outputs into " + install_root.string());
+    return true;
+}
+
 static bool finalize_compiled_plugin_manifest(const fs::path& plugin_dir,
                                               const fs::path& host_root,
                                               const std::vector<std::string>& source_modules) {
@@ -3695,10 +3822,15 @@ static void compile_plugin_module(const fs::path& dir) {
         return true;
     };
 
-    auto finish = [dir, host_root, source_modules](bool success) {
+    const std::string ue_config = g.configs[g.compile_config];
+    auto finish = [dir, host_root, source_modules, ue_config](bool success) {
         if (!success) return;
-        if (!finalize_compiled_plugin_manifest(dir, host_root, source_modules))
+        if (!finalize_compiled_plugin_manifest(dir, host_root, source_modules)) {
             log_line("[ERROR] Plugin compiled, but its UBT-generated module manifest could not be finalized.");
+            return;
+        }
+        if (!build_and_install_unrealsharp_managed(dir, ue_config))
+            log_line("[ERROR] Native plugin compile succeeded, but UnrealSharp managed binaries could not be prepared.");
     };
 
     run_command_with_prep(command.str(), "Compile Plugin " + descriptor.stem().string(),
