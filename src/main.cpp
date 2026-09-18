@@ -3428,9 +3428,11 @@ static void compile_plugin_module(const fs::path& dir) {
 
     std::ostringstream command;
 #ifdef _WIN32
-    command << quote(build_script()) << " HostProjectEditor Win64 ";
+    command << "set DOTNET_CLI_USE_MSBUILD_SERVER=0&& set MSBUILDUSESERVER=0&& "
+            << quote(build_script()) << " HostProjectEditor Win64 ";
 #else
-    command << "bash " << quote(build_script()) << " HostProjectEditor Mac ";
+    command << "DOTNET_CLI_USE_MSBUILD_SERVER=0 MSBUILDUSESERVER=0 "
+            << "bash " << quote(build_script()) << " HostProjectEditor Mac ";
 #endif
     command << g.configs[g.compile_config]
             << " -Project=" << quote(host_project)
@@ -3449,6 +3451,11 @@ static void compile_plugin_module(const fs::path& dir) {
 
     auto prepare = [host_root, host_plugins, host_plugin_dir, host_project, source_dir, config_dir, target_file,
                     dir, descriptor, dependencies]() -> bool {
+#ifdef _WIN32
+        std::system("dotnet build-server shutdown >nul 2>&1");
+#else
+        std::system("dotnet build-server shutdown >/dev/null 2>&1");
+#endif
         std::error_code ec;
         fs::create_directories(host_plugins, ec);
         if (ec) { log_line("[ERROR] Could not create plugin compile host: " + host_root.string()); return false; }
