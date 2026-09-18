@@ -44,7 +44,14 @@ struct Engine { std::string label; fs::path path; };
 struct ToolRow { std::string group; std::string name; fs::path path; bool found; };
 struct ToolMeta { std::string version; std::string install; std::string code; };
 struct FavoritePlugin { std::string name; std::string url; };
-struct PluginGitState { bool submodule = false; std::string revision; };
+struct PluginGitState {
+    bool git_repo = false;
+    bool submodule = false;
+    std::string revision;
+    std::string remote_url;
+    std::string repo_name;
+    std::vector<std::string> branches;
+};
 struct ProjectGitState { fs::path root; std::string branch; std::vector<std::string> branches; };
 struct AndroidPackageArtifacts {
     fs::path install_bat;
@@ -100,8 +107,14 @@ struct AppState {
     int adb_log_quick_filter = 0;
     int adb_record_seconds = 10;
     AndroidPackageArtifacts adb_artifacts;
-    bool clear_on_run = false;
+    bool clear_on_run = true;
     bool log_expanded = false;
+    std::string hotkey_toggle_log = "GraveAccent";
+    std::string hotkey_quit = "Ctrl+Q";
+    std::string hotkey_launch_editor = "Ctrl+E";
+    std::string hotkey_play = "Ctrl+P";
+    std::string hotkey_compile = "Ctrl+B";
+    std::string hotkey_package = "Ctrl+Shift+B";
     std::set<int> selected_logs;
     int log_selection_anchor = -1;
     std::atomic<bool> process_running{false};
@@ -375,6 +388,13 @@ static void save_settings() {
     out << "unrealsharp_target=" << g.unrealsharp_target << '\n';
     out << "unrealsharp=" << g.unrealsharp << '\n';
     out << "clean_output=" << g.clean_output << '\n';
+    out << "clear_on_run=" << g.clear_on_run << '\n';
+    out << "hotkey_toggle_log=" << g.hotkey_toggle_log << '\n';
+    out << "hotkey_quit=" << g.hotkey_quit << '\n';
+    out << "hotkey_launch_editor=" << g.hotkey_launch_editor << '\n';
+    out << "hotkey_play=" << g.hotkey_play << '\n';
+    out << "hotkey_compile=" << g.hotkey_compile << '\n';
+    out << "hotkey_package=" << g.hotkey_package << '\n';
     if (!g.selected_tool_catalog_version.empty()) out << "tool_catalog_version=" << g.selected_tool_catalog_version << '\n';
     for (const auto& [key, path] : g.tool_overrides) if (!path.empty()) out << "tool_override=" << key << '|' << path.string() << '\n';
     for (const auto& plugin : g.favorite_plugins) if (!plugin.name.empty() && !plugin.url.empty())
@@ -402,6 +422,13 @@ static void load_settings() {
             else if (key == "unrealsharp_target") g.unrealsharp_target = std::stoi(value);
             else if (key == "unrealsharp") g.unrealsharp = std::stoi(value) != 0;
             else if (key == "clean_output") g.clean_output = std::stoi(value) != 0;
+            else if (key == "clear_on_run") g.clear_on_run = std::stoi(value) != 0;
+            else if (key == "hotkey_toggle_log") g.hotkey_toggle_log = value;
+            else if (key == "hotkey_quit") g.hotkey_quit = value;
+            else if (key == "hotkey_launch_editor") g.hotkey_launch_editor = value;
+            else if (key == "hotkey_play") g.hotkey_play = value;
+            else if (key == "hotkey_compile") g.hotkey_compile = value;
+            else if (key == "hotkey_package") g.hotkey_package = value;
             else if (key == "tool_catalog_version") g.selected_tool_catalog_version = value;
             else if (key == "tool_override") {
                 auto split_override = value.find('|');
@@ -1243,38 +1270,25 @@ static void stop_adb_logcat() {
 static ProjectGitState inspect_project_git_state(const fs::path& project) {
     ProjectGitState state;
     if (project.empty()) return state;
-
     auto project_dir = project.parent_path();
-    auto identity = capture_command("git -C " + quote(project_dir) + " rev-parse --show-toplevel --abbrev-ref HEAD");
-    if (identity.empty()) return state;
 
-    std::stringstream identity_lines(identity);
-    std::string root;
-    std::string branch;
-    std::getline(identity_lines, root);
-    std::getline(identity_lines, branch);
-    if (!root.empty() && root.back() == '\r') root.pop_back();
-    if (!branch.empty() && branch.back() == '\r') branch.pop_back();
+    auto root = capture_command("git -C " + quote(project_dir) + " rev-parse --show-toplevel");
     if (root.empty()) return state;
-
     state.root = fs::path(root);
-    state.branch = branch == "HEAD" ? std::string{} : branch;
 
+    state.branch = capture_command("git -C " + quote(state.root) + " symbolic-ref --quiet --short HEAD");
     auto branches = capture_command("git -C " + quote(state.root) + " branch --list --no-color");
     std::stringstream lines(branches);
     std::string line;
     while (std::getline(lines, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        while (!line.empty() && (line.front() == '*' || std::isspace(static_cast<unsigned char>(line.front()))))
-            line.erase(line.begin());
-        while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back())))
-            line.pop_back();
+        while (!line.empty() && (line.front() == '*' || std::isspace(static_cast<unsigned char>(line.front())))) line.erase(line.begin());
+        while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
         if (!line.empty()) state.branches.push_back(line);
     }
-
     if (state.branch.empty()) {
         auto sha = capture_command("git -C " + quote(state.root) + " rev-parse --short HEAD");
-        if (!sha.empty()) state.branch = "detached @ " + sha;
+        state.branch = sha.empty() ? "unborn branch" : "detached @ " + sha;
     }
     return state;
 }
@@ -1817,6 +1831,44 @@ static void tooltip(const char* text) {
         ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
+}
+
+static std::optional<ImGuiKey> hotkey_key_from_name(std::string name) {
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch){ return static_cast<char>(std::toupper(ch)); });
+    if (name == "GRAVEACCENT" || name == "GRAVE" || name == "`") return ImGuiKey_GraveAccent;
+    if (name.size() == 1 && name[0] >= 'A' && name[0] <= 'Z') return static_cast<ImGuiKey>(ImGuiKey_A + (name[0] - 'A'));
+    if (name.size() == 1 && name[0] >= '0' && name[0] <= '9') return static_cast<ImGuiKey>(ImGuiKey_0 + (name[0] - '0'));
+    if (name == "F1") return ImGuiKey_F1; if (name == "F2") return ImGuiKey_F2;
+    if (name == "F3") return ImGuiKey_F3; if (name == "F4") return ImGuiKey_F4;
+    if (name == "F5") return ImGuiKey_F5; if (name == "F6") return ImGuiKey_F6;
+    if (name == "F7") return ImGuiKey_F7; if (name == "F8") return ImGuiKey_F8;
+    if (name == "F9") return ImGuiKey_F9; if (name == "F10") return ImGuiKey_F10;
+    if (name == "F11") return ImGuiKey_F11; if (name == "F12") return ImGuiKey_F12;
+    if (name == "SPACE") return ImGuiKey_Space;
+    if (name == "ENTER") return ImGuiKey_Enter;
+    return std::nullopt;
+}
+
+static bool hotkey_pressed(const std::string& spec) {
+    if (spec.empty() || ImGui::GetIO().WantTextInput) return false;
+    std::stringstream ss(spec);
+    std::string part, key_name;
+    bool want_ctrl=false, want_shift=false, want_alt=false;
+    while (std::getline(ss, part, '+')) {
+        while (!part.empty() && std::isspace(static_cast<unsigned char>(part.front()))) part.erase(part.begin());
+        while (!part.empty() && std::isspace(static_cast<unsigned char>(part.back()))) part.pop_back();
+        std::string upper=part;
+        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char ch){ return static_cast<char>(std::toupper(ch)); });
+        if (upper=="CTRL" || upper=="CONTROL") want_ctrl=true;
+        else if (upper=="SHIFT") want_shift=true;
+        else if (upper=="ALT") want_alt=true;
+        else key_name=part;
+    }
+    auto key=hotkey_key_from_name(key_name);
+    if (!key) return false;
+    auto& io=ImGui::GetIO();
+    if (want_ctrl != io.KeyCtrl || want_shift != io.KeyShift || want_alt != io.KeyAlt) return false;
+    return ImGui::IsKeyPressed(*key, false);
 }
 
 static bool readiness_button(const char* label, bool ready) {
@@ -2486,6 +2538,25 @@ static void draw_settings_ui() {
         }
     }
     ImGui::Spacing();
+    if (ImGui::CollapsingHeader("Hotkeys", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextDisabled("Editable shortcuts. Supported keys: A-Z, 0-9, F1-F12, GraveAccent, Space, Enter; modifiers: Ctrl, Shift, Alt.");
+        auto edit_hotkey = [](const char* label, std::string& value) {
+            std::array<char, 128> buffer{};
+            std::snprintf(buffer.data(), buffer.size(), "%s", value.c_str());
+            ImGui::SetNextItemWidth(220.0f);
+            if (ImGui::InputText(label, buffer.data(), buffer.size())) {
+                value = buffer.data();
+                save_settings();
+            }
+        };
+        edit_hotkey("Toggle Build Log", g.hotkey_toggle_log);
+        edit_hotkey("Quit", g.hotkey_quit);
+        edit_hotkey("Launch in Editor", g.hotkey_launch_editor);
+        edit_hotkey("Play", g.hotkey_play);
+        edit_hotkey("Compile Project", g.hotkey_compile);
+        edit_hotkey("Package Project", g.hotkey_package);
+    }
+    ImGui::Spacing();
     ImGui::SeparatorText("Tooling");
     draw_tooling_ui();
     ImGui::Spacing();
@@ -2630,22 +2701,49 @@ static std::string add_plugin_submodule_command(const fs::path& root, const fs::
     return command;
 }
 
+static std::string repo_name_from_url(std::string url) {
+    url = normalized_git_url(url);
+    if (url.empty()) return {};
+    if (url.ends_with(".git")) url.resize(url.size() - 4);
+    auto github = url.find("github.com");
+    if (github != std::string::npos) {
+        auto start = url.find_first_of("/:", github + 10);
+        if (start != std::string::npos) {
+            auto value = url.substr(start + 1);
+            while (!value.empty() && value.front() == '/') value.erase(value.begin());
+            return value;
+        }
+    }
+    auto slash = url.find_last_of('/');
+    return slash == std::string::npos ? url : url.substr(slash + 1);
+}
+
 static PluginGitState inspect_plugin_git_state(const fs::path& dir, const fs::path& root) {
     PluginGitState state;
-    if (root.empty()) return state;
-    std::error_code ec;
-    auto relative = fs::relative(dir, root, ec);
-    if (ec) return state;
-    auto status = capture_command("git -C " + quote(root) + " submodule status -- " + quote(relative));
-    if (status.empty()) return state;
-    state.submodule = true;
-    auto status_sha = status;
-    if (!status_sha.empty() && (status_sha.front() == ' ' || status_sha.front() == '-' || status_sha.front() == '+')) status_sha.erase(status_sha.begin());
-    if (auto end = status_sha.find_first_of(" \t\r\n"); end != std::string::npos) status_sha.erase(end);
+    auto git_root = capture_command("git -C " + quote(dir) + " rev-parse --show-toplevel");
+    if (git_root.empty()) return state;
+    state.git_repo = true;
+
+    if (!root.empty()) {
+        std::error_code ec;
+        auto relative = fs::relative(dir, root, ec);
+        if (!ec) state.submodule = !capture_command("git -C " + quote(root) + " submodule status -- " + quote(relative)).empty();
+    }
+
     auto branch = capture_command("git -C " + quote(dir) + " symbolic-ref --quiet --short HEAD");
     auto sha = capture_command("git -C " + quote(dir) + " rev-parse --short HEAD");
-    if (sha.empty() && !status_sha.empty()) sha = status_sha.substr(0, std::min<size_t>(12, status_sha.size()));
-    state.revision = branch.empty() ? (sha.empty() ? "detached" : "detached @ " + sha) : branch;
+    state.revision = branch.empty() ? (sha.empty() ? "unborn branch" : "detached @ " + sha) : branch;
+    state.remote_url = capture_command("git -C " + quote(dir) + " remote get-url origin");
+    state.repo_name = repo_name_from_url(state.remote_url);
+
+    auto branches = capture_command("git -C " + quote(dir) + " branch --list --no-color");
+    std::stringstream lines(branches);
+    std::string line;
+    while (std::getline(lines, line)) {
+        while (!line.empty() && (line.front() == '*' || std::isspace(static_cast<unsigned char>(line.front())))) line.erase(line.begin());
+        while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
+        if (!line.empty()) state.branches.push_back(line);
+    }
     return state;
 }
 
@@ -2740,35 +2838,110 @@ static void remove_plugin_submodule(const fs::path& root, const fs::path& relati
     }).detach();
 }
 
+static std::string plugin_module_name(const fs::path& dir) {
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (entry.path().extension() != ".uplugin") continue;
+        auto text = read_text(entry.path());
+        auto modules = text.find("\"Modules\"");
+        if (modules == std::string::npos) return {};
+        auto name = text.find("\"Name\"", modules);
+        if (name == std::string::npos) return {};
+        auto colon = text.find(':', name);
+        auto q1 = text.find('"', colon + 1);
+        auto q2 = q1 == std::string::npos ? std::string::npos : text.find('"', q1 + 1);
+        if (q1 != std::string::npos && q2 != std::string::npos) return text.substr(q1 + 1, q2 - q1 - 1);
+    }
+    return {};
+}
+
+static void compile_plugin_module(const fs::path& dir) {
+    if (g.targets.empty()) { log_line("[ERROR] No project target available to compile plugin module."); return; }
+    auto module = plugin_module_name(dir);
+    if (module.empty()) { log_line("[ERROR] No C++ module found in plugin " + dir.filename().string()); return; }
+    auto target = g.targets[std::min<int>(g.compile_target, g.targets.size()-1)].name;
+    std::ostringstream command;
+#ifdef _WIN32
+    command << quote(build_script()) << ' ' << target << " Win64 ";
+#else
+    command << "bash " << quote(build_script()) << ' ' << target << " Mac ";
+#endif
+    command << g.configs[g.compile_config] << " -Project=" << quote(g.project)
+            << " -Module=" << module << " -WaitMutex -Verbose";
+    run_command(command.str(), "Compile Plugin " + module, true);
+}
+
+static void plugin_git_controls(const fs::path& dir, const PluginGitState& state) {
+    if (!state.git_repo) return;
+    if (!state.repo_name.empty()) {
+        ImGui::TextDisabled("%s", state.repo_name.c_str());
+        ImGui::SameLine();
+    }
+    const char* current = state.revision.empty() ? "Unknown" : state.revision.c_str();
+    ImGui::SetNextItemWidth(180.0f);
+    if (ImGui::BeginCombo("##plugin_branch", current)) {
+        for (const auto& branch : state.branches) {
+            bool selected = branch == state.revision;
+            if (ImGui::Selectable(branch.c_str(), selected) && !selected) {
+                run_command("git -C " + quote(dir) + " switch " + quote(fs::path(branch)),
+                            "Switch Plugin Branch " + dir.filename().string(), true);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Update")) {
+        run_command("git -C " + quote(dir) + " fetch --all --prune && git -C " + quote(dir) + " pull --ff-only",
+                    "Update Plugin " + dir.filename().string(), true);
+    }
+}
+
 static void draw_plugin_list(const fs::path& root, bool refresh = false, bool show_git_details = false) {
     if (root.empty()) { ImGui::TextDisabled("Select a project on the Project tab first."); return; }
     if (refresh && !g.plugin_details_running) g.plugin_git_cache.clear();
     if (!fs::exists(root)) { ImGui::TextDisabled("No plugins in %s", root.string().c_str()); return; }
     const auto& plugins = list_plugins(root, refresh);
     if (plugins.empty()) { ImGui::TextDisabled("No plugins found in %s", root.string().c_str()); return; }
+
     if (show_git_details) {
         std::vector<fs::path> missing;
         for (const auto& dir : plugins)
             if (!g.plugin_git_cache.contains(normalized_path_key(dir))) missing.push_back(dir);
         request_plugin_details(std::move(missing));
-        if (g.plugin_details_running) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("Checking Git details...");
-        }
     }
+
     for (const auto& dir : plugins) {
         ImGui::PushID(dir.string().c_str());
+        ImGui::Separator();
         ImGui::TextUnformatted(plugin_display_name(dir).c_str());
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", dir.string().c_str());
-        ImGui::SameLine();
+
+        PluginGitState state;
+        bool have_state = false;
         if (show_git_details) {
             auto found = g.plugin_git_cache.find(normalized_path_key(dir));
-            if (found == g.plugin_git_cache.end()) ImGui::TextDisabled("Checking...");
-            else ImGui::TextColored(found->second.submodule ? ImVec4(0.30f, 0.68f, 1.0f, 1.0f) : ImVec4(0.58f, 0.58f, 0.58f, 1.0f),
-                                    "%s", found->second.submodule ? ("Submodule | " + found->second.revision).c_str() : "Local folder");
-            ImGui::SameLine();
+            if (found != g.plugin_git_cache.end()) { state = found->second; have_state = true; }
         }
+
+        if (have_state && state.git_repo) {
+            ImGui::SameLine();
+            ImGui::TextColored(state.submodule ? ImVec4(0.30f,0.68f,1.0f,1.0f) : ImVec4(0.58f,0.78f,0.58f,1.0f),
+                               "%s", state.submodule ? "Submodule" : "Git");
+            ImGui::SameLine();
+            plugin_git_controls(dir, state);
+        } else if (show_git_details) {
+            ImGui::SameLine();
+            ImGui::TextDisabled(have_state ? "Local folder" : "Checking Git...");
+        }
+
         if (ImGui::SmallButton("Open")) open_path(dir);
+        ImGui::SameLine();
+        auto module = plugin_module_name(dir);
+        const bool compile_ready = !module.empty() && !g.process_running && !g.targets.empty();
+        if (!compile_ready) ImGui::BeginDisabled();
+        if (ImGui::SmallButton("Compile Plugin")) compile_plugin_module(dir);
+        if (!compile_ready) ImGui::EndDisabled();
+        if (!module.empty()) { ImGui::SameLine(); ImGui::TextDisabled("Module: %s", module.c_str()); }
         ImGui::PopID();
     }
 }
@@ -2833,7 +3006,7 @@ static void draw_favorite_plugins() {
         auto git_state = g.plugin_git_cache.find(git_key);
         bool submodule_exists = target_exists && git_state != g.plugin_git_cache.end() && git_state->second.submodule;
         bool can_clone = !g.project.empty() && !g.process_running && valid_folder;
-        bool project_is_git = !g.project.empty() && fs::exists(g.project.parent_path() / ".git");
+        bool project_is_git = !g.project.empty() && !capture_command("git -C " + quote(g.project.parent_path()) + " rev-parse --show-toplevel").empty();
         bool can_submodule = can_clone && project_is_git && (submodule_exists || !target_exists);
         if (!can_submodule) ImGui::BeginDisabled();
         if (ImGui::SmallButton(submodule_exists ? "Remove Submodule" : "Add Submodule")) {
@@ -2871,6 +3044,18 @@ static void draw_favorite_plugins() {
         if (ImGui::SmallButton("Remove")) remove = i;
         ImGui::SameLine();
         ImGui::TextUnformatted(plugin.name.c_str());
+        ImGui::SameLine();
+        auto favorite_repo = repo_name_from_url(plugin.url);
+        ImGui::TextDisabled("%s", favorite_repo.empty() ? plugin.url.c_str() : favorite_repo.c_str());
+        if (target_exists && git_state != g.plugin_git_cache.end() && git_state->second.git_repo) {
+            plugin_git_controls(target, git_state->second);
+            auto module = plugin_module_name(target);
+            const bool can_compile_plugin = !module.empty() && !g.process_running && !g.targets.empty();
+            ImGui::SameLine();
+            if (!can_compile_plugin) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("Compile Plugin")) compile_plugin_module(target);
+            if (!can_compile_plugin) ImGui::EndDisabled();
+        }
         ImGui::PopID();
     }
     if (remove >= 0) {
@@ -3019,6 +3204,12 @@ static void initialize_project_git() {
             "*.sdf\n"
             "*.tmp\n"
             "*.log\n";
+    }
+    {
+        std::lock_guard lock(g.git_mutex);
+        g.git_root.clear();
+        g.git_branch.clear();
+        g.git_branches.clear();
     }
     run_command("git -C " + quote(root) + " init", "Git Init", false, true);
 }
@@ -3493,7 +3684,7 @@ static void draw_footer() {
     const float footer_y = ImGui::GetWindowHeight() - ImGui::GetStyle().WindowPadding.y - footer_height;
     if (ImGui::GetCursorPosY() < footer_y) ImGui::SetCursorPosY(footer_y);
     ImGui::Separator();
-    ImGui::TextDisabled("` Toggle Build Log    |    Ctrl + Q Quit");
+    ImGui::TextDisabled("%s Toggle Build Log    |    %s Quit", g.hotkey_toggle_log.c_str(), g.hotkey_quit.c_str());
 }
 
 static void draw_log_panel() {
@@ -3763,12 +3954,20 @@ int main(int, char**) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
-        if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false))
-            g.log_expanded = !g.log_expanded;
-        if (!ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl &&
-            ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
+        if (hotkey_pressed(g.hotkey_toggle_log)) g.log_expanded = !g.log_expanded;
+        if (hotkey_pressed(g.hotkey_quit)) {
             running = false;
             continue;
+        }
+        if (hotkey_pressed(g.hotkey_launch_editor) && fs::is_regular_file(g.project) && fs::exists(editor_path())) launch_editor(false);
+        if (hotkey_pressed(g.hotkey_play) && fs::is_regular_file(g.project) && fs::exists(editor_path())) launch_editor(true);
+        if (hotkey_pressed(g.hotkey_compile) && g.project_has_cpp_module && !g.process_running) {
+            auto command = compile_command();
+            if (!command.empty()) run_command(command, "Compile");
+        }
+        if (hotkey_pressed(g.hotkey_package) && !g.process_running) {
+            auto command = package_command();
+            if (!command.empty()) run_command(command, "Package");
         }
         auto* main_viewport = ImGui::GetMainViewport();
         ImGui::SetNextWindowViewport(main_viewport->ID);
