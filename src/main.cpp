@@ -1711,13 +1711,15 @@ static std::string package_command() {
 
 static void run_command_with_prep(std::string command, const std::string& name,
                                   std::function<bool()> prepare,
-                                  bool refresh_plugins = false, bool refresh_git = false) {
+                                  bool refresh_plugins = false, bool refresh_git = false,
+                                  std::function<void(bool)> finish = {}) {
     if (g.process_running.exchange(true)) { log_line("[ERROR] Another operation is already running."); return; }
     if (name == "Compile" || name == "Package" || name.rfind("Compile Plugin ", 0) == 0) g.log_expanded = true;
     g.stop_requested = false;
     if (g.clear_on_run) { std::lock_guard lock(g.mutex); g.logs.clear(); }
 
-    std::thread([command = std::move(command), name, prepare = std::move(prepare), refresh_plugins, refresh_git] {
+    std::thread([command = std::move(command), name, prepare = std::move(prepare), refresh_plugins, refresh_git,
+                 finish = std::move(finish)] {
         if (prepare) {
             log_line("[SYSTEM] Preparing " + name + "...");
             if (!prepare()) {
@@ -1783,7 +1785,9 @@ static void run_command_with_prep(std::string command, const std::string& name,
                           detail_line.find("ERROR") != std::string::npos || detail_line.find("Error") != std::string::npos);
             }
         }
-        log_line(status == 0 ? "[SYSTEM] " + name + " completed." : "[ERROR] " + name + " exited with an error.");
+        const bool success = status == 0;
+        if (finish) finish(success);
+        log_line(success ? "[SYSTEM] " + name + " completed." : "[ERROR] " + name + " exited with an error.");
         if (refresh_plugins) g.plugin_refresh_requested = true;
         if (refresh_git) g.git_refresh_requested = true;
         g.process_running = false;
@@ -3402,6 +3406,80 @@ static std::string plugin_module_name(const fs::path& dir) {
     return result;
 }
 
+static bool replace_json_string_value(std::string& text, const std::string& key, const std::string& value) {
+    const auto key_pos = text.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) return false;
+    const auto colon = text.find(':', key_pos);
+    if (colon == std::string::npos) return false;
+    const auto quote_begin = text.find('"', colon + 1);
+    if (quote_begin == std::string::npos) return false;
+    auto quote_end = quote_begin + 1;
+    bool escaped = false;
+    for (; quote_end < text.size(); ++quote_end) {
+        const char ch = text[quote_end];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') break;
+    }
+    if (quote_end >= text.size()) return false;
+    text.replace(quote_begin + 1, quote_end - quote_begin - 1, value);
+    return true;
+}
+
+static bool sync_plugin_build_id_with_editor(const fs::path& plugin_dir) {
+#ifdef _WIN32
+    const char* platform_dir = "Win64";
+#else
+    const char* platform_dir = "Mac";
+#endif
+    const auto engine_manifest = g.engine / "Engine" / "Binaries" / platform_dir / "UnrealEditor.modules";
+    const auto plugin_manifest = plugin_dir / "Binaries" / platform_dir / "UnrealEditor.modules";
+
+    if (!fs::is_regular_file(engine_manifest)) {
+        log_line("[ERROR] Engine module manifest not found: " + engine_manifest.string());
+        return false;
+    }
+    if (!fs::is_regular_file(plugin_manifest)) {
+        log_line("[ERROR] Plugin module manifest not found after compile: " + plugin_manifest.string());
+        return false;
+    }
+
+    const auto engine_text = read_text(engine_manifest);
+    const auto build_id = json_string_value(engine_text, "BuildId");
+    if (build_id.empty()) {
+        log_line("[ERROR] Could not read BuildId from " + engine_manifest.string());
+        return false;
+    }
+
+    auto plugin_text = read_text(plugin_manifest);
+    const auto previous_id = json_string_value(plugin_text, "BuildId");
+    if (!replace_json_string_value(plugin_text, "BuildId", build_id)) {
+        log_line("[ERROR] Could not update BuildId in " + plugin_manifest.string());
+        return false;
+    }
+
+    std::ofstream out(plugin_manifest, std::ios::trunc);
+    out << plugin_text;
+    if (!out) {
+        log_line("[ERROR] Could not write plugin module manifest: " + plugin_manifest.string());
+        return false;
+    }
+
+    if (previous_id != build_id) {
+        log_line("[SYSTEM] Synced plugin module BuildId to installed UnrealEditor: " +
+                 (previous_id.empty() ? std::string{"<missing>"} : previous_id) + " -> " + build_id);
+    } else {
+        log_line("[SYSTEM] Plugin module BuildId already matches installed UnrealEditor: " + build_id);
+    }
+    return true;
+}
+
 static void compile_plugin_module(const fs::path& dir) {
     auto descriptor = plugin_descriptor_path(dir);
     if (descriptor.empty()) {
@@ -3540,7 +3618,14 @@ static void compile_plugin_module(const fs::path& dir) {
         return true;
     };
 
-    run_command_with_prep(command.str(), "Compile Plugin " + descriptor.stem().string(), std::move(prepare), true);
+    auto finish = [dir](bool success) {
+        if (!success) return;
+        if (!sync_plugin_build_id_with_editor(dir))
+            log_line("[ERROR] Plugin compiled, but its UnrealEditor.modules manifest could not be synchronized.");
+    };
+
+    run_command_with_prep(command.str(), "Compile Plugin " + descriptor.stem().string(),
+                          std::move(prepare), true, false, std::move(finish));
 }
 
 
