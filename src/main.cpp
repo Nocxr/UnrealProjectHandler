@@ -120,6 +120,7 @@ struct AppState {
     AndroidPackageArtifacts adb_artifacts;
     bool clear_on_run = true;
     bool log_expanded = false;
+    bool quit_requested = false;
     std::string hotkey_global_toggle = "Ctrl+Alt+U";
     std::string hotkey_toggle_log = "GraveAccent";
     std::string hotkey_quit = "Ctrl+Q";
@@ -3432,21 +3433,23 @@ static bool replace_json_string_value(std::string& text, const std::string& key,
     return true;
 }
 
-static bool sync_plugin_build_id_with_editor(const fs::path& plugin_dir) {
+static bool install_compiled_plugin_binaries(const fs::path& plugin_dir,
+                                            const std::vector<std::string>& modules) {
 #ifdef _WIN32
     const char* platform_dir = "Win64";
+    const char* library_ext = ".dll";
 #else
     const char* platform_dir = "Mac";
+    const char* library_ext = ".dylib";
 #endif
-    const auto engine_manifest = g.engine / "Engine" / "Binaries" / platform_dir / "UnrealEditor.modules";
-    const auto plugin_manifest = plugin_dir / "Binaries" / platform_dir / "UnrealEditor.modules";
+
+    const auto engine_bin = g.engine / "Engine" / "Binaries" / platform_dir;
+    const auto engine_manifest = engine_bin / "UnrealEditor.modules";
+    const auto plugin_bin = plugin_dir / "Binaries" / platform_dir;
+    const auto plugin_manifest = plugin_bin / "UnrealEditor.modules";
 
     if (!fs::is_regular_file(engine_manifest)) {
         log_line("[ERROR] Engine module manifest not found: " + engine_manifest.string());
-        return false;
-    }
-    if (!fs::is_regular_file(plugin_manifest)) {
-        log_line("[ERROR] Plugin module manifest not found after compile: " + plugin_manifest.string());
         return false;
     }
 
@@ -3457,28 +3460,69 @@ static bool sync_plugin_build_id_with_editor(const fs::path& plugin_dir) {
         return false;
     }
 
-    auto plugin_text = read_text(plugin_manifest);
-    const auto previous_id = json_string_value(plugin_text, "BuildId");
-    if (!replace_json_string_value(plugin_text, "BuildId", build_id)) {
-        log_line("[ERROR] Could not update BuildId in " + plugin_manifest.string());
+    std::error_code ec;
+    fs::create_directories(plugin_bin, ec);
+    if (ec) {
+        log_line("[ERROR] Could not create plugin Binaries directory: " + plugin_bin.string());
         return false;
     }
 
-    std::ofstream out(plugin_manifest, std::ios::trunc);
-    out << plugin_text;
-    if (!out) {
+    std::vector<std::pair<std::string, std::string>> installed;
+    for (const auto& module : modules) {
+#ifdef _WIN32
+        const auto filename = "UnrealEditor-" + module + std::string(library_ext);
+        const auto source = engine_bin / filename;
+#else
+        const auto filename = "UnrealEditor-" + module + std::string(library_ext);
+        const auto source = engine_bin / filename;
+#endif
+        if (!fs::is_regular_file(source)) {
+            log_line("[ERROR] Compiled module binary not found: " + source.string());
+            return false;
+        }
+
+        const auto destination = plugin_bin / filename;
+        fs::copy_file(source, destination, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            log_line("[ERROR] Could not copy compiled module binary to plugin: " + destination.string() + ": " + ec.message());
+            return false;
+        }
+
+#ifdef _WIN32
+        const auto pdb_source = engine_bin / ("UnrealEditor-" + module + ".pdb");
+        if (fs::is_regular_file(pdb_source)) {
+            ec.clear();
+            fs::copy_file(pdb_source, plugin_bin / pdb_source.filename(), fs::copy_options::overwrite_existing, ec);
+            if (ec) log_line("[WARNING] Could not copy PDB for " + module + ": " + ec.message());
+        }
+#endif
+        installed.push_back({module, filename});
+    }
+
+    std::ofstream manifest(plugin_manifest, std::ios::trunc);
+    manifest << "{\n";
+    manifest << "  \"BuildId\": \"" << json_escape(build_id) << "\",\n";
+    manifest << "  \"Modules\": {\n";
+    for (size_t i = 0; i < installed.size(); ++i) {
+        manifest << "    \"" << json_escape(installed[i].first) << "\": \""
+                 << json_escape(installed[i].second) << "\"";
+        manifest << (i + 1 < installed.size() ? "," : "") << "\n";
+    }
+    manifest << "  }\n";
+    manifest << "}\n";
+    manifest.close();
+
+    if (!manifest) {
         log_line("[ERROR] Could not write plugin module manifest: " + plugin_manifest.string());
         return false;
     }
 
-    if (previous_id != build_id) {
-        log_line("[SYSTEM] Synced plugin module BuildId to installed UnrealEditor: " +
-                 (previous_id.empty() ? std::string{"<missing>"} : previous_id) + " -> " + build_id);
-    } else {
-        log_line("[SYSTEM] Plugin module BuildId already matches installed UnrealEditor: " + build_id);
-    }
+    log_line("[SYSTEM] Installed " + std::to_string(installed.size()) +
+             " compiled module binaries into " + plugin_bin.string());
+    log_line("[SYSTEM] Wrote plugin UnrealEditor.modules with engine BuildId " + build_id);
     return true;
 }
+
 
 static void compile_plugin_module(const fs::path& dir) {
     auto descriptor = plugin_descriptor_path(dir);
@@ -3618,10 +3662,10 @@ static void compile_plugin_module(const fs::path& dir) {
         return true;
     };
 
-    auto finish = [dir](bool success) {
+    auto finish = [dir, modules](bool success) {
         if (!success) return;
-        if (!sync_plugin_build_id_with_editor(dir))
-            log_line("[ERROR] Plugin compiled, but its UnrealEditor.modules manifest could not be synchronized.");
+        if (!install_compiled_plugin_binaries(dir, modules))
+            log_line("[ERROR] Plugin compiled, but its binaries could not be installed into the plugin folder.");
     };
 
     run_command_with_prep(command.str(), "Compile Plugin " + descriptor.stem().string(),
@@ -4896,11 +4940,12 @@ static void draw_top_context_selectors() {
 }
 
 static void draw_footer() {
-    const float footer_height = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 2.0f;
+    const float footer_height = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y + 2.0f;
     const float footer_y = ImGui::GetWindowHeight() - ImGui::GetStyle().WindowPadding.y - footer_height;
     if (ImGui::GetCursorPosY() < footer_y) ImGui::SetCursorPosY(footer_y);
     ImGui::Separator();
 
+    ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("%s Show/Hide | %s Log | %s Editor | %s Play | %s Build | %s Package | %s Quit",
                         g.hotkey_global_toggle.c_str(),
                         g.hotkey_toggle_log.c_str(),
@@ -4909,6 +4954,14 @@ static void draw_footer() {
                         g.hotkey_compile.c_str(),
                         g.hotkey_package.c_str(),
                         g.hotkey_quit.c_str());
+
+    const float quit_width = ImGui::CalcTextSize("Quit").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    ImGui::SameLine();
+    const float available = ImGui::GetContentRegionAvail().x;
+    if (available > quit_width) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + available - quit_width);
+    if (ImGui::Button("Quit##footer"))
+        g.quit_requested = true;
+    tooltip("Exit UPH completely instead of hiding it to the tray.");
 }
 
 static void draw_log_panel() {
@@ -5190,6 +5243,10 @@ int main(int, char**) {
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
         draw_ui();
         ImGui::End();
+        if (g.quit_requested) {
+            running = false;
+            continue;
+        }
         ImGui::Render();
         int width, height;
         SDL_GetWindowSizeInPixels(g_window, &width, &height);
