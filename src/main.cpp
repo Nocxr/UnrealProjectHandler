@@ -148,6 +148,7 @@ struct AppState {
     bool app_on_main_commit = true;
     std::string app_local_commit;
     std::string app_main_commit;
+    std::string app_local_branch;
     std::mutex mutex;
     std::mutex plugin_mutex;
     std::mutex git_mutex;
@@ -832,6 +833,7 @@ static void check_app_main_commit_async() {
     if (g.app_update_check_running.exchange(true)) return;
     std::thread([] {
         auto local = capture_command("git rev-parse HEAD");
+        auto local_branch = capture_command("git branch --show-current");
         auto remote = capture_command("git ls-remote origin refs/heads/main");
         if (remote.empty()) remote = capture_command("git ls-remote origin refs/heads/master");
         auto split = remote.find_first_of(" \t");
@@ -840,6 +842,7 @@ static void check_app_main_commit_async() {
             std::lock_guard lock(g.app_update_mutex);
             g.app_local_commit = local;
             g.app_main_commit = remote;
+            g.app_local_branch = local_branch;
             g.app_on_main_commit = !local.empty() && !remote.empty() && local == remote;
         }
         g.app_update_check_running = false;
@@ -851,13 +854,21 @@ static void draw_app_update_status() {
         ImGui::TextDisabled("Checking UPH version...");
         return;
     }
-    std::string local, remote;
+
+    std::string local, remote, local_branch;
     bool current = true;
     {
         std::lock_guard lock(g.app_update_mutex);
         local = g.app_local_commit;
         remote = g.app_main_commit;
+        local_branch = g.app_local_branch;
         current = g.app_on_main_commit;
+    }
+
+    const bool wrong_branch = !local_branch.empty() && local_branch != "main";
+    if (wrong_branch) {
+        ImGui::TextColored(ImVec4(1.0f, 0.68f, 0.20f, 1.0f),
+                           "UPH is running from branch '%s', not main.", local_branch.c_str());
     }
     if (!local.empty() && !remote.empty() && !current) {
         ImGui::TextColored(ImVec4(1.0f, 0.68f, 0.20f, 1.0f),
@@ -3480,7 +3491,9 @@ static void compile_plugin_module(const fs::path& dir) {
         target << "public class HostProjectEditorTarget : TargetRules\n{\n";
         target << "    public HostProjectEditorTarget(TargetInfo Target) : base(Target)\n    {\n";
         target << "        Type = TargetType.Editor;\n";
-        target << "        DefaultBuildSettings = BuildSettingsVersion.V6;\n";
+        target << "        DefaultBuildSettings = BuildSettingsVersion.V7;\n";
+        target << "        IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_8;\n";
+        target << "        BuildEnvironment = TargetBuildEnvironment.Unique;\n";
         target << "        bAllowEnginePluginsEnabledByDefault = false;\n";
         target << "        EnablePlugins.Add(\"" << json_escape(descriptor.stem().string()) << "\");\n";
         target << "        BuildPlugins.Add(\"" << json_escape(descriptor.stem().string()) << "\");\n";
@@ -4767,8 +4780,15 @@ static void draw_footer() {
     const float footer_y = ImGui::GetWindowHeight() - ImGui::GetStyle().WindowPadding.y - footer_height;
     if (ImGui::GetCursorPosY() < footer_y) ImGui::SetCursorPosY(footer_y);
     ImGui::Separator();
-    ImGui::TextDisabled("%s Show/Hide UPH    |    %s Toggle Build Log    |    %s Quit",
-                        g.hotkey_global_toggle.c_str(), g.hotkey_toggle_log.c_str(), g.hotkey_quit.c_str());
+
+    ImGui::TextDisabled("%s Show/Hide    |    %s Log    |    %s Editor    |    %s Play    |    %s Compile    |    %s Package    |    %s Quit",
+                        g.hotkey_global_toggle.c_str(),
+                        g.hotkey_toggle_log.c_str(),
+                        g.hotkey_launch_editor.c_str(),
+                        g.hotkey_play.c_str(),
+                        g.hotkey_compile.c_str(),
+                        g.hotkey_package.c_str(),
+                        g.hotkey_quit.c_str());
 }
 
 static void draw_log_panel() {
