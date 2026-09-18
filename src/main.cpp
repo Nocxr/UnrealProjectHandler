@@ -74,6 +74,8 @@ struct AppState {
     std::vector<ToolRow> tools;
     std::map<std::string, std::vector<fs::path>> plugin_scan_cache;
     std::map<std::string, PluginGitState> plugin_git_cache;
+    std::map<std::string, std::string> plugin_display_cache;
+    std::map<std::string, std::string> plugin_module_cache;
     std::map<std::string, fs::path> tool_overrides;
     std::map<std::string, std::map<std::string, ToolMeta>> tool_catalogs;
     std::vector<std::string> tool_catalog_versions;
@@ -1367,6 +1369,8 @@ static void select_project(fs::path project) {
     g.project = project;
     g.output.clear();
     g.plugin_scan_cache.clear();
+    g.plugin_display_cache.clear();
+    g.plugin_module_cache.clear();
     remember_project(project);
     match_project_engine(project);
     inspect_project();
@@ -2665,14 +2669,19 @@ static fs::path engine_marketplace_dir() {
 }
 
 static std::string plugin_display_name(const fs::path& dir) {
+    auto key = normalized_path_key(dir);
+    if (auto found = g.plugin_display_cache.find(key); found != g.plugin_display_cache.end()) return found->second;
+
+    std::string result = dir.filename().string();
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(dir, ec)) {
         if (entry.path().extension() != ".uplugin") continue;
         auto friendly = json_string_value(read_text(entry.path()), "FriendlyName");
-        if (!friendly.empty()) return friendly;
-        return entry.path().stem().string();
+        result = friendly.empty() ? entry.path().stem().string() : friendly;
+        break;
     }
-    return dir.filename().string();
+    g.plugin_display_cache[key] = result;
+    return result;
 }
 
 static std::string name_from_plugin_url(const std::string& url) {
@@ -2725,26 +2734,37 @@ static std::string repo_name_from_url(std::string url) {
     return slash == std::string::npos ? url : url.substr(slash + 1);
 }
 
-static PluginGitState inspect_plugin_git_state(const fs::path& dir, const fs::path& root) {
+static fs::path nested_plugin_git_root(const fs::path& dir, const fs::path& project_root) {
+    std::error_code ec;
+    auto current = fs::weakly_canonical(dir, ec);
+    auto project = fs::weakly_canonical(project_root, ec);
+    while (!current.empty() && current != project) {
+        if (fs::exists(current / ".git", ec)) return current;
+        auto parent = current.parent_path();
+        if (parent == current) break;
+        current = parent;
+    }
+    return {};
+}
+
+static PluginGitState inspect_plugin_git_root_state(const fs::path& git_root, const fs::path& project_root) {
     PluginGitState state;
-    auto git_root = capture_command("git -C " + quote(dir) + " rev-parse --show-toplevel");
     if (git_root.empty()) return state;
     state.git_repo = true;
-    state.git_root = fs::path(git_root);
+    state.git_root = git_root;
 
-    if (!root.empty()) {
-        std::error_code ec;
-        auto relative = fs::relative(dir, root, ec);
-        if (!ec) state.submodule = !capture_command("git -C " + quote(root) + " submodule status -- " + quote(relative)).empty();
-    }
+    std::error_code ec;
+    auto relative = fs::relative(git_root, project_root, ec);
+    if (!ec)
+        state.submodule = !capture_command("git -C " + quote(project_root) + " submodule status -- " + quote(relative)).empty();
 
-    auto branch = capture_command("git -C " + quote(dir) + " symbolic-ref --quiet --short HEAD");
-    auto sha = capture_command("git -C " + quote(dir) + " rev-parse --short HEAD");
+    auto branch = capture_command("git -C " + quote(git_root) + " symbolic-ref --quiet --short HEAD");
+    auto sha = capture_command("git -C " + quote(git_root) + " rev-parse --short HEAD");
     state.revision = branch.empty() ? (sha.empty() ? "unborn branch" : "detached @ " + sha) : branch;
-    state.remote_url = capture_command("git -C " + quote(dir) + " remote get-url origin");
+    state.remote_url = capture_command("git -C " + quote(git_root) + " remote get-url origin");
     state.repo_name = repo_name_from_url(state.remote_url);
 
-    auto branches = capture_command("git -C " + quote(dir) + " branch --list --no-color");
+    auto branches = capture_command("git -C " + quote(git_root) + " branch --list --no-color");
     std::stringstream lines(branches);
     std::string line;
     while (std::getline(lines, line)) {
@@ -2757,15 +2777,29 @@ static PluginGitState inspect_plugin_git_state(const fs::path& dir, const fs::pa
 
 static void request_plugin_details(std::vector<fs::path> plugins) {
     if (plugins.empty() || g.project.empty() || g.plugin_details_running.exchange(true)) return;
-    auto root = g.project.parent_path();
+    auto project_root = g.project.parent_path();
     g.plugin_details_ready = false;
-    std::thread([plugins = std::move(plugins), root] {
+    std::thread([plugins = std::move(plugins), project_root] {
         std::map<std::string, PluginGitState> details;
-        for (const auto& dir : plugins)
-            details[normalized_path_key(dir)] = inspect_plugin_git_state(dir, root);
+        std::map<std::string, PluginGitState> repo_states;
+
+        for (const auto& dir : plugins) {
+            auto git_root = nested_plugin_git_root(dir, project_root);
+            if (git_root.empty()) {
+                details[normalized_path_key(dir)] = {};
+                continue;
+            }
+            auto root_key = normalized_path_key(git_root);
+            auto found = repo_states.find(root_key);
+            if (found == repo_states.end())
+                found = repo_states.emplace(root_key, inspect_plugin_git_root_state(git_root, project_root)).first;
+            details[normalized_path_key(dir)] = found->second;
+        }
+
         {
             std::lock_guard lock(g.plugin_mutex);
-            g.pending_plugin_git_cache = std::move(details);
+            for (auto& [path, state] : details)
+                g.pending_plugin_git_cache.insert_or_assign(path, std::move(state));
         }
         g.plugin_details_ready = true;
         g.plugin_details_running = false;
@@ -2847,20 +2881,26 @@ static void remove_plugin_submodule(const fs::path& root, const fs::path& relati
 }
 
 static std::string plugin_module_name(const fs::path& dir) {
+    auto key = normalized_path_key(dir);
+    if (auto found = g.plugin_module_cache.find(key); found != g.plugin_module_cache.end()) return found->second;
+
+    std::string result;
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(dir, ec)) {
         if (entry.path().extension() != ".uplugin") continue;
         auto text = read_text(entry.path());
         auto modules = text.find("\"Modules\"");
-        if (modules == std::string::npos) return {};
+        if (modules == std::string::npos) break;
         auto name = text.find("\"Name\"", modules);
-        if (name == std::string::npos) return {};
+        if (name == std::string::npos) break;
         auto colon = text.find(':', name);
         auto q1 = text.find('"', colon + 1);
         auto q2 = q1 == std::string::npos ? std::string::npos : text.find('"', q1 + 1);
-        if (q1 != std::string::npos && q2 != std::string::npos) return text.substr(q1 + 1, q2 - q1 - 1);
+        if (q1 != std::string::npos && q2 != std::string::npos) result = text.substr(q1 + 1, q2 - q1 - 1);
+        break;
     }
-    return {};
+    g.plugin_module_cache[key] = result;
+    return result;
 }
 
 static void compile_plugin_module(const fs::path& dir) {
@@ -2995,15 +3035,14 @@ static bool set_project_plugin_enabled(const std::string& plugin_name, bool enab
 static bool project_plugin_exists_locally(const std::string& name) {
     if (g.project.empty()) return false;
     auto plugins_root = g.project.parent_path() / "Plugins";
-    std::error_code ec;
-    if (!fs::exists(plugins_root, ec)) return false;
-    for (fs::recursive_directory_iterator it(plugins_root, fs::directory_options::skip_permission_denied, ec), end;
-         it != end; it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        if (!it->is_regular_file(ec) || it->path().extension() != ".uplugin") continue;
-        if (it->path().stem().string() == name) return true;
-        auto friendly = json_string_value(read_text(it->path()), "FriendlyName");
-        if (friendly == name) return true;
+    const auto& plugins = list_plugins(plugins_root, false);
+    for (const auto& dir : plugins) {
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(dir, ec)) {
+            if (entry.path().extension() != ".uplugin") continue;
+            if (entry.path().stem().string() == name) return true;
+            break;
+        }
     }
     return false;
 }
@@ -3105,6 +3144,8 @@ static void draw_project_plugins() {
     if (refresh) {
         g.plugin_scan_cache.erase(normalized_path_key(root));
         g.plugin_git_cache.clear();
+        g.plugin_display_cache.clear();
+        g.plugin_module_cache.clear();
         if (g.plugin_details_running) g.plugin_refresh_requested = true;
     }
 
@@ -3240,7 +3281,7 @@ static void draw_favorite_plugins() {
         auto git_state = g.plugin_git_cache.find(git_key);
         bool submodule_exists = target_exists && git_state != g.plugin_git_cache.end() && git_state->second.submodule;
         bool can_clone = !g.project.empty() && !g.process_running && valid_folder;
-        bool project_is_git = !g.project.empty() && !capture_command("git -C " + quote(g.project.parent_path()) + " rev-parse --show-toplevel").empty();
+        bool project_is_git = !g.git_root.empty();
         bool can_submodule = can_clone && project_is_git && (submodule_exists || !target_exists);
         if (!can_submodule) ImGui::BeginDisabled();
         if (ImGui::SmallButton(submodule_exists ? "Remove Submodule" : "Add Submodule")) {
@@ -4037,6 +4078,8 @@ static float draw_ui() {
         } else {
             g.plugin_scan_cache.clear();
             g.plugin_git_cache.clear();
+            g.plugin_display_cache.clear();
+            g.plugin_module_cache.clear();
         }
     }
     if (g.git_refresh_ready.exchange(false)) {
