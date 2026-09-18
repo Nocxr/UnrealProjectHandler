@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <memory>
@@ -119,6 +120,7 @@ struct AppState {
     AndroidPackageArtifacts adb_artifacts;
     bool clear_on_run = true;
     bool log_expanded = false;
+    std::string hotkey_global_toggle = "Ctrl+Alt+U";
     std::string hotkey_toggle_log = "GraveAccent";
     std::string hotkey_quit = "Ctrl+Q";
     std::string hotkey_launch_editor = "Ctrl+E";
@@ -404,6 +406,7 @@ static void save_settings() {
     out << "unrealsharp=" << g.unrealsharp << '\n';
     out << "clean_output=" << g.clean_output << '\n';
     out << "clear_on_run=" << g.clear_on_run << '\n';
+    out << "hotkey_global_toggle=" << g.hotkey_global_toggle << '\n';
     out << "hotkey_toggle_log=" << g.hotkey_toggle_log << '\n';
     out << "hotkey_quit=" << g.hotkey_quit << '\n';
     out << "hotkey_launch_editor=" << g.hotkey_launch_editor << '\n';
@@ -438,6 +441,7 @@ static void load_settings() {
             else if (key == "unrealsharp") g.unrealsharp = std::stoi(value) != 0;
             else if (key == "clean_output") g.clean_output = std::stoi(value) != 0;
             else if (key == "clear_on_run") g.clear_on_run = std::stoi(value) != 0;
+            else if (key == "hotkey_global_toggle") g.hotkey_global_toggle = value;
             else if (key == "hotkey_toggle_log") g.hotkey_toggle_log = value;
             else if (key == "hotkey_quit") g.hotkey_quit = value;
             else if (key == "hotkey_launch_editor") g.hotkey_launch_editor = value;
@@ -1651,13 +1655,25 @@ static std::string package_command() {
     return command.str();
 }
 
-static void run_command(std::string command, const std::string& name, bool refresh_plugins = false, bool refresh_git = false) {
+static void run_command_with_prep(std::string command, const std::string& name,
+                                  std::function<bool()> prepare,
+                                  bool refresh_plugins = false, bool refresh_git = false) {
     if (g.process_running.exchange(true)) { log_line("[ERROR] Another operation is already running."); return; }
     if (name == "Compile" || name == "Package" || name.rfind("Compile Plugin ", 0) == 0) g.log_expanded = true;
     g.stop_requested = false;
     if (g.clear_on_run) { std::lock_guard lock(g.mutex); g.logs.clear(); }
-    log_line("[SYSTEM] Starting " + name + ": " + command);
-    std::thread([command = std::move(command), name, refresh_plugins, refresh_git] {
+
+    std::thread([command = std::move(command), name, prepare = std::move(prepare), refresh_plugins, refresh_git] {
+        if (prepare) {
+            log_line("[SYSTEM] Preparing " + name + "...");
+            if (!prepare()) {
+                log_line("[ERROR] Could not prepare " + name + ".");
+                g.process_running = false;
+                return;
+            }
+        }
+
+        log_line("[SYSTEM] Starting " + name + ": " + command);
 #ifdef _WIN32
         auto wrapped = "cmd /S /C \"" + command + " 2>&1\"";
 #else
@@ -1718,6 +1734,10 @@ static void run_command(std::string command, const std::string& name, bool refre
         if (refresh_git) g.git_refresh_requested = true;
         g.process_running = false;
     }).detach();
+}
+
+static void run_command(std::string command, const std::string& name, bool refresh_plugins = false, bool refresh_git = false) {
+    run_command_with_prep(std::move(command), name, {}, refresh_plugins, refresh_git);
 }
 
 
@@ -2030,6 +2050,7 @@ static bool package_platform_ready(int platform) {
 
 #ifdef _WIN32
 static constexpr UINT WM_UPH_TRAY = WM_APP + 37;
+static constexpr int ID_GLOBAL_TOGGLE_HOTKEY = 0x5548;
 static constexpr UINT ID_TRAY_OPEN = 41001;
 static constexpr UINT ID_TRAY_PROJECT_COMPILE = 41002;
 static constexpr UINT ID_TRAY_PROJECT_EDITOR = 41003;
@@ -2054,6 +2075,7 @@ static HICON g_tray_hicon = nullptr;
 static bool g_tray_installed = false;
 static UINT g_taskbar_created_message = 0;
 static std::atomic<bool> g_tray_exit_requested{false};
+static bool g_global_hotkey_registered = false;
 
 static std::wstring tray_widen(const std::string& text) {
     if (text.empty()) return {};
@@ -2394,7 +2416,72 @@ static void show_tray_menu() {
     }
 }
 
+static bool windows_hotkey_from_spec(const std::string& spec, UINT& modifiers, UINT& vk) {
+    modifiers = MOD_NOREPEAT;
+    vk = 0;
+    std::stringstream ss(spec);
+    std::string part;
+    while (std::getline(ss, part, '+')) {
+        while (!part.empty() && std::isspace(static_cast<unsigned char>(part.front()))) part.erase(part.begin());
+        while (!part.empty() && std::isspace(static_cast<unsigned char>(part.back()))) part.pop_back();
+        std::string upper = part;
+        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char ch){ return static_cast<char>(std::toupper(ch)); });
+        if (upper == "CTRL" || upper == "CONTROL") modifiers |= MOD_CONTROL;
+        else if (upper == "SHIFT") modifiers |= MOD_SHIFT;
+        else if (upper == "ALT") modifiers |= MOD_ALT;
+        else if (upper == "WIN" || upper == "WINDOWS") modifiers |= MOD_WIN;
+        else if (upper.size() == 1 && upper[0] >= 'A' && upper[0] <= 'Z') vk = static_cast<UINT>(upper[0]);
+        else if (upper.size() == 1 && upper[0] >= '0' && upper[0] <= '9') vk = static_cast<UINT>(upper[0]);
+        else if (upper.rfind("F", 0) == 0) {
+            int n = 0;
+            try { n = std::stoi(upper.substr(1)); } catch (...) { return false; }
+            if (n < 1 || n > 12) return false;
+            vk = VK_F1 + (n - 1);
+        } else if (upper == "SPACE") vk = VK_SPACE;
+        else if (upper == "ENTER") vk = VK_RETURN;
+        else if (upper == "GRAVEACCENT" || upper == "GRAVE" || upper == "`") vk = VK_OEM_3;
+        else return false;
+    }
+    return vk != 0;
+}
+
+static void register_global_toggle_hotkey() {
+    if (!g_tray_hwnd) return;
+    if (g_global_hotkey_registered) {
+        UnregisterHotKey(g_tray_hwnd, ID_GLOBAL_TOGGLE_HOTKEY);
+        g_global_hotkey_registered = false;
+    }
+    UINT modifiers = 0, vk = 0;
+    if (!windows_hotkey_from_spec(g.hotkey_global_toggle, modifiers, vk)) {
+        log_line("[ERROR] Invalid global UPH hotkey: " + g.hotkey_global_toggle);
+        return;
+    }
+    if (RegisterHotKey(g_tray_hwnd, ID_GLOBAL_TOGGLE_HOTKEY, modifiers, vk)) {
+        g_global_hotkey_registered = true;
+        log_line("[SYSTEM] Global UPH hotkey registered: " + g.hotkey_global_toggle);
+    } else {
+        log_line("[ERROR] Could not register global UPH hotkey (it may already be in use): " + g.hotkey_global_toggle);
+    }
+}
+
+static void toggle_main_window_global() {
+    if (!g_window) return;
+    bool hidden = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_HIDDEN) != 0;
+    if (hidden) {
+        restore_main_window_from_tray();
+        return;
+    }
+    HWND foreground = GetForegroundWindow();
+    if (g_tray_hwnd && foreground == g_tray_hwnd) hide_main_window_to_tray();
+    else restore_main_window_from_tray();
+}
+
 static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_HOTKEY && static_cast<int>(wparam) == ID_GLOBAL_TOGGLE_HOTKEY) {
+        toggle_main_window_global();
+        return 0;
+    }
+
     if (message == WM_CLOSE && g_tray_installed) {
         hide_main_window_to_tray();
         return 0;
@@ -2476,10 +2563,15 @@ static bool install_tray_icon() {
 
     g_taskbar_created_message = RegisterWindowMessageW(L"TaskbarCreated");
     g_tray_installed = true;
+    register_global_toggle_hotkey();
     return true;
 }
 
 static void remove_tray_icon() {
+    if (g_global_hotkey_registered && g_tray_hwnd) {
+        UnregisterHotKey(g_tray_hwnd, ID_GLOBAL_TOGGLE_HOTKEY);
+        g_global_hotkey_registered = false;
+    }
     if (g_tray_installed) Shell_NotifyIconW(NIM_DELETE, &g_tray_icon);
     g_tray_installed = false;
 
@@ -2493,6 +2585,7 @@ static void remove_tray_icon() {
     g_tray_hicon = nullptr;
 }
 #else
+static void register_global_toggle_hotkey() {}
 static void remove_tray_icon() {}
 #endif
 
@@ -2645,6 +2738,11 @@ static void draw_hotkeys_settings() {
         }
     };
 
+    {
+        auto before = g.hotkey_global_toggle;
+        edit_hotkey("Global Show / Hide UPH", g.hotkey_global_toggle);
+        if (before != g.hotkey_global_toggle) register_global_toggle_hotkey();
+    }
     edit_hotkey("Toggle Build Log", g.hotkey_toggle_log);
     edit_hotkey("Quit", g.hotkey_quit);
     edit_hotkey("Launch in Editor", g.hotkey_launch_editor);
@@ -2656,6 +2754,7 @@ static void draw_hotkeys_settings() {
     auto add_usage = [&](const char* action, const std::string& key) {
         if (!key.empty()) usage[key].push_back(action);
     };
+    add_usage("Global Show / Hide UPH", g.hotkey_global_toggle);
     add_usage("Toggle Build Log", g.hotkey_toggle_log);
     add_usage("Quit", g.hotkey_quit);
     add_usage("Launch in Editor", g.hotkey_launch_editor);
@@ -2677,6 +2776,7 @@ static void draw_hotkeys_settings() {
     if (!conflict) ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.42f, 1.0f), "No hotkey conflicts.");
 
     if (ImGui::Button("Reset Hotkeys")) {
+        g.hotkey_global_toggle = "Ctrl+Alt+U";
         g.hotkey_toggle_log = "GraveAccent";
         g.hotkey_quit = "Ctrl+Q";
         g.hotkey_launch_editor = "Ctrl+E";
@@ -2684,6 +2784,7 @@ static void draw_hotkeys_settings() {
         g.hotkey_compile = "Ctrl+B";
         g.hotkey_package = "Ctrl+Shift+B";
         save_settings();
+        register_global_toggle_hotkey();
     }
 }
 
@@ -3245,61 +3346,14 @@ static void compile_plugin_module(const fs::path& dir) {
         log_line("[ERROR] No C++ modules found in plugin " + descriptor.filename().string());
         return;
     }
+    auto dependencies = plugin_dependency_names(dir);
 
-    // Build against a tiny host project that contains only the selected plugin.
-    // This keeps unrelated project/engine plugins out of the rules scan.
     auto host_root = g.project.empty()
         ? fs::temp_directory_path() / "UPH" / "PluginCompile" / descriptor.stem()
         : g.project.parent_path() / "Intermediate" / "UPH" / "PluginCompile" / descriptor.stem();
     auto host_plugins = host_root / "Plugins";
     auto host_plugin_dir = host_plugins / descriptor.stem();
     auto host_project = host_root / "HostProject.uproject";
-
-    std::error_code ec;
-    fs::create_directories(host_plugins, ec);
-    if (ec) {
-        log_line("[ERROR] Could not create plugin compile host: " + host_root.string());
-        return;
-    }
-
-#ifdef _WIN32
-    if (fs::exists(host_plugin_dir, ec)) {
-        std::string remove_link = "cmd /S /C \"rmdir " + quote(host_plugin_dir) + "\"";
-        std::system(remove_link.c_str());
-    }
-    std::string make_link = "cmd /S /C \"mklink /J " + quote(host_plugin_dir) + " " + quote(dir) + " >nul\"";
-    if (std::system(make_link.c_str()) != 0) {
-        log_line("[ERROR] Could not create plugin compile junction: " + host_plugin_dir.string());
-        return;
-    }
-#else
-    fs::remove(host_plugin_dir, ec);
-    ec.clear();
-    fs::create_directory_symlink(dir, host_plugin_dir, ec);
-    if (ec) {
-        log_line("[ERROR] Could not create plugin compile symlink: " + ec.message());
-        return;
-    }
-#endif
-
-    auto dependencies = plugin_dependency_names(dir);
-    std::ofstream host(host_project, std::ios::trunc);
-    host << "{\n";
-    host << "  \"FileVersion\": 3,\n";
-    host << "  \"DisableEnginePluginsByDefault\": true,\n";
-    host << "  \"Plugins\": [\n";
-    host << "    {\"Name\": \"" << json_escape(descriptor.stem().string()) << "\", \"Enabled\": true}";
-    for (const auto& dep : dependencies)
-        host << ",\n    {\"Name\": \"" << json_escape(dep) << "\", \"Enabled\": true}";
-    host << "\n  ]\n";
-    host << "}\n";
-    host.close();
-    if (!host) {
-        log_line("[ERROR] Could not write plugin compile host project: " + host_project.string());
-        return;
-    }
-
-    auto host_descriptor = host_plugin_dir / descriptor.filename();
 
     std::ostringstream command;
 #ifdef _WIN32
@@ -3309,12 +3363,7 @@ static void compile_plugin_module(const fs::path& dir) {
 #endif
     command << g.configs[g.compile_config]
             << " -Project=" << quote(host_project)
-            << " -Plugin=" << quote(host_descriptor)
-            << " -DisableAllPlugins"
-            << " -EnablePlugin=" << descriptor.stem().string();
-    for (const auto& dep : dependencies)
-        command << " -EnablePlugin=" << dep;
-    command << " -NoHotReload -WaitMutex";
+            << " -NoHotReload -WaitMutex";
     for (const auto& module : modules)
         command << " -Module=" << module;
 
@@ -3326,15 +3375,57 @@ static void compile_plugin_module(const fs::path& dir) {
 
     g.log_expanded = true;
     log_line("[SYSTEM] Compiling only selected plugin " + descriptor.stem().string() + " modules: " + module_list);
-    if (!dependencies.empty()) {
-        std::string dep_list;
-        for (size_t i = 0; i < dependencies.size(); ++i) {
-            if (i) dep_list += ", ";
-            dep_list += dependencies[i];
+
+    auto prepare = [host_root, host_plugins, host_plugin_dir, host_project, dir, descriptor, dependencies]() -> bool {
+        std::error_code ec;
+        fs::create_directories(host_plugins, ec);
+        if (ec) {
+            log_line("[ERROR] Could not create plugin compile host: " + host_root.string());
+            return false;
         }
-        log_line("[SYSTEM] Required engine plugin dependencies enabled: " + dep_list);
-    }
-    run_command(command.str(), "Compile Plugin " + descriptor.stem().string(), true);
+
+#ifdef _WIN32
+        if (!fs::exists(host_plugin_dir / descriptor.filename(), ec)) {
+            if (fs::exists(host_plugin_dir, ec)) {
+                std::string remove_link = "cmd /S /C \"rmdir " + quote(host_plugin_dir) + "\"";
+                std::system(remove_link.c_str());
+            }
+            std::string make_link = "cmd /S /C \"mklink /J " + quote(host_plugin_dir) + " " + quote(dir) + " >nul\"";
+            if (std::system(make_link.c_str()) != 0) {
+                log_line("[ERROR] Could not create plugin compile junction: " + host_plugin_dir.string());
+                return false;
+            }
+        }
+#else
+        if (!fs::exists(host_plugin_dir / descriptor.filename(), ec)) {
+            fs::remove(host_plugin_dir, ec);
+            ec.clear();
+            fs::create_directory_symlink(dir, host_plugin_dir, ec);
+            if (ec) {
+                log_line("[ERROR] Could not create plugin compile symlink: " + ec.message());
+                return false;
+            }
+        }
+#endif
+
+        std::ofstream host(host_project, std::ios::trunc);
+        host << "{\n";
+        host << "  \"FileVersion\": 3,\n";
+        host << "  \"Plugins\": [\n";
+        host << "    {\"Name\": \"" << json_escape(descriptor.stem().string()) << "\", \"Enabled\": true}";
+        for (const auto& dep : dependencies)
+            host << ",\n    {\"Name\": \"" << json_escape(dep) << "\", \"Enabled\": true}";
+        host << "\n  ]\n";
+        host << "}\n";
+        host.close();
+        if (!host) {
+            log_line("[ERROR] Could not write plugin compile host project: " + host_project.string());
+            return false;
+        }
+        return true;
+    };
+
+    run_command_with_prep(command.str(), "Compile Plugin " + descriptor.stem().string(), std::move(prepare), true);
 }
 
 
@@ -4606,7 +4697,8 @@ static void draw_footer() {
     const float footer_y = ImGui::GetWindowHeight() - ImGui::GetStyle().WindowPadding.y - footer_height;
     if (ImGui::GetCursorPosY() < footer_y) ImGui::SetCursorPosY(footer_y);
     ImGui::Separator();
-    ImGui::TextDisabled("%s Toggle Build Log    |    %s Quit", g.hotkey_toggle_log.c_str(), g.hotkey_quit.c_str());
+    ImGui::TextDisabled("%s Show/Hide UPH    |    %s Toggle Build Log    |    %s Quit",
+                        g.hotkey_global_toggle.c_str(), g.hotkey_toggle_log.c_str(), g.hotkey_quit.c_str());
 }
 
 static void draw_log_panel() {
@@ -4739,12 +4831,12 @@ static float draw_ui() {
 
     draw_top_context_selectors();
 
+    const ImVec2 content_origin = ImGui::GetCursorScreenPos();
     const float available_height = ImGui::GetContentRegionAvail().y;
     const float footer_reserve = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 8.0f;
-    const float expanded_log_height = available_height * 0.52f;
     const float collapsed_log_height = ImGui::GetFrameHeightWithSpacing() + 6.0f;
-    const float log_height = g.log_expanded ? expanded_log_height : collapsed_log_height;
-    const float content_height = std::max(120.0f, available_height - log_height - footer_reserve - ImGui::GetStyle().ItemSpacing.y);
+    const float expanded_log_height = available_height * 0.52f;
+    const float content_height = std::max(120.0f, available_height - collapsed_log_height - footer_reserve - ImGui::GetStyle().ItemSpacing.y);
 
     static bool project_tab_active = true;
     ImGuiWindowFlags content_flags = project_tab_active ? (ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse) : ImGuiWindowFlags_None;
@@ -4769,14 +4861,24 @@ static float draw_ui() {
     }
     ImGui::EndChild();
 
-    ImGui::Separator();
-    ImGui::BeginChild("##embedded_build_log", ImVec2(0, log_height), ImGuiChildFlags_None);
-    if (ImGui::Selectable(g.log_expanded ? "v Build Log" : "> Build Log", false,
-                          ImGuiSelectableFlags_None, ImVec2(0, ImGui::GetFrameHeight()))) {
-        g.log_expanded = !g.log_expanded;
+    if (!g.log_expanded) {
+        ImGui::Separator();
+        ImGui::BeginChild("##embedded_build_log", ImVec2(0, collapsed_log_height), ImGuiChildFlags_None);
+        if (ImGui::Selectable("> Build Log", false, ImGuiSelectableFlags_None, ImVec2(0, ImGui::GetFrameHeight())))
+            g.log_expanded = true;
+        ImGui::EndChild();
+    } else {
+        ImVec2 overlay_pos = content_origin;
+        overlay_pos.y += std::max(0.0f, content_height - expanded_log_height);
+        ImGui::SetCursorScreenPos(overlay_pos);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.055f, 0.060f, 0.070f, 0.98f));
+        ImGui::BeginChild("##embedded_build_log_overlay", ImVec2(0, expanded_log_height), ImGuiChildFlags_Borders);
+        if (ImGui::Selectable("v Build Log", false, ImGuiSelectableFlags_None, ImVec2(0, ImGui::GetFrameHeight())))
+            g.log_expanded = false;
+        draw_log_panel();
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
     }
-    if (g.log_expanded) draw_log_panel();
-    ImGui::EndChild();
 
     draw_footer();
     return ImGui::GetCursorPosY();
