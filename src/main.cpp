@@ -84,7 +84,7 @@ struct AppState {
     std::vector<std::string> adb_devices;
     std::string adb_logcat;
     bool clear_on_run = false;
-    bool log_expanded = true;
+    bool log_expanded = false;
     std::set<int> selected_logs;
     int log_selection_anchor = -1;
     std::atomic<bool> process_running{false};
@@ -1317,6 +1317,7 @@ static std::string package_command() {
 
 static void run_command(std::string command, const std::string& name, bool refresh_plugins = false, bool refresh_git = false) {
     if (g.process_running.exchange(true)) { log_line("[ERROR] Another operation is already running."); return; }
+    if (name == "Compile" || name == "Package") g.log_expanded = true;
     g.stop_requested = false;
     if (g.clear_on_run) { std::lock_guard lock(g.mutex); g.logs.clear(); }
     log_line("[SYSTEM] Starting " + name + ": " + command);
@@ -2816,6 +2817,7 @@ static void draw_project_ui() {
     if (!has_cpp_module) ImGui::EndDisabled();
 
     ImGui::SeparatorText("Package");
+    ImGui::Spacing();
     ImGui::Checkbox("Use UnrealSharp PackageProject", &g.unrealsharp);
     tooltip("Use UnrealSharp's PackageProject automation command instead of Unreal BuildCookRun.");
     bool selected_platform_ready = package_platform_ready(g.package_platform);
@@ -2840,6 +2842,7 @@ static void draw_project_ui() {
     if (!selected_platform_ready) ImGui::PopStyleColor();
     ImGui::Combo("Configuration##package", &g.package_config, g.configs.data(), (int)g.configs.size());
     tooltip("Unreal build configuration used for packaging.");
+    ImGui::Spacing();
     if (g.unrealsharp) {
         std::vector<std::string> target_types;
         for (const auto& target : g.targets)
@@ -2863,6 +2866,7 @@ static void draw_project_ui() {
     tooltip("Choose the package output directory.");
     ImGui::Checkbox("Clean Output Before Package", &g.clean_output);
     tooltip("Delete the previous package output before starting. Unreal's cook cache is not removed.");
+    ImGui::Spacing();
     if (!g.unrealsharp) {
         static const char* names[] = {"Build", "Cook", "Stage", "Pak", "Package", "Archive", "Deploy", "Run"};
         static const char* help[] = {
@@ -2875,13 +2879,14 @@ static void draw_project_ui() {
             "Install the packaged build onto a connected device.",
             "Launch the staged or deployed build after packaging."
         };
-        ImGui::TextUnformatted("Build Pipeline");
+        ImGui::SeparatorText("Build Pipeline");
         for (size_t i = 0; i < g.operations.size(); ++i) {
             if (i) ImGui::SameLine();
             auto id = std::string(names[i]) + "##package_operation_" + std::to_string(i);
             ImGui::Checkbox(id.c_str(), &g.operations[i]);
             tooltip(help[i]);
         }
+        ImGui::Spacing();
     }
     bool can_package = fs::is_regular_file(g.project) && fs::exists(run_uat()) &&
                        package_platform_ready(g.package_platform) && !g.process_running &&
@@ -2898,6 +2903,7 @@ static void draw_project_ui() {
     tooltip("Open the current package output directory.");
     ImGui::SameLine(); if (ImGui::Button("Stop") && g.process_running) { g.stop_requested = true; log_line("[SYSTEM] Stop requested."); }
     tooltip("Stop the currently tracked compile or package operation.");
+    ImGui::Spacing();
 
     auto package_preview = package_command();
     ImGui::TextUnformatted("Package Command Preview");
@@ -2907,6 +2913,7 @@ static void draw_project_ui() {
     if (package_preview.empty()) ImGui::EndDisabled();
     command_preview(package_preview, "##package_preview");
     tooltip("Command that will be executed with the current package settings.");
+    ImGui::Spacing();
 
     if (g.package_platform == 2) {
         ImGui::SeparatorText("ADB Device");
@@ -2948,13 +2955,13 @@ static void draw_project_ui() {
             std::array<char, 512> package_buffer{};
             std::snprintf(package_buffer.data(), package_buffer.size(), "%s", package.c_str());
             ImGui::SetNextItemWidth(420.0f);
-            if (ImGui::InputText("Package", package_buffer.data(), package_buffer.size())) {
+            if (ImGui::InputText("Android Package", package_buffer.data(), package_buffer.size())) {
                 std::lock_guard lock(g.adb_mutex);
                 g.adb_package = package_buffer.data();
                 g.adb_status = "Not checked";
             }
             ImGui::SameLine();
-            if (ImGui::Button("Detect##adb_package")) {
+            if (ImGui::Button("Detect Package##adb_package")) {
                 std::lock_guard lock(g.adb_mutex);
                 g.adb_package = detect_android_package();
                 g.adb_status = "Not checked";
