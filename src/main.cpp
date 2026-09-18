@@ -3408,6 +3408,10 @@ static void compile_plugin_module(const fs::path& dir) {
         log_line("[ERROR] No .uplugin descriptor found in " + dir.string());
         return;
     }
+    if (g.project.empty()) {
+        log_line("[ERROR] Select a project before compiling a project plugin.");
+        return;
+    }
 
     auto modules = plugin_module_names(dir);
     if (modules.empty()) {
@@ -3416,23 +3420,36 @@ static void compile_plugin_module(const fs::path& dir) {
     }
     auto dependencies = plugin_dependency_names(dir);
 
-    auto host_root = g.project.empty()
-        ? fs::temp_directory_path() / "UPH" / "PluginCompile" / descriptor.stem()
-        : g.project.parent_path() / "Intermediate" / "UPH" / "PluginCompile" / descriptor.stem();
+    std::string editor_target;
+    for (const auto& target : g.targets) {
+        if (target.type == "Editor") {
+            editor_target = target.name;
+            break;
+        }
+    }
+    if (editor_target.empty()) {
+        log_line("[ERROR] No Editor target found for " + g.project.filename().string() + ".");
+        return;
+    }
+
+    // Build in an isolated mirror that uses the real project's name and Editor target.
+    // UBT therefore stamps the plugin binaries for the same target that will load them,
+    // while the mirror only exposes the selected plugin and its declared dependencies.
+    auto host_root = g.project.parent_path() / "Intermediate" / "UPH" / "PluginCompile" / descriptor.stem();
     auto host_plugins = host_root / "Plugins";
     auto host_plugin_dir = host_plugins / descriptor.stem();
-    auto host_project = host_root / "HostProject.uproject";
+    auto host_project = host_root / g.project.filename();
     auto source_dir = host_root / "Source";
     auto config_dir = host_root / "Config";
-    auto target_file = source_dir / "HostProjectEditor.Target.cs";
+    auto target_file = source_dir / (editor_target + ".Target.cs");
 
     std::ostringstream command;
 #ifdef _WIN32
     command << "set DOTNET_CLI_USE_MSBUILD_SERVER=0&& set MSBUILDUSESERVER=0&& "
-            << quote(build_script()) << " HostProjectEditor Win64 ";
+            << quote(build_script()) << ' ' << editor_target << " Win64 ";
 #else
     command << "DOTNET_CLI_USE_MSBUILD_SERVER=0 MSBUILDUSESERVER=0 "
-            << "bash " << quote(build_script()) << " HostProjectEditor Mac ";
+            << "bash " << quote(build_script()) << ' ' << editor_target << " Mac ";
 #endif
     command << g.configs[g.compile_config]
             << " -Project=" << quote(host_project)
@@ -3447,10 +3464,11 @@ static void compile_plugin_module(const fs::path& dir) {
     }
 
     g.log_expanded = true;
-    log_line("[SYSTEM] Compiling only selected plugin " + descriptor.stem().string() + " modules: " + module_list);
+    log_line("[SYSTEM] Compiling selected plugin " + descriptor.stem().string() +
+             " for real project target " + editor_target + ": " + module_list);
 
     auto prepare = [host_root, host_plugins, host_plugin_dir, host_project, source_dir, config_dir, target_file,
-                    dir, descriptor, dependencies]() -> bool {
+                    dir, descriptor, dependencies, editor_target]() -> bool {
 #ifdef _WIN32
         std::system("dotnet build-server shutdown >nul 2>&1");
 #else
@@ -3494,12 +3512,12 @@ static void compile_plugin_module(const fs::path& dir) {
             host << ",\n    {\"Name\": \"" << json_escape(dep) << "\", \"Enabled\": true}";
         host << "\n  ]\n}\n";
         host.close();
-        if (!host) { log_line("[ERROR] Could not write plugin compile host project: " + host_project.string()); return false; }
+        if (!host) { log_line("[ERROR] Could not write isolated project descriptor: " + host_project.string()); return false; }
 
         std::ofstream target(target_file, std::ios::trunc);
         target << "using UnrealBuildTool;\n\n";
-        target << "public class HostProjectEditorTarget : TargetRules\n{\n";
-        target << "    public HostProjectEditorTarget(TargetInfo Target) : base(Target)\n    {\n";
+        target << "public class " << editor_target << "Target : TargetRules\n{\n";
+        target << "    public " << editor_target << "Target(TargetInfo Target) : base(Target)\n    {\n";
         target << "        Type = TargetType.Editor;\n";
         target << "        DefaultBuildSettings = BuildSettingsVersion.V7;\n";
         target << "        IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_8;\n";
@@ -3511,7 +3529,12 @@ static void compile_plugin_module(const fs::path& dir) {
             target << "        EnablePlugins.Add(\"" << json_escape(dep) << "\");\n";
         target << "    }\n}\n";
         target.close();
-        if (!target) { log_line("[ERROR] Could not write plugin compile target: " + target_file.string()); return false; }
+        if (!target) { log_line("[ERROR] Could not write isolated Editor target: " + target_file.string()); return false; }
+
+        // Remove stale synthetic-target metadata so UBT cannot reuse the old HostProjectEditor makefile/receipt.
+        fs::remove_all(host_root / "Intermediate" / "Build", ec);
+        ec.clear();
+        fs::remove_all(host_root / "Binaries", ec);
         return true;
     };
 
