@@ -2940,9 +2940,10 @@ static void draw_project_ui() {
                 ImGui::EndCombo();
             }
             ImGui::SameLine();
-            if (g.adb_refresh_running) ImGui::BeginDisabled();
+            const bool disable_refresh_devices = g.adb_refresh_running;
+            if (disable_refresh_devices) ImGui::BeginDisabled();
             if (ImGui::Button("Refresh Devices")) refresh_adb_devices_async();
-            if (g.adb_refresh_running) ImGui::EndDisabled();
+            if (disable_refresh_devices) ImGui::EndDisabled();
 
             std::array<char, 512> package_buffer{};
             std::snprintf(package_buffer.data(), package_buffer.size(), "%s", package.c_str());
@@ -2961,7 +2962,8 @@ static void draw_project_ui() {
 
             ImGui::TextDisabled("Status: %s", status.c_str());
             bool adb_ready = !serial.empty() && !package.empty();
-            if (!adb_ready || g.adb_action_running) ImGui::BeginDisabled();
+            const bool disable_adb_actions = !adb_ready || g.adb_action_running;
+            if (disable_adb_actions) ImGui::BeginDisabled();
             if (ImGui::Button("Check Running")) refresh_adb_status_async();
             ImGui::SameLine();
             if (ImGui::Button("Start App"))
@@ -2972,14 +2974,15 @@ static void draw_project_ui() {
             ImGui::SameLine();
             if (ImGui::Button("Uninstall"))
                 run_adb_action("uninstall " + quote(fs::path(package)), "Uninstall");
-            if (!adb_ready || g.adb_action_running) ImGui::EndDisabled();
+            if (disable_adb_actions) ImGui::EndDisabled();
 
             auto apk = find_android_apk();
             ImGui::SameLine();
-            if (serial.empty() || apk.empty() || g.adb_action_running) ImGui::BeginDisabled();
+            const bool disable_install_apk = serial.empty() || apk.empty() || g.adb_action_running;
+            if (disable_install_apk) ImGui::BeginDisabled();
             if (ImGui::Button("Install Latest APK"))
                 run_adb_action("install -r " + quote(apk), "Install " + apk.filename().string());
-            if (serial.empty() || apk.empty() || g.adb_action_running) ImGui::EndDisabled();
+            if (disable_install_apk) ImGui::EndDisabled();
             if (!apk.empty()) {
                 ImGui::TextDisabled("APK: %s", apk.string().c_str());
             } else {
@@ -3022,13 +3025,14 @@ static void draw_top_context_selectors() {
     ImGui::TextDisabled("Project");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(220.0f);
-    if (g.process_running) ImGui::BeginDisabled();
+    const bool disable_project_switch = g.process_running;
+    if (disable_project_switch) ImGui::BeginDisabled();
     if (ImGui::BeginCombo("##top_selected_project", project.c_str())) {
         project_combo_items();
         ImGui::EndCombo();
     }
-    if (g.process_running) ImGui::EndDisabled();
-    tooltip(g.process_running ? "Project switching is locked while an operation is running." : "Switch projects or browse for another .uproject file.");
+    if (disable_project_switch) ImGui::EndDisabled();
+    tooltip(disable_project_switch ? "Project switching is locked while an operation is running." : "Switch projects or browse for another .uproject file.");
 
     bool can_launch_project = fs::is_regular_file(g.project) && fs::exists(editor_path());
     ImGui::SameLine();
@@ -3049,13 +3053,14 @@ static void draw_top_context_selectors() {
     ImGui::TextDisabled("Engine");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(200.0f);
-    if (g.process_running) ImGui::BeginDisabled();
+    const bool disable_engine_switch = g.process_running;
+    if (disable_engine_switch) ImGui::BeginDisabled();
     if (ImGui::BeginCombo("##top_selected_engine", engine.c_str())) {
         engine_combo_items();
         ImGui::EndCombo();
     }
-    if (g.process_running) ImGui::EndDisabled();
-    tooltip(g.process_running ? "Engine switching is locked while an operation is running." : "Pick the active Unreal Engine.");
+    if (disable_engine_switch) ImGui::EndDisabled();
+    tooltip(disable_engine_switch ? "Engine switching is locked while an operation is running." : "Pick the active Unreal Engine.");
 
     ImGui::SameLine();
     if (readiness_button("Launch##top_engine", fs::exists(editor_path()))) launch_editor_home();
