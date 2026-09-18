@@ -3428,8 +3428,10 @@ static void compile_plugin_module(const fs::path& dir) {
         }
     }
     if (editor_target.empty()) {
-        log_line("[ERROR] No Editor target found for " + g.project.filename().string() + ".");
-        return;
+        // Content-only projects often do not have a Source/<Project>Editor.Target.cs.
+        // Unreal synthesizes a temporary Editor target for them, named <Project>Editor.
+        editor_target = g.project.stem().string() + "Editor";
+        log_line("[SYSTEM] No explicit Editor target found; using synthesized target " + editor_target + ".");
     }
 
     // Build in an isolated mirror that uses the real project's name and Editor target.
