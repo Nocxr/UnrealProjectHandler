@@ -52,6 +52,9 @@ struct PluginGitState {
     std::string remote_url;
     std::string repo_name;
     std::vector<std::string> branches;
+    int ahead = 0;
+    int behind = 0;
+    bool tracking_known = false;
 };
 struct ProjectGitState { fs::path root; std::string branch; std::vector<std::string> branches; };
 struct AndroidPackageArtifacts {
@@ -2864,6 +2867,17 @@ static PluginGitState inspect_plugin_git_root_state(const fs::path& git_root, co
         while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
         if (!line.empty()) state.branches.push_back(line);
     }
+
+    if (!state.remote_url.empty()) {
+        capture_command("git -C " + quote(git_root) + " fetch --quiet --prune");
+        auto counts = capture_command("git -C " + quote(git_root) + " rev-list --left-right --count HEAD...@{upstream}");
+        if (counts.empty() && !branch.empty())
+            counts = capture_command("git -C " + quote(git_root) + " rev-list --left-right --count HEAD...origin/" + branch);
+        if (!counts.empty()) {
+            std::stringstream count_stream(counts);
+            if (count_stream >> state.ahead >> state.behind) state.tracking_known = true;
+        }
+    }
     return state;
 }
 
@@ -3227,13 +3241,31 @@ static void draw_plugin_list(const fs::path& root, bool refresh = false, bool sh
 }
 
 static void draw_engine_marketplace_plugins() {
-    if (!ImGui::CollapsingHeader("Engine Marketplace", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    if (!ImGui::CollapsingHeader("Engine Marketplace")) return;
     auto root = engine_marketplace_dir();
     if (root.empty()) { ImGui::TextDisabled("Select an engine in Settings first."); return; }
     if (!fs::exists(root)) { ImGui::TextDisabled("No marketplace folder at %s", root.string().c_str()); return; }
     bool refresh = ImGui::SmallButton("Refresh##engine_plugins");
     ImGui::SameLine(); ImGui::TextDisabled("Cached after first scan");
     draw_plugin_list(root, refresh, false);
+}
+
+
+static void draw_plugin_git_status(const PluginGitState& state) {
+    if (!state.git_repo) return;
+    if (!state.tracking_known) {
+        ImGui::TextColored(ImVec4(0.55f, 0.65f, 0.75f, 1.0f), "No tracking");
+        return;
+    }
+    if (state.ahead == 0 && state.behind == 0) {
+        ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.42f, 1.0f), "Up to date");
+    } else if (state.behind > 0 && state.ahead == 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.24f, 1.0f), "Behind %d", state.behind);
+    } else if (state.ahead > 0 && state.behind == 0) {
+        ImGui::TextColored(ImVec4(0.35f, 0.72f, 1.0f, 1.0f), "Ahead %d", state.ahead);
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.38f, 1.0f), "+%d / -%d", state.ahead, state.behind);
+    }
 }
 
 static void draw_project_plugins() {
@@ -3301,20 +3333,24 @@ static void draw_project_plugins() {
         std::string label = state.repo_name.empty() ? state.git_root.filename().string() : state.repo_name;
         label += " (" + std::to_string(group_plugins.size()) + " plugins)";
         ImGui::PushID(group_key.c_str());
-        if (ImGui::BeginTable("##repo_group_row", 4, ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn("Repo", ImGuiTableColumnFlags_WidthStretch, 2.7f);
-            ImGui::TableSetupColumn("Remote", ImGuiTableColumnFlags_WidthStretch, 2.0f);
-            ImGui::TableSetupColumn("Branch", ImGuiTableColumnFlags_WidthFixed, 190.0f);
+        if (ImGui::BeginTable("##repo_group_row", 5, ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Repo", ImGuiTableColumnFlags_WidthStretch, 2.5f);
+            ImGui::TableSetupColumn("Remote", ImGuiTableColumnFlags_WidthStretch, 1.9f);
+            ImGui::TableSetupColumn("Branch", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+            ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 105.0f);
             ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 70.0f);
             ImGui::TableNextRow();
 
             ImGui::TableSetColumnIndex(0);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.86f, 0.93f, 1.0f, 1.0f));
             bool open = ImGui::TreeNodeEx("##repo_group",
                                           ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_NoTreePushOnOpen,
                                           "%s", label.c_str());
+            ImGui::PopStyleColor();
 
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextDisabled("%s", state.repo_name.empty() ? state.git_root.filename().string().c_str() : state.repo_name.c_str());
+            ImGui::TextColored(ImVec4(0.42f, 0.72f, 1.0f, 1.0f), "%s",
+                               state.repo_name.empty() ? state.git_root.filename().string().c_str() : state.repo_name.c_str());
 
             ImGui::TableSetColumnIndex(2);
             const char* current = state.revision.empty() ? "Unknown" : state.revision.c_str();
@@ -3331,6 +3367,9 @@ static void draw_project_plugins() {
             }
 
             ImGui::TableSetColumnIndex(3);
+            draw_plugin_git_status(state);
+
+            ImGui::TableSetColumnIndex(4);
             if (ImGui::SmallButton("Update##repo")) {
                 run_command_sequence({
                     {"Fetch", "git -C " + quote(state.git_root) + " fetch --all --prune"},
@@ -3462,11 +3501,13 @@ static void draw_favorite_plugins() {
 
             ImGui::TableSetColumnIndex(1);
             auto favorite_repo = repo_name_from_url(plugin.url);
-            ImGui::TextDisabled("%s", favorite_repo.empty() ? plugin.url.c_str() : favorite_repo.c_str());
-            if (!target_exists) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("(not installed)");
-            }
+            ImGui::TextColored(ImVec4(0.42f, 0.72f, 1.0f, 1.0f), "%s",
+                               favorite_repo.empty() ? plugin.url.c_str() : favorite_repo.c_str());
+            ImGui::SameLine();
+            if (target_exists)
+                ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.42f, 1.0f), "Installed");
+            else
+                ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.24f, 1.0f), "Not installed");
 
             ImGui::TableSetColumnIndex(2);
             if (installed_git) {
@@ -3505,18 +3546,7 @@ static void draw_favorite_plugins() {
             ImGui::TableSetColumnIndex(3);
 
             if (installed_git) {
-                if (ImGui::SmallButton("Update")) {
-                    run_command_sequence({
-                        {"Fetch", "git -C " + quote(target) + " fetch --all --prune"},
-                        {"Pull",  "git -C " + quote(target) + " pull --ff-only"}
-                    }, "Update Plugin " + plugin.name, true);
-                }
-                ImGui::SameLine();
-                auto module = plugin_module_name(target);
-                const bool can_compile_plugin = !module.empty() && !g.process_running && fs::exists(build_script()) && fs::is_regular_file(g.project);
-                if (!can_compile_plugin) ImGui::BeginDisabled();
-                if (ImGui::SmallButton("Compile")) compile_plugin_module(target);
-                if (!can_compile_plugin) ImGui::EndDisabled();
+                draw_plugin_git_status(git_state->second);
                 ImGui::SameLine();
             }
 
@@ -3568,10 +3598,14 @@ static void draw_plugins_ui() {
             std::lock_guard lock(g.progress_mutex);
             progress_label = g.operation_progress_label;
         }
-        ImGui::TextColored(ImVec4(0.30f, 0.72f, 1.0f, 1.0f), "%s - running %d of %d",
-                           progress_label.c_str(), progress_current, progress_total);
+        ImGui::TextColored(ImVec4(0.92f, 0.96f, 1.0f, 1.0f), "%s",
+                           progress_label.c_str());
         float fraction = progress_total > 0 ? static_cast<float>(progress_current) / static_cast<float>(progress_total) : 0.0f;
-        ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f));
+        std::string progress_overlay = std::to_string(progress_current) + " / " + std::to_string(progress_total);
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.18f, 0.58f, 0.86f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        ImGui::ProgressBar(fraction, ImVec2(-1.0f, 20.0f), progress_overlay.c_str());
+        ImGui::PopStyleColor(2);
         ImGui::Spacing();
     }
     draw_engine_marketplace_plugins();
