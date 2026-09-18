@@ -3210,17 +3210,6 @@ static std::vector<std::string> plugin_dependency_names(const fs::path& dir) {
     return deps;
 }
 
-static std::string json_path_string(const fs::path& path) {
-    auto value = path.generic_string();
-    std::string escaped;
-    escaped.reserve(value.size());
-    for (char ch : value) {
-        if (ch == '\\' || ch == '"') escaped += '\\';
-        escaped += ch;
-    }
-    return escaped;
-}
-
 static std::string plugin_module_name(const fs::path& dir) {
     auto key = normalized_path_key(dir);
     if (auto found = g.plugin_module_cache.find(key); found != g.plugin_module_cache.end()) return found->second;
@@ -3321,7 +3310,11 @@ static void compile_plugin_module(const fs::path& dir) {
     command << g.configs[g.compile_config]
             << " -Project=" << quote(host_project)
             << " -Plugin=" << quote(host_descriptor)
-            << " -NoHotReload -WaitMutex";
+            << " -DisableAllPlugins"
+            << " -EnablePlugin=" << descriptor.stem().string();
+    for (const auto& dep : dependencies)
+        command << " -EnablePlugin=" << dep;
+    command << " -NoHotReload -WaitMutex";
     for (const auto& module : modules)
         command << " -Module=" << module;
 
@@ -3332,7 +3325,7 @@ static void compile_plugin_module(const fs::path& dir) {
     }
 
     g.log_expanded = true;
-    log_line("[SYSTEM] Compiling only plugin " + descriptor.stem().string() + " modules: " + module_list);
+    log_line("[SYSTEM] Compiling only selected plugin " + descriptor.stem().string() + " modules: " + module_list);
     if (!dependencies.empty()) {
         std::string dep_list;
         for (size_t i = 0; i < dependencies.size(); ++i) {
