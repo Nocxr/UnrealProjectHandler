@@ -3407,34 +3407,25 @@ static std::string plugin_module_name(const fs::path& dir) {
     return result;
 }
 
-static bool replace_json_string_value(std::string& text, const std::string& key, const std::string& value) {
-    const auto key_pos = text.find("\"" + key + "\"");
-    if (key_pos == std::string::npos) return false;
-    const auto colon = text.find(':', key_pos);
-    if (colon == std::string::npos) return false;
-    const auto quote_begin = text.find('"', colon + 1);
-    if (quote_begin == std::string::npos) return false;
-    auto quote_end = quote_begin + 1;
-    bool escaped = false;
-    for (; quote_end < text.size(); ++quote_end) {
-        const char ch = text[quote_end];
-        if (escaped) {
-            escaped = false;
-            continue;
+static fs::path newest_existing_file(const std::vector<fs::path>& candidates) {
+    fs::path newest;
+    fs::file_time_type newest_time{};
+    std::error_code ec;
+    for (const auto& candidate : candidates) {
+        if (!fs::is_regular_file(candidate, ec)) { ec.clear(); continue; }
+        auto time = fs::last_write_time(candidate, ec);
+        if (ec) { ec.clear(); continue; }
+        if (newest.empty() || time > newest_time) {
+            newest = candidate;
+            newest_time = time;
         }
-        if (ch == '\\') {
-            escaped = true;
-            continue;
-        }
-        if (ch == '"') break;
     }
-    if (quote_end >= text.size()) return false;
-    text.replace(quote_begin + 1, quote_end - quote_begin - 1, value);
-    return true;
+    return newest;
 }
 
 static bool install_compiled_plugin_binaries(const fs::path& plugin_dir,
-                                            const std::vector<std::string>& modules) {
+                                             const fs::path& host_root,
+                                             const std::vector<std::string>& modules) {
 #ifdef _WIN32
     const char* platform_dir = "Win64";
     const char* library_ext = ".dll";
@@ -3469,33 +3460,51 @@ static bool install_compiled_plugin_binaries(const fs::path& plugin_dir,
 
     std::vector<std::pair<std::string, std::string>> installed;
     for (const auto& module : modules) {
-#ifdef _WIN32
         const auto filename = "UnrealEditor-" + module + std::string(library_ext);
-        const auto source = engine_bin / filename;
-#else
-        const auto filename = "UnrealEditor-" + module + std::string(library_ext);
-        const auto source = engine_bin / filename;
-#endif
-        if (!fs::is_regular_file(source)) {
-            log_line("[ERROR] Compiled module binary not found: " + source.string());
+
+        // Project-target module builds normally land in the isolated project's
+        // Binaries folder. Keep the other paths as fallbacks for UE variations.
+        auto source = newest_existing_file({
+            host_root / "Binaries" / platform_dir / filename,
+            host_root / "Plugins" / plugin_dir.filename() / "Binaries" / platform_dir / filename,
+            plugin_dir / "Binaries" / platform_dir / filename,
+            engine_bin / filename
+        });
+
+        if (source.empty()) {
+            log_line("[ERROR] Compiled module binary not found for " + module + ". Checked isolated project, plugin, and engine Binaries folders.");
             return false;
         }
 
         const auto destination = plugin_bin / filename;
-        fs::copy_file(source, destination, fs::copy_options::overwrite_existing, ec);
-        if (ec) {
-            log_line("[ERROR] Could not copy compiled module binary to plugin: " + destination.string() + ": " + ec.message());
-            return false;
+        if (normalized_path_key(source) != normalized_path_key(destination)) {
+            ec.clear();
+            fs::copy_file(source, destination, fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                log_line("[ERROR] Could not copy compiled module binary from " + source.string() +
+                         " to " + destination.string() + ": " + ec.message());
+                return false;
+            }
         }
 
 #ifdef _WIN32
-        const auto pdb_source = engine_bin / ("UnrealEditor-" + module + ".pdb");
-        if (fs::is_regular_file(pdb_source)) {
-            ec.clear();
-            fs::copy_file(pdb_source, plugin_bin / pdb_source.filename(), fs::copy_options::overwrite_existing, ec);
-            if (ec) log_line("[WARNING] Could not copy PDB for " + module + ": " + ec.message());
+        auto pdb_source = newest_existing_file({
+            host_root / "Binaries" / platform_dir / ("UnrealEditor-" + module + ".pdb"),
+            host_root / "Plugins" / plugin_dir.filename() / "Binaries" / platform_dir / ("UnrealEditor-" + module + ".pdb"),
+            plugin_dir / "Binaries" / platform_dir / ("UnrealEditor-" + module + ".pdb"),
+            engine_bin / ("UnrealEditor-" + module + ".pdb")
+        });
+        if (!pdb_source.empty()) {
+            auto pdb_destination = plugin_bin / pdb_source.filename();
+            if (normalized_path_key(pdb_source) != normalized_path_key(pdb_destination)) {
+                ec.clear();
+                fs::copy_file(pdb_source, pdb_destination, fs::copy_options::overwrite_existing, ec);
+                if (ec) log_line("[WARNING] Could not copy PDB for " + module + ": " + ec.message());
+            }
         }
 #endif
+
+        log_line("[SYSTEM] Installed " + module + " from " + source.string());
         installed.push_back({module, filename});
     }
 
@@ -3662,9 +3671,9 @@ static void compile_plugin_module(const fs::path& dir) {
         return true;
     };
 
-    auto finish = [dir, modules](bool success) {
+    auto finish = [dir, host_root, modules](bool success) {
         if (!success) return;
-        if (!install_compiled_plugin_binaries(dir, modules))
+        if (!install_compiled_plugin_binaries(dir, host_root, modules))
             log_line("[ERROR] Plugin compiled, but its binaries could not be installed into the plugin folder.");
     };
 
