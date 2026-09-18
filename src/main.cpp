@@ -144,12 +144,17 @@ struct AppState {
     std::atomic<bool> plugin_details_ready{false};
     std::atomic<int> operation_progress_current{0};
     std::atomic<int> operation_progress_total{0};
+    std::atomic<bool> app_update_check_running{false};
+    bool app_on_main_commit = true;
+    std::string app_local_commit;
+    std::string app_main_commit;
     std::mutex mutex;
     std::mutex plugin_mutex;
     std::mutex git_mutex;
     std::mutex adb_mutex;
     std::mutex progress_mutex;
     std::mutex favorite_remote_mutex;
+    std::mutex app_update_mutex;
     std::string operation_progress_label;
     std::map<std::string, PluginGitState> pending_plugin_git_cache;
     ProjectGitState pending_git_state;
@@ -821,6 +826,44 @@ static std::string capture_command(const std::string& command) {
     if (pclose(pipe) != 0) return {};
     return normalized_text(output);
 #endif
+}
+
+static void check_app_main_commit_async() {
+    if (g.app_update_check_running.exchange(true)) return;
+    std::thread([] {
+        auto local = capture_command("git rev-parse HEAD");
+        auto remote = capture_command("git ls-remote origin refs/heads/main");
+        if (remote.empty()) remote = capture_command("git ls-remote origin refs/heads/master");
+        auto split = remote.find_first_of(" \t");
+        if (split != std::string::npos) remote = remote.substr(0, split);
+        {
+            std::lock_guard lock(g.app_update_mutex);
+            g.app_local_commit = local;
+            g.app_main_commit = remote;
+            g.app_on_main_commit = !local.empty() && !remote.empty() && local == remote;
+        }
+        g.app_update_check_running = false;
+    }).detach();
+}
+
+static void draw_app_update_status() {
+    if (g.app_update_check_running) {
+        ImGui::TextDisabled("Checking UPH version...");
+        return;
+    }
+    std::string local, remote;
+    bool current = true;
+    {
+        std::lock_guard lock(g.app_update_mutex);
+        local = g.app_local_commit;
+        remote = g.app_main_commit;
+        current = g.app_on_main_commit;
+    }
+    if (!local.empty() && !remote.empty() && !current) {
+        ImGui::TextColored(ImVec4(1.0f, 0.68f, 0.20f, 1.0f),
+                           "UPH is not on the current main commit. Local %.8s  Main %.8s",
+                           local.c_str(), remote.c_str());
+    }
 }
 
 static fs::path adb_executable() {
@@ -3054,6 +3097,20 @@ static std::string repo_name_from_url(std::string url) {
     return slash == std::string::npos ? url : url.substr(slash + 1);
 }
 
+static bool same_git_repo(const std::string& a, const std::string& b) {
+    auto normalize = [](std::string value) {
+        value = normalized_git_url(value);
+        while (!value.empty() && value.back() == '/') value.pop_back();
+        if (value.size() > 4 && value.ends_with(".git")) value.resize(value.size() - 4);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch){ return static_cast<char>(std::tolower(ch)); });
+        return value;
+    };
+    auto na = normalize(a), nb = normalize(b);
+    return !na.empty() && !nb.empty() && na == nb;
+}
+
+
 static fs::path nested_plugin_git_root(const fs::path& dir, const fs::path& project_root) {
     std::error_code ec;
     auto current = fs::weakly_canonical(dir, ec);
@@ -3354,12 +3411,14 @@ static void compile_plugin_module(const fs::path& dir) {
     auto host_plugins = host_root / "Plugins";
     auto host_plugin_dir = host_plugins / descriptor.stem();
     auto host_project = host_root / "HostProject.uproject";
+    auto source_dir = host_root / "Source";
+    auto target_file = source_dir / "HostProjectEditor.Target.cs";
 
     std::ostringstream command;
 #ifdef _WIN32
-    command << quote(build_script()) << " UnrealEditor Win64 ";
+    command << quote(build_script()) << " HostProjectEditor Win64 ";
 #else
-    command << "bash " << quote(build_script()) << " UnrealEditor Mac ";
+    command << "bash " << quote(build_script()) << " HostProjectEditor Mac ";
 #endif
     command << g.configs[g.compile_config]
             << " -Project=" << quote(host_project)
@@ -3376,13 +3435,13 @@ static void compile_plugin_module(const fs::path& dir) {
     g.log_expanded = true;
     log_line("[SYSTEM] Compiling only selected plugin " + descriptor.stem().string() + " modules: " + module_list);
 
-    auto prepare = [host_root, host_plugins, host_plugin_dir, host_project, dir, descriptor, dependencies]() -> bool {
+    auto prepare = [host_root, host_plugins, host_plugin_dir, host_project, source_dir, target_file,
+                    dir, descriptor, dependencies]() -> bool {
         std::error_code ec;
         fs::create_directories(host_plugins, ec);
-        if (ec) {
-            log_line("[ERROR] Could not create plugin compile host: " + host_root.string());
-            return false;
-        }
+        if (ec) { log_line("[ERROR] Could not create plugin compile host: " + host_root.string()); return false; }
+        fs::create_directories(source_dir, ec);
+        if (ec) { log_line("[ERROR] Could not create plugin compile target directory: " + source_dir.string()); return false; }
 
 #ifdef _WIN32
         if (!fs::exists(host_plugin_dir / descriptor.filename(), ec)) {
@@ -3401,10 +3460,7 @@ static void compile_plugin_module(const fs::path& dir) {
             fs::remove(host_plugin_dir, ec);
             ec.clear();
             fs::create_directory_symlink(dir, host_plugin_dir, ec);
-            if (ec) {
-                log_line("[ERROR] Could not create plugin compile symlink: " + ec.message());
-                return false;
-            }
+            if (ec) { log_line("[ERROR] Could not create plugin compile symlink: " + ec.message()); return false; }
         }
 #endif
 
@@ -3415,13 +3471,24 @@ static void compile_plugin_module(const fs::path& dir) {
         host << "    {\"Name\": \"" << json_escape(descriptor.stem().string()) << "\", \"Enabled\": true}";
         for (const auto& dep : dependencies)
             host << ",\n    {\"Name\": \"" << json_escape(dep) << "\", \"Enabled\": true}";
-        host << "\n  ]\n";
-        host << "}\n";
+        host << "\n  ]\n}\n";
         host.close();
-        if (!host) {
-            log_line("[ERROR] Could not write plugin compile host project: " + host_project.string());
-            return false;
-        }
+        if (!host) { log_line("[ERROR] Could not write plugin compile host project: " + host_project.string()); return false; }
+
+        std::ofstream target(target_file, std::ios::trunc);
+        target << "using UnrealBuildTool;\n\n";
+        target << "public class HostProjectEditorTarget : TargetRules\n{\n";
+        target << "    public HostProjectEditorTarget(TargetInfo Target) : base(Target)\n    {\n";
+        target << "        Type = TargetType.Editor;\n";
+        target << "        DefaultBuildSettings = BuildSettingsVersion.V6;\n";
+        target << "        bAllowEnginePluginsEnabledByDefault = false;\n";
+        target << "        EnablePlugins.Add(\"" << json_escape(descriptor.stem().string()) << "\");\n";
+        target << "        BuildPlugins.Add(\"" << json_escape(descriptor.stem().string()) << "\");\n";
+        for (const auto& dep : dependencies)
+            target << "        EnablePlugins.Add(\"" << json_escape(dep) << "\");\n";
+        target << "    }\n}\n";
+        target.close();
+        if (!target) { log_line("[ERROR] Could not write plugin compile target: " + target_file.string()); return false; }
         return true;
     };
 
@@ -3866,7 +3933,8 @@ static void draw_favorite_plugins() {
         if (target_exists && !g.plugin_git_cache.contains(git_key)) request_plugin_details({target});
         auto git_state = g.plugin_git_cache.find(git_key);
         bool installed_git = target_exists && git_state != g.plugin_git_cache.end() && git_state->second.git_repo;
-        bool submodule_exists = installed_git && git_state->second.submodule;
+        bool favorite_installed = installed_git && same_git_repo(plugin.url, git_state->second.remote_url);
+        bool submodule_exists = favorite_installed && git_state->second.submodule;
         bool can_clone = !g.project.empty() && !g.process_running && valid_folder;
         bool project_is_git = !g.git_root.empty();
         bool can_submodule = can_clone && project_is_git && (submodule_exists || !target_exists);
@@ -3882,7 +3950,7 @@ static void draw_favorite_plugins() {
             remote_loading = g.favorite_remote_loading.contains(plugin.url);
         }
 
-        if (installed_git) {
+        if (favorite_installed) {
             plugin.branch = git_state->second.revision;
         } else if (plugin.branch.empty() && !remote_branches.empty()) {
             if (std::find(remote_branches.begin(), remote_branches.end(), "main") != remote_branches.end()) plugin.branch = "main";
@@ -3907,12 +3975,14 @@ static void draw_favorite_plugins() {
                                favorite_repo.empty() ? plugin.url.c_str() : favorite_repo.c_str());
 
             ImGui::TableSetColumnIndex(2);
-            ImGui::TextColored(target_exists ? ImVec4(0.30f, 0.85f, 0.42f, 1.0f)
-                                             : ImVec4(0.88f, 0.34f, 0.30f, 1.0f),
-                               "%s", target_exists ? "Yes" : "No");
+            ImGui::TextColored(favorite_installed ? ImVec4(0.30f, 0.85f, 0.42f, 1.0f)
+                                                  : ImVec4(0.88f, 0.34f, 0.30f, 1.0f),
+                               "%s", favorite_installed ? "Yes" : "No");
+            if (target_exists && installed_git && !favorite_installed && ImGui::IsItemHovered())
+                ImGui::SetTooltip("Folder is occupied by a different remote: %s", git_state->second.remote_url.c_str());
 
             ImGui::TableSetColumnIndex(3);
-            if (installed_git) {
+            if (favorite_installed) {
                 const auto& state = git_state->second;
                 const char* current = state.revision.empty() ? "Unknown" : state.revision.c_str();
                 ImGui::SetNextItemWidth(-1.0f);
@@ -4830,55 +4900,31 @@ static float draw_ui() {
     if (g.git_refresh_requested.exchange(false)) request_project_git_refresh();
 
     draw_top_context_selectors();
+    draw_app_update_status();
 
-    const ImVec2 content_origin = ImGui::GetCursorScreenPos();
     const float available_height = ImGui::GetContentRegionAvail().y;
     const float footer_reserve = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 8.0f;
-    const float collapsed_log_height = ImGui::GetFrameHeightWithSpacing() + 6.0f;
     const float expanded_log_height = available_height * 0.52f;
-    const float content_height = std::max(120.0f, available_height - collapsed_log_height - footer_reserve - ImGui::GetStyle().ItemSpacing.y);
+    const float collapsed_log_height = ImGui::GetFrameHeightWithSpacing() + 6.0f;
+    const float log_height = g.log_expanded ? expanded_log_height : collapsed_log_height;
+    const float content_height = std::max(120.0f, available_height - log_height - footer_reserve - ImGui::GetStyle().ItemSpacing.y);
 
-    static bool project_tab_active = true;
-    ImGuiWindowFlags content_flags = project_tab_active ? (ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse) : ImGuiWindowFlags_None;
-    ImGui::BeginChild("##main_content", ImVec2(0, content_height), ImGuiChildFlags_None, content_flags);
+    ImGui::BeginChild("##main_content", ImVec2(0, content_height), ImGuiChildFlags_None, ImGuiWindowFlags_None);
     if (ImGui::BeginTabBar("##main_tabs")) {
-        if (ImGui::BeginTabItem("Project")) {
-            project_tab_active = true;
-            draw_project_ui();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Plugins")) {
-            project_tab_active = false;
-            draw_plugins_ui();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Settings")) {
-            project_tab_active = false;
-            draw_settings_ui();
-            ImGui::EndTabItem();
-        }
+        if (ImGui::BeginTabItem("Project")) { draw_project_ui(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Plugins")) { draw_plugins_ui(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Settings")) { draw_settings_ui(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
     ImGui::EndChild();
 
-    if (!g.log_expanded) {
-        ImGui::Separator();
-        ImGui::BeginChild("##embedded_build_log", ImVec2(0, collapsed_log_height), ImGuiChildFlags_None);
-        if (ImGui::Selectable("> Build Log", false, ImGuiSelectableFlags_None, ImVec2(0, ImGui::GetFrameHeight())))
-            g.log_expanded = true;
-        ImGui::EndChild();
-    } else {
-        ImVec2 overlay_pos = content_origin;
-        overlay_pos.y += std::max(0.0f, content_height - expanded_log_height);
-        ImGui::SetCursorScreenPos(overlay_pos);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.055f, 0.060f, 0.070f, 0.98f));
-        ImGui::BeginChild("##embedded_build_log_overlay", ImVec2(0, expanded_log_height), ImGuiChildFlags_Borders);
-        if (ImGui::Selectable("v Build Log", false, ImGuiSelectableFlags_None, ImVec2(0, ImGui::GetFrameHeight())))
-            g.log_expanded = false;
-        draw_log_panel();
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
-    }
+    ImGui::Separator();
+    ImGui::BeginChild("##embedded_build_log", ImVec2(0, log_height), ImGuiChildFlags_None);
+    if (ImGui::Selectable(g.log_expanded ? "v Build Log" : "> Build Log", false,
+                          ImGuiSelectableFlags_None, ImVec2(0, ImGui::GetFrameHeight())))
+        g.log_expanded = !g.log_expanded;
+    if (g.log_expanded) draw_log_panel();
+    ImGui::EndChild();
 
     draw_footer();
     return ImGui::GetCursorPosY();
@@ -4935,6 +4981,7 @@ int main(int, char**) {
     }
     refresh_android_artifacts();
     refresh_adb_devices_async();
+    check_app_main_commit_async();
 #ifdef _WIN32
     if (install_tray_icon()) log_line("[SYSTEM] Tray icon ready. Closing the main window hides UPH to the tray.");
 #endif
