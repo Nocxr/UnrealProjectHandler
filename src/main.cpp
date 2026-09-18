@@ -82,12 +82,16 @@ struct AppState {
     std::atomic<bool> process_running{false};
     std::atomic<bool> stop_requested{false};
     std::atomic<bool> catalog_running{false};
+    std::atomic<bool> git_refresh_requested{true};
     std::atomic<bool> plugin_refresh_requested{false};
     std::atomic<bool> plugin_details_running{false};
     std::atomic<bool> plugin_details_ready{false};
     std::mutex mutex;
     std::mutex plugin_mutex;
     std::map<std::string, PluginGitState> pending_plugin_git_cache;
+    fs::path git_root;
+    std::string git_branch;
+    std::vector<std::string> git_branches;
 };
 
 static AppState g;
@@ -670,6 +674,37 @@ static std::string capture_command(const std::string& command) {
     return normalized_text(output);
 }
 
+static void refresh_project_git_state() {
+    g.git_root.clear();
+    g.git_branch.clear();
+    g.git_branches.clear();
+    if (g.project.empty()) return;
+
+    auto project_dir = g.project.parent_path();
+    auto root = capture_command("git -C " + quote(project_dir) + " rev-parse --show-toplevel");
+    if (root.empty()) return;
+
+    g.git_root = fs::path(root);
+    g.git_branch = capture_command("git -C " + quote(g.git_root) + " branch --show-current");
+
+    auto branches = capture_command("git -C " + quote(g.git_root) + " branch --list --no-color");
+    std::stringstream lines(branches);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        while (!line.empty() && (line.front() == '*' || std::isspace(static_cast<unsigned char>(line.front()))))
+            line.erase(line.begin());
+        while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back())))
+            line.pop_back();
+        if (!line.empty()) g.git_branches.push_back(line);
+    }
+
+    if (g.git_branch.empty()) {
+        auto sha = capture_command("git -C " + quote(g.git_root) + " rev-parse --short HEAD");
+        if (!sha.empty()) g.git_branch = "detached @ " + sha;
+    }
+}
+
 static std::string normalized_path_key(const fs::path& path) {
     std::error_code ec;
     auto normalized = fs::weakly_canonical(path, ec);
@@ -726,6 +761,7 @@ static void select_project(fs::path project) {
     remember_project(project);
     match_project_engine(project);
     inspect_project();
+    g.git_refresh_requested = true;
     log_line("[SYSTEM] Project: " + project.string());
     save_settings();
 }
@@ -968,12 +1004,12 @@ static std::string package_command() {
     return command.str();
 }
 
-static void run_command(std::string command, const std::string& name, bool refresh_plugins = false) {
+static void run_command(std::string command, const std::string& name, bool refresh_plugins = false, bool refresh_git = false) {
     if (g.process_running.exchange(true)) { log_line("[ERROR] Another operation is already running."); return; }
     g.stop_requested = false;
     if (g.clear_on_run) { std::lock_guard lock(g.mutex); g.logs.clear(); }
     log_line("[SYSTEM] Starting " + name + ": " + command);
-    std::thread([command = std::move(command), name, refresh_plugins] {
+    std::thread([command = std::move(command), name, refresh_plugins, refresh_git] {
 #ifdef _WIN32
         auto wrapped = "cmd /S /C \"" + command + " 2>&1\"";
 #else
@@ -1031,6 +1067,7 @@ static void run_command(std::string command, const std::string& name, bool refre
         }
         log_line(status == 0 ? "[SYSTEM] " + name + " completed." : "[ERROR] " + name + " exited with an error.");
         if (refresh_plugins) g.plugin_refresh_requested = true;
+        if (refresh_git) g.git_refresh_requested = true;
         g.process_running = false;
     }).detach();
 }
@@ -2348,121 +2385,185 @@ static void draw_engine_ui() {
     }
 }
 
+static void draw_project_git_ui() {
+    ImGui::SeparatorText("Git");
+    if (g.git_root.empty()) {
+        ImGui::TextDisabled("Project folder is not a Git repository.");
+        return;
+    }
+
+    ImGui::TextDisabled("%s", g.git_root.string().c_str());
+
+    bool git_available = !g.process_running;
+    if (!git_available) ImGui::BeginDisabled();
+
+    if (ImGui::Button("Fetch")) {
+        run_command("git -C " + quote(g.git_root) + " fetch --all --prune", "Git Fetch", false, true);
+    }
+    tooltip("Fetch updates from all remotes and prune deleted remote branches.");
+    ImGui::SameLine();
+    if (ImGui::Button("Pull")) {
+        run_command("git -C " + quote(g.git_root) + " pull", "Git Pull", false, true);
+    }
+    tooltip("Pull the current branch from its configured upstream.");
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh Branches")) g.git_refresh_requested = true;
+
+    if (!git_available) ImGui::EndDisabled();
+
+    const char* branch_label = g.git_branch.empty() ? "No branch" : g.git_branch.c_str();
+    ImGui::SetNextItemWidth(std::max(220.0f, ImGui::GetContentRegionAvail().x * 0.45f));
+    if (g.process_running) ImGui::BeginDisabled();
+    if (ImGui::BeginCombo("Branch", branch_label)) {
+        for (const auto& branch : g.git_branches) {
+            bool selected = branch == g.git_branch;
+            if (ImGui::Selectable(branch.c_str(), selected) && !selected) {
+                run_command("git -C " + quote(g.git_root) + " switch " + quote(fs::path(branch)),
+                            "Switch Branch " + branch, false, true);
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (g.process_running) ImGui::EndDisabled();
+    tooltip("Switch between local Git branches for this project.");
+}
+
 static void draw_project_ui() {
-    if (ImGui::CollapsingHeader("Project", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (g.process_running) ImGui::BeginDisabled();
-        path_row("Project", g.project, "Browse...", pick_project);
-        if (g.process_running) ImGui::EndDisabled();
-        bool can_launch_project = fs::is_regular_file(g.project) && fs::exists(editor_path());
-        if (ImGui::Button("Open Project Folder")) open_path(g.project.parent_path());
-        ImGui::SameLine();
-        if (readiness_button("Launch in Editor", can_launch_project)) launch_editor(false);
-        ImGui::SameLine();
-        if (readiness_button("Run Game", can_launch_project)) launch_editor(true);
+    ImGui::SeparatorText("Project");
+    if (g.process_running) ImGui::BeginDisabled();
+    path_row("Project", g.project, "Browse...", pick_project);
+    if (g.process_running) ImGui::EndDisabled();
+    bool can_launch_project = fs::is_regular_file(g.project) && fs::exists(editor_path());
+    if (ImGui::Button("Open Project Folder")) open_path(g.project.parent_path());
+    ImGui::SameLine();
+    if (readiness_button("Launch in Editor", can_launch_project)) launch_editor(false);
+    ImGui::SameLine();
+    if (readiness_button("Run Game", can_launch_project)) launch_editor(true);
+
+    draw_project_git_ui();
+
+    ImGui::SeparatorText("Compile");
+    std::string target = g.targets.empty() ? "No project targets found" : g.targets[std::min<int>(g.compile_target, g.targets.size()-1)].name;
+    if (ImGui::BeginCombo("Target", target.c_str())) {
+        for (size_t i = 0; i < g.targets.size(); ++i)
+            if (ImGui::Selectable((g.targets[i].name + " (" + g.targets[i].type + ")").c_str(), g.compile_target == (int)i))
+                g.compile_target = (int)i;
+        ImGui::EndCombo();
     }
-    if (ImGui::CollapsingHeader("Compile", ImGuiTreeNodeFlags_DefaultOpen)) {
-        std::string target = g.targets.empty() ? "No project targets found" : g.targets[std::min<int>(g.compile_target, g.targets.size()-1)].name;
-        if (ImGui::BeginCombo("Target", target.c_str())) {
-            for (size_t i = 0; i < g.targets.size(); ++i) if (ImGui::Selectable((g.targets[i].name + " (" + g.targets[i].type + ")").c_str(), g.compile_target == (int)i)) g.compile_target = (int)i;
-            ImGui::EndCombo();
-        }
-        ImGui::Combo("Configuration##compile", &g.compile_config, g.configs.data(), (int)g.configs.size());
-        bool can_compile = fs::is_regular_file(g.project) && fs::exists(build_script()) && !g.targets.empty() && !g.process_running;
-        if (readiness_button("Compile Project", can_compile)) run_command(compile_command(), "Compile");
-        ImGui::SameLine(); if (readiness_button("Clean", can_compile)) run_command(compile_command(true), "Clean");
-        ImGui::TextUnformatted("Compile Command Preview"); command_preview(compile_command(), "##compile_preview");
-    }
-    if (ImGui::CollapsingHeader("Package", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Checkbox("Use UnrealSharp PackageProject", &g.unrealsharp);
-        tooltip("Use UnrealSharp's PackageProject automation command instead of Unreal BuildCookRun.");
-        bool selected_platform_ready = package_platform_ready(g.package_platform);
-        if (!selected_platform_ready) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.38f, 0.32f, 1.0f));
-        if (ImGui::BeginCombo("Platform", g.platforms[g.package_platform])) {
-            for (int i = 0; i < (int)g.platforms.size(); ++i) {
-                bool ready = package_platform_ready(i);
-                if (!ready) ImGui::BeginDisabled();
-                if (ImGui::Selectable((std::string(g.platforms[i]) + (ready ? "" : " (tooling incomplete)")).c_str(), g.package_platform == i))
-                    g.package_platform = i;
-                if (!ready) {
-                    ImGui::EndDisabled();
-                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip("Complete the %s tooling checks to enable this platform.", g.platforms[i]);
-                }
-            }
-            ImGui::EndCombo();
-        }
-        tooltip("Target platform for the packaged build. Platforms with incomplete tooling remain visible but disabled.");
-        if (!selected_platform_ready) ImGui::PopStyleColor();
-        ImGui::Combo("Configuration##package", &g.package_config, g.configs.data(), (int)g.configs.size());
-        tooltip("Unreal build configuration used for packaging.");
-        if (g.unrealsharp) {
-            std::vector<std::string> target_types;
-            for (const auto& target : g.targets)
-                if ((target.type == "Game" || target.type == "Client" || target.type == "Server") &&
-                    std::find(target_types.begin(), target_types.end(), target.type) == target_types.end()) target_types.push_back(target.type);
-            std::vector<const char*> labels;
-            for (const auto& type : target_types) labels.push_back(type.c_str());
-            if (labels.empty()) ImGui::TextDisabled("No packageable project target types found");
-            else ImGui::Combo("Target Type", &g.unrealsharp_target, labels.data(), (int)labels.size());
-            tooltip("Target type passed to UnrealSharp PackageProject.");
-        }
-        auto output = package_output();
-        ImGui::TextUnformatted("Output Directory");
-        ImGui::SetNextItemWidth(-95.0f);
-        auto output_text = output.string();
-        std::array<char, 4096> output_buffer{};
-        std::snprintf(output_buffer.data(), output_buffer.size(), "%s", output_text.c_str());
-        ImGui::InputText("##output", output_buffer.data(), output_buffer.size(), ImGuiInputTextFlags_ReadOnly);
-        tooltip("Directory where archived packaged builds are written.");
-        ImGui::SameLine(); if (ImGui::Button("Browse...##output")) pick_folder(DialogKind::Output, output);
-        tooltip("Choose the package output directory.");
-        ImGui::Checkbox("Clean Output Before Package", &g.clean_output);
-        tooltip("Delete the previous package output before starting. Unreal's cook cache is not removed.");
-        if (!g.unrealsharp) {
-            static const char* names[] = {"Build", "Cook", "Stage", "Pak", "Package", "Archive", "Deploy", "Run"};
-            static const char* help[] = {
-                "Compile project code before continuing.",
-                "Convert Unreal assets into platform-specific runtime data.",
-                "Copy binaries, cooked assets, configuration, and dependencies into a staging directory.",
-                "Pack cooked content into Unreal .pak container files.",
-                "Create the distributable application or platform package.",
-                "Copy the packaged build into the selected output directory.",
-                "Install the packaged build onto a connected device.",
-                "Launch the staged or deployed build after packaging."
-            };
-            ImGui::TextUnformatted("Build Pipeline");
-            for (size_t i = 0; i < 6; ++i) {
-                if (i) ImGui::SameLine();
-                auto id = std::string(names[i]) + "##package_operation_" + std::to_string(i);
-                ImGui::Checkbox(id.c_str(), &g.operations[i]);
-                tooltip(help[i]);
-            }
-            ImGui::Spacing();
-            ImGui::SeparatorText("Device Operations");
-            for (size_t i = 6; i < g.operations.size(); ++i) {
-                if (i > 6) ImGui::SameLine();
-                auto id = std::string(names[i]) + "##package_operation_" + std::to_string(i);
-                ImGui::Checkbox(id.c_str(), &g.operations[i]);
-                tooltip(help[i]);
+    ImGui::Combo("Configuration##compile", &g.compile_config, g.configs.data(), (int)g.configs.size());
+    bool can_compile = fs::is_regular_file(g.project) && fs::exists(build_script()) && !g.targets.empty() && !g.process_running;
+    if (readiness_button("Compile Project", can_compile)) run_command(compile_command(), "Compile");
+    ImGui::SameLine();
+    if (readiness_button("Clean", can_compile)) run_command(compile_command(true), "Clean");
+
+    auto compile_preview = compile_command();
+    ImGui::TextUnformatted("Compile Command Preview");
+    ImGui::SameLine();
+    if (compile_preview.empty()) ImGui::BeginDisabled();
+    if (ImGui::SmallButton("Copy Command##compile")) SDL_SetClipboardText(compile_preview.c_str());
+    if (compile_preview.empty()) ImGui::EndDisabled();
+    command_preview(compile_preview, "##compile_preview");
+
+    ImGui::SeparatorText("Package");
+    ImGui::Checkbox("Use UnrealSharp PackageProject", &g.unrealsharp);
+    tooltip("Use UnrealSharp's PackageProject automation command instead of Unreal BuildCookRun.");
+    bool selected_platform_ready = package_platform_ready(g.package_platform);
+    if (!selected_platform_ready) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.38f, 0.32f, 1.0f));
+    if (ImGui::BeginCombo("Platform", g.platforms[g.package_platform])) {
+        for (int i = 0; i < (int)g.platforms.size(); ++i) {
+            bool ready = package_platform_ready(i);
+            if (!ready) ImGui::BeginDisabled();
+            if (ImGui::Selectable((std::string(g.platforms[i]) + (ready ? "" : " (tooling incomplete)")).c_str(), g.package_platform == i))
+                g.package_platform = i;
+            if (!ready) {
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Complete the %s tooling checks to enable this platform.", g.platforms[i]);
             }
         }
-        bool can_package = fs::is_regular_file(g.project) && fs::exists(run_uat()) &&
-                           package_platform_ready(g.package_platform) && !g.process_running &&
-                           (!g.unrealsharp || fs::exists(unrealsharp_scripts()));
-        if (readiness_button("Package Project", can_package)) {
-            if (g.clean_output) clean_output();
-            auto c = package_command(); if (!c.empty()) run_command(c, "Package");
-        }
-        tooltip(can_package ? "Run the selected packaging backend." : "Packaging is disabled until the selected platform's required tooling is ready.");
-        ImGui::SameLine(); if (ImGui::Button("Clean Output")) clean_output();
-        tooltip("Immediately delete the selected package output directory without clearing Unreal's cook cache.");
-        ImGui::SameLine(); if (ImGui::Button("Open Output")) open_path(output);
-        tooltip("Open the current package output directory.");
-        ImGui::SameLine(); if (ImGui::Button("Stop") && g.process_running) { g.stop_requested = true; log_line("[SYSTEM] Stop requested."); }
-        tooltip("Stop the currently tracked compile or package operation.");
-        ImGui::TextUnformatted("Package Command Preview"); command_preview(package_command(), "##package_preview");
-        tooltip("Command that will be executed with the current package settings.");
+        ImGui::EndCombo();
     }
+    tooltip("Target platform for the packaged build. Platforms with incomplete tooling remain visible but disabled.");
+    if (!selected_platform_ready) ImGui::PopStyleColor();
+    ImGui::Combo("Configuration##package", &g.package_config, g.configs.data(), (int)g.configs.size());
+    tooltip("Unreal build configuration used for packaging.");
+    if (g.unrealsharp) {
+        std::vector<std::string> target_types;
+        for (const auto& target : g.targets)
+            if ((target.type == "Game" || target.type == "Client" || target.type == "Server") &&
+                std::find(target_types.begin(), target_types.end(), target.type) == target_types.end()) target_types.push_back(target.type);
+        std::vector<const char*> labels;
+        for (const auto& type : target_types) labels.push_back(type.c_str());
+        if (labels.empty()) ImGui::TextDisabled("No packageable project target types found");
+        else ImGui::Combo("Target Type", &g.unrealsharp_target, labels.data(), (int)labels.size());
+        tooltip("Target type passed to UnrealSharp PackageProject.");
+    }
+    auto output = package_output();
+    ImGui::TextUnformatted("Output Directory");
+    ImGui::SetNextItemWidth(-95.0f);
+    auto output_text = output.string();
+    std::array<char, 4096> output_buffer{};
+    std::snprintf(output_buffer.data(), output_buffer.size(), "%s", output_text.c_str());
+    ImGui::InputText("##output", output_buffer.data(), output_buffer.size(), ImGuiInputTextFlags_ReadOnly);
+    tooltip("Directory where archived packaged builds are written.");
+    ImGui::SameLine(); if (ImGui::Button("Browse...##output")) pick_folder(DialogKind::Output, output);
+    tooltip("Choose the package output directory.");
+    ImGui::Checkbox("Clean Output Before Package", &g.clean_output);
+    tooltip("Delete the previous package output before starting. Unreal's cook cache is not removed.");
+    if (!g.unrealsharp) {
+        static const char* names[] = {"Build", "Cook", "Stage", "Pak", "Package", "Archive", "Deploy", "Run"};
+        static const char* help[] = {
+            "Compile project code before continuing.",
+            "Convert Unreal assets into platform-specific runtime data.",
+            "Copy binaries, cooked assets, configuration, and dependencies into a staging directory.",
+            "Pack cooked content into Unreal .pak container files.",
+            "Create the distributable application or platform package.",
+            "Copy the packaged build into the selected output directory.",
+            "Install the packaged build onto a connected device.",
+            "Launch the staged or deployed build after packaging."
+        };
+        ImGui::TextUnformatted("Build Pipeline");
+        for (size_t i = 0; i < 6; ++i) {
+            if (i) ImGui::SameLine();
+            auto id = std::string(names[i]) + "##package_operation_" + std::to_string(i);
+            ImGui::Checkbox(id.c_str(), &g.operations[i]);
+            tooltip(help[i]);
+        }
+        ImGui::Spacing();
+        ImGui::SeparatorText("Device Operations");
+        for (size_t i = 6; i < g.operations.size(); ++i) {
+            if (i > 6) ImGui::SameLine();
+            auto id = std::string(names[i]) + "##package_operation_" + std::to_string(i);
+            ImGui::Checkbox(id.c_str(), &g.operations[i]);
+            tooltip(help[i]);
+        }
+    }
+    bool can_package = fs::is_regular_file(g.project) && fs::exists(run_uat()) &&
+                       package_platform_ready(g.package_platform) && !g.process_running &&
+                       (!g.unrealsharp || fs::exists(unrealsharp_scripts()));
+    if (readiness_button("Package Project", can_package)) {
+        if (g.clean_output) clean_output();
+        auto command = package_command();
+        if (!command.empty()) run_command(command, "Package");
+    }
+    tooltip(can_package ? "Run the selected packaging backend." : "Packaging is disabled until the selected platform's required tooling is ready.");
+    ImGui::SameLine(); if (ImGui::Button("Clean Output")) clean_output();
+    tooltip("Immediately delete the selected package output directory without clearing Unreal's cook cache.");
+    ImGui::SameLine(); if (ImGui::Button("Open Output")) open_path(output);
+    tooltip("Open the current package output directory.");
+    ImGui::SameLine(); if (ImGui::Button("Stop") && g.process_running) { g.stop_requested = true; log_line("[SYSTEM] Stop requested."); }
+    tooltip("Stop the currently tracked compile or package operation.");
+
+    auto package_preview = package_command();
+    ImGui::TextUnformatted("Package Command Preview");
+    ImGui::SameLine();
+    if (package_preview.empty()) ImGui::BeginDisabled();
+    if (ImGui::SmallButton("Copy Command##package")) SDL_SetClipboardText(package_preview.c_str());
+    if (package_preview.empty()) ImGui::EndDisabled();
+    command_preview(package_preview, "##package_preview");
+    tooltip("Command that will be executed with the current package settings.");
+
     ImGui::SeparatorText("Process Status");
     ImGui::TextColored(g.process_running ? ImVec4(0.90f, 0.22f, 0.20f, 1.0f) : ImVec4(0.18f, 0.78f, 0.30f, 1.0f),
                        "%s", g.process_running ? "BUSY - build operation running" : "READY - okay to compile or package");
@@ -2644,25 +2745,31 @@ static float draw_ui() {
             g.plugin_git_cache.clear();
         }
     }
+    if (g.git_refresh_requested.exchange(false)) refresh_project_git_state();
 
     draw_top_context_selectors();
 
     const float available_height = ImGui::GetContentRegionAvail().y;
     const float footer_reserve = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 8.0f;
-    const float log_height = std::clamp(available_height * 0.34f, 210.0f, 300.0f);
-    const float content_height = std::max(200.0f, available_height - log_height - footer_reserve - ImGui::GetStyle().ItemSpacing.y);
+    const float log_height = std::clamp(available_height * 0.24f, 180.0f, 260.0f);
+    const float content_height = std::max(580.0f, available_height - log_height - footer_reserve - ImGui::GetStyle().ItemSpacing.y);
 
-    ImGui::BeginChild("##main_content", ImVec2(0, content_height), ImGuiChildFlags_None);
+    static bool project_tab_active = true;
+    ImGuiWindowFlags content_flags = project_tab_active ? (ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse) : ImGuiWindowFlags_None;
+    ImGui::BeginChild("##main_content", ImVec2(0, content_height), ImGuiChildFlags_None, content_flags);
     if (ImGui::BeginTabBar("##main_tabs")) {
         if (ImGui::BeginTabItem("Project")) {
+            project_tab_active = true;
             draw_project_ui();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Plugins")) {
+            project_tab_active = false;
             draw_plugins_ui();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Settings")) {
+            project_tab_active = false;
             draw_settings_ui();
             ImGui::EndTabItem();
         }
@@ -2686,9 +2793,9 @@ int main(int, char**) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    g_window = SDL_CreateWindow("UPH - Unreal Project Handler", 900, 900, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    g_window = SDL_CreateWindow("UPH - Unreal Project Handler", 1100, 1000, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!g_window) { SDL_Log("Window creation failed: %s", SDL_GetError()); SDL_Quit(); return 1; }
-    SDL_SetWindowMinimumSize(g_window, 900, 720);
+    SDL_SetWindowMinimumSize(g_window, 1000, 900);
     auto context = SDL_GL_CreateContext(g_window);
     SDL_GL_MakeCurrent(g_window, context);
     SDL_GL_SetSwapInterval(1);
