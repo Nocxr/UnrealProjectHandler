@@ -2476,6 +2476,32 @@ static void draw_engine_ui() {
     }
 }
 
+static void initialize_project_git() {
+    if (g.project.empty()) return;
+    auto root = g.project.parent_path();
+    auto ignore = root / ".gitignore";
+    if (!fs::exists(ignore)) {
+        std::ofstream out(ignore);
+        out <<
+            "# Unreal generated files\n"
+            "Binaries/\n"
+            "DerivedDataCache/\n"
+            "Intermediate/\n"
+            "Saved/\n"
+            ".vs/\n"
+            ".idea/\n"
+            "*.VC.db\n"
+            "*.VC.opendb\n"
+            "*.sln\n"
+            "*.suo\n"
+            "*.opensdf\n"
+            "*.sdf\n"
+            "*.tmp\n"
+            "*.log\n";
+    }
+    run_command("git -C " + quote(root) + " init", "Git Init", false, true);
+}
+
 static void draw_project_git_ui() {
     ImGui::SeparatorText("Git");
     if (g.git_refresh_running) {
@@ -2484,6 +2510,12 @@ static void draw_project_git_ui() {
     }
     if (g.git_root.empty()) {
         ImGui::TextDisabled(g.git_refresh_running ? "Checking project repository..." : "Project folder is not a Git repository.");
+        if (!g.git_refresh_running && !g.project.empty()) {
+            if (g.process_running) ImGui::BeginDisabled();
+            if (ImGui::Button("Initialize Git Repository")) initialize_project_git();
+            if (g.process_running) ImGui::EndDisabled();
+            tooltip("Run git init in the project folder and create a starter Unreal .gitignore if one does not already exist.");
+        }
         return;
     }
 
@@ -2527,17 +2559,6 @@ static void draw_project_git_ui() {
 }
 
 static void draw_project_ui() {
-    ImGui::SeparatorText("Project");
-    if (g.process_running) ImGui::BeginDisabled();
-    path_row("Project", g.project, "Browse...", pick_project);
-    if (g.process_running) ImGui::EndDisabled();
-    bool can_launch_project = fs::is_regular_file(g.project) && fs::exists(editor_path());
-    if (ImGui::Button("Open Project Folder")) open_path(g.project.parent_path());
-    ImGui::SameLine();
-    if (readiness_button("Launch in Editor", can_launch_project)) launch_editor(false);
-    ImGui::SameLine();
-    if (readiness_button("Run Game", can_launch_project)) launch_editor(true);
-
     draw_project_git_ui();
 
     ImGui::SeparatorText("Compile");
@@ -2670,6 +2691,7 @@ static void draw_project_ui() {
 static void draw_top_context_selectors() {
     std::string project = current_project_label();
     std::string engine = current_engine_label();
+
     ImGui::TextDisabled("Project");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(220.0f);
@@ -2680,23 +2702,20 @@ static void draw_top_context_selectors() {
     }
     if (g.process_running) ImGui::EndDisabled();
     tooltip(g.process_running ? "Project switching is locked while an operation is running." : "Switch projects or browse for another .uproject file.");
-    ImGui::SameLine();
+
     bool can_launch_project = fs::is_regular_file(g.project) && fs::exists(editor_path());
-    if (readiness_button("\xE2\x96\xB6 Play##top_project", can_launch_project)) launch_editor(false);
+    ImGui::SameLine();
+    if (readiness_button("Launch in Editor##top_project", can_launch_project)) launch_editor(false);
     tooltip("Open the selected project in Unreal Editor.");
+
     ImGui::SameLine();
-    bool can_compile = fs::is_regular_file(g.project) && fs::exists(build_script()) && !g.targets.empty() && !g.process_running;
-    if (readiness_button("\xE2\x9A\x99 Compile##top_project", can_compile)) run_command(compile_command(), "Compile");
-    tooltip("Compile with the target and configuration selected on the Project tab.");
+    if (readiness_button("Play##top_project", can_launch_project)) launch_editor(true);
+    tooltip("Run the selected project as a game.");
+
     ImGui::SameLine();
-    bool can_package = fs::is_regular_file(g.project) && fs::exists(run_uat()) && package_platform_ready(g.package_platform) &&
-                       !g.process_running && (!g.unrealsharp || fs::exists(unrealsharp_scripts()));
-    if (readiness_button("\xE2\x96\xA3 Package##top_project", can_package)) {
-        if (g.clean_output) clean_output();
-        auto command = package_command();
-        if (!command.empty()) run_command(command, "Package");
-    }
-    tooltip("Package with the settings selected on the Project tab.");
+    if (ImGui::Button("Open Project Folder##top_project") && !g.project.empty()) open_path(g.project.parent_path());
+    tooltip("Open the selected project's folder.");
+
     ImGui::SameLine();
     ImGui::Spacing();
     ImGui::SameLine();
@@ -2710,9 +2729,11 @@ static void draw_top_context_selectors() {
     }
     if (g.process_running) ImGui::EndDisabled();
     tooltip(g.process_running ? "Engine switching is locked while an operation is running." : "Pick the active Unreal Engine.");
+
     ImGui::SameLine();
-    if (readiness_button("\xE2\x96\xB6 Play##top_engine", fs::exists(editor_path()))) launch_editor_home();
+    if (readiness_button("Launch##top_engine", fs::exists(editor_path()))) launch_editor_home();
     tooltip("Launch Unreal Editor without a project to open the project browser/new-project window.");
+
     ImGui::Separator();
 }
 
@@ -2854,10 +2875,10 @@ static float draw_ui() {
 
     const float available_height = ImGui::GetContentRegionAvail().y;
     const float footer_reserve = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 8.0f;
-    const float expanded_log_height = std::clamp(available_height * 0.24f, 180.0f, 260.0f);
+    const float expanded_log_height = available_height * 0.52f;
     const float collapsed_log_height = ImGui::GetFrameHeightWithSpacing() + 6.0f;
     const float log_height = g.log_expanded ? expanded_log_height : collapsed_log_height;
-    const float content_height = std::max(580.0f, available_height - log_height - footer_reserve - ImGui::GetStyle().ItemSpacing.y);
+    const float content_height = std::max(120.0f, available_height - log_height - footer_reserve - ImGui::GetStyle().ItemSpacing.y);
 
     static bool project_tab_active = true;
     ImGuiWindowFlags content_flags = project_tab_active ? (ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse) : ImGuiWindowFlags_None;
@@ -2884,7 +2905,7 @@ static float draw_ui() {
 
     ImGui::Separator();
     ImGui::BeginChild("##embedded_build_log", ImVec2(0, log_height), ImGuiChildFlags_None);
-    if (ImGui::Selectable(g.log_expanded ? "â¼ Build Log" : "â¶ Build Log", false,
+    if (ImGui::Selectable(g.log_expanded ? "v Build Log" : "> Build Log", false,
                           ImGuiSelectableFlags_None, ImVec2(0, ImGui::GetFrameHeight()))) {
         g.log_expanded = !g.log_expanded;
     }
