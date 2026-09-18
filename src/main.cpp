@@ -76,6 +76,7 @@ struct AppState {
     int unrealsharp_target = 0;
     bool unrealsharp = false;
     bool clean_output = false;
+    bool project_has_cpp_module = false;
     bool auto_scroll = true;
     bool clear_on_run = false;
     bool log_expanded = true;
@@ -644,6 +645,7 @@ static void discover_engines() {
 
 static void inspect_project() {
     g.targets.clear();
+    g.project_has_cpp_module = false;
     if (g.project.empty()) {
         inspect_tooling();
         return;
@@ -652,12 +654,16 @@ static void inspect_project() {
     std::error_code ec;
     if (fs::exists(source, ec)) {
         for (const auto& entry : fs::recursive_directory_iterator(source, ec)) {
-            if (!entry.is_regular_file() || entry.path().filename().string().find("Target.cs") == std::string::npos) continue;
+            if (!entry.is_regular_file()) continue;
+            auto filename = entry.path().filename().string();
+            if (filename.size() >= 9 && filename.ends_with(".Build.cs"))
+                g.project_has_cpp_module = true;
+            if (filename.find("Target.cs") == std::string::npos) continue;
             auto text = read_text(entry.path());
             std::string type = "Game";
             for (auto candidate : {"Editor", "Client", "Server", "Program"})
                 if (text.find("TargetType." + std::string(candidate)) != std::string::npos) type = candidate;
-            auto name = entry.path().filename().string();
+            auto name = filename;
             name.erase(name.size() - std::string(".Target.cs").size());
             g.targets.push_back({name, type});
         }
@@ -848,6 +854,7 @@ static void select_project(fs::path project) {
     if (g.process_running) { log_line("[ERROR] Stop the current operation before switching projects."); return; }
     if (project.empty()) return;
     g.project = project;
+    g.output.clear();
     g.plugin_scan_cache.clear();
     remember_project(project);
     match_project_engine(project);
@@ -967,10 +974,14 @@ static fs::path editor_path() {
 #endif
 }
 
+static fs::path default_package_output() {
+    if (g.project.empty()) return {};
+    return g.project.parent_path() / g.platforms[g.package_platform];
+}
+
 static fs::path package_output() {
     if (!g.output.empty()) return g.output;
-    if (g.project.empty()) return {};
-    return g.project.parent_path() / "Builds" / g.platforms[g.package_platform] / g.configs[g.package_config];
+    return default_package_output();
 }
 
 static fs::path unrealsharp_scripts() {
@@ -1251,16 +1262,6 @@ static void clean_output() {
     else log_line("[SYSTEM] Cleaned package output (" + std::to_string(count) + " entries).");
 }
 
-static void path_row(const char* label, const fs::path& path, const char* button, void (*action)()) {
-    ImGui::TextUnformatted(label);
-    ImGui::SetNextItemWidth(-95.0f);
-    std::array<char, 4096> buffer{};
-    auto text = path.string();
-    std::snprintf(buffer.data(), buffer.size(), "%s", text.c_str());
-    ImGui::InputText((std::string("##") + label).c_str(), buffer.data(), buffer.size(), ImGuiInputTextFlags_ReadOnly);
-    ImGui::SameLine();
-    if (ImGui::Button(button)) action();
-}
 
 static std::string wrapped_for_preview(const std::string& text, float max_width) {
     std::string wrapped;
@@ -2410,23 +2411,38 @@ static std::string current_project_label() {
 
 static void project_combo_items() {
     fs::path selected;
-    for (const auto& project : g.recent_projects) {
-        ImGui::PushID(project.string().c_str());
+    int remove_index = -1;
+
+    for (int i = 0; i < (int)g.recent_projects.size(); ++i) {
+        const auto& project = g.recent_projects[i];
+        ImGui::PushID(i);
         bool available = fs::is_regular_file(project);
+        bool active = normalized_path_key(project) == normalized_path_key(g.project);
         auto label = project.stem().string() + (available ? "" : " (missing)");
+
+        float remove_width = ImGui::CalcTextSize("X").x + ImGui::GetStyle().FramePadding.x * 2.0f +
+                             ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - remove_width));
         if (!available) ImGui::BeginDisabled();
-        if (ImGui::Selectable(label.c_str(), normalized_path_key(project) == normalized_path_key(g.project))) selected = project;
+        if (ImGui::Selectable(label.c_str(), active, ImGuiSelectableFlags_None, ImVec2(ImGui::GetContentRegionAvail().x - remove_width, 0)))
+            selected = project;
         if (!available) ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", project.string().c_str());
+
+        ImGui::SameLine();
+        if (ImGui::SmallButton("X")) remove_index = i;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove this project from the recent-project list.");
         ImGui::PopID();
     }
-    if (!g.recent_projects.empty()) ImGui::Separator();
-    if (ImGui::Selectable("Browse for project...")) pick_project();
-    bool has_missing = std::any_of(g.recent_projects.begin(), g.recent_projects.end(), [](const fs::path& path){ return !fs::is_regular_file(path); });
-    if (has_missing && ImGui::Selectable("Remove missing projects")) {
-        std::erase_if(g.recent_projects, [](const fs::path& path){ return !fs::is_regular_file(path); });
+
+    if (remove_index >= 0 && remove_index < (int)g.recent_projects.size()) {
+        g.recent_projects.erase(g.recent_projects.begin() + remove_index);
         save_settings();
     }
+
+    if (!g.recent_projects.empty()) ImGui::Separator();
+    if (ImGui::Selectable("Browse for project...")) pick_project();
+
     if (!selected.empty()) select_project(selected);
 }
 
@@ -2563,6 +2579,11 @@ static void draw_project_ui() {
     draw_project_git_ui();
 
     ImGui::SeparatorText("Compile");
+    const bool has_cpp_module = g.project_has_cpp_module && !g.targets.empty();
+    if (!has_cpp_module) {
+        ImGui::TextDisabled("No C++ module found for this project.");
+        ImGui::BeginDisabled();
+    }
     std::string target = g.targets.empty() ? "No project targets found" : g.targets[std::min<int>(g.compile_target, g.targets.size()-1)].name;
     if (ImGui::BeginCombo("Target", target.c_str())) {
         for (size_t i = 0; i < g.targets.size(); ++i)
@@ -2571,7 +2592,7 @@ static void draw_project_ui() {
         ImGui::EndCombo();
     }
     ImGui::Combo("Configuration##compile", &g.compile_config, g.configs.data(), (int)g.configs.size());
-    bool can_compile = fs::is_regular_file(g.project) && fs::exists(build_script()) && !g.targets.empty() && !g.process_running;
+    bool can_compile = has_cpp_module && fs::is_regular_file(g.project) && fs::exists(build_script()) && !g.process_running;
     if (readiness_button("Compile Project", can_compile)) run_command(compile_command(), "Compile");
     ImGui::SameLine();
     if (readiness_button("Clean", can_compile)) run_command(compile_command(true), "Clean");
@@ -2583,6 +2604,7 @@ static void draw_project_ui() {
     if (ImGui::SmallButton("Copy Command##compile")) SDL_SetClipboardText(compile_preview.c_str());
     if (compile_preview.empty()) ImGui::EndDisabled();
     command_preview(compile_preview, "##compile_preview");
+    if (!has_cpp_module) ImGui::EndDisabled();
 
     ImGui::SeparatorText("Package");
     ImGui::Checkbox("Use UnrealSharp PackageProject", &g.unrealsharp);
@@ -2593,8 +2615,10 @@ static void draw_project_ui() {
         for (int i = 0; i < (int)g.platforms.size(); ++i) {
             bool ready = package_platform_ready(i);
             if (!ready) ImGui::BeginDisabled();
-            if (ImGui::Selectable((std::string(g.platforms[i]) + (ready ? "" : " (tooling incomplete)")).c_str(), g.package_platform == i))
+            if (ImGui::Selectable((std::string(g.platforms[i]) + (ready ? "" : " (tooling incomplete)")).c_str(), g.package_platform == i)) {
                 g.package_platform = i;
+                g.output.clear();
+            }
             if (!ready) {
                 ImGui::EndDisabled();
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
