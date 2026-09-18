@@ -45,6 +45,7 @@ struct ToolRow { std::string group; std::string name; fs::path path; bool found;
 struct ToolMeta { std::string version; std::string install; std::string code; };
 struct FavoritePlugin { std::string name; std::string url; };
 struct PluginGitState { bool submodule = false; std::string revision; };
+struct ProjectGitState { fs::path root; std::string branch; std::vector<std::string> branches; };
 struct LogEntry { std::string text; bool error = false; };
 
 struct AppState {
@@ -77,18 +78,23 @@ struct AppState {
     bool clean_output = false;
     bool auto_scroll = true;
     bool clear_on_run = false;
+    bool log_expanded = true;
     std::set<int> selected_logs;
     int log_selection_anchor = -1;
     std::atomic<bool> process_running{false};
     std::atomic<bool> stop_requested{false};
     std::atomic<bool> catalog_running{false};
     std::atomic<bool> git_refresh_requested{true};
+    std::atomic<bool> git_refresh_running{false};
+    std::atomic<bool> git_refresh_ready{false};
     std::atomic<bool> plugin_refresh_requested{false};
     std::atomic<bool> plugin_details_running{false};
     std::atomic<bool> plugin_details_ready{false};
     std::mutex mutex;
     std::mutex plugin_mutex;
+    std::mutex git_mutex;
     std::map<std::string, PluginGitState> pending_plugin_git_cache;
+    ProjectGitState pending_git_state;
     fs::path git_root;
     std::string git_branch;
     std::vector<std::string> git_branches;
@@ -661,10 +667,67 @@ static void inspect_project() {
 
 static std::string capture_command(const std::string& command) {
 #ifdef _WIN32
-    auto wrapped = "cmd /S /C \"" + command + " 2>NUL\"";
+    SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    HANDLE read_pipe = nullptr;
+    HANDLE write_pipe = nullptr;
+    if (!CreatePipe(&read_pipe, &write_pipe, &security, 0)) return {};
+    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+
+    HANDLE null_input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE null_error = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    startup.hStdInput = null_input != INVALID_HANDLE_VALUE ? null_input : GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = write_pipe;
+    startup.hStdError = null_error != INVALID_HANDLE_VALUE ? null_error : write_pipe;
+
+    int wide_count = MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, nullptr, 0);
+    std::wstring wide_command;
+    if (wide_count > 0) {
+        wide_command.resize(static_cast<size_t>(wide_count));
+        MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, wide_command.data(), wide_count);
+        if (!wide_command.empty() && wide_command.back() == L'\0') wide_command.pop_back();
+    } else {
+        wide_command.assign(command.begin(), command.end());
+    }
+
+    std::wstring command_line = L"cmd.exe /D /S /C \"" + wide_command + L"\"";
+    std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
+    mutable_command.push_back(L'\0');
+
+    PROCESS_INFORMATION process{};
+    BOOL started = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, TRUE,
+                                  CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+    CloseHandle(write_pipe);
+    if (null_input != INVALID_HANDLE_VALUE) CloseHandle(null_input);
+    if (null_error != INVALID_HANDLE_VALUE) CloseHandle(null_error);
+
+    if (!started) {
+        CloseHandle(read_pipe);
+        return {};
+    }
+
+    std::string output;
+    char buffer[4096];
+    DWORD bytes_read = 0;
+    while (ReadFile(read_pipe, buffer, sizeof(buffer), &bytes_read, nullptr) && bytes_read > 0)
+        output.append(buffer, buffer + bytes_read);
+
+    CloseHandle(read_pipe);
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exit_code = 1;
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    if (exit_code != 0) return {};
+    return normalized_text(output);
 #else
     auto wrapped = command + " 2>/dev/null";
-#endif
     FILE* pipe = popen(wrapped.c_str(), "r");
     if (!pipe) return {};
     char buffer[1024];
@@ -672,22 +735,30 @@ static std::string capture_command(const std::string& command) {
     while (fgets(buffer, sizeof(buffer), pipe)) output += buffer;
     if (pclose(pipe) != 0) return {};
     return normalized_text(output);
+#endif
 }
 
-static void refresh_project_git_state() {
-    g.git_root.clear();
-    g.git_branch.clear();
-    g.git_branches.clear();
-    if (g.project.empty()) return;
+static ProjectGitState inspect_project_git_state(const fs::path& project) {
+    ProjectGitState state;
+    if (project.empty()) return state;
 
-    auto project_dir = g.project.parent_path();
-    auto root = capture_command("git -C " + quote(project_dir) + " rev-parse --show-toplevel");
-    if (root.empty()) return;
+    auto project_dir = project.parent_path();
+    auto identity = capture_command("git -C " + quote(project_dir) + " rev-parse --show-toplevel --abbrev-ref HEAD");
+    if (identity.empty()) return state;
 
-    g.git_root = fs::path(root);
-    g.git_branch = capture_command("git -C " + quote(g.git_root) + " branch --show-current");
+    std::stringstream identity_lines(identity);
+    std::string root;
+    std::string branch;
+    std::getline(identity_lines, root);
+    std::getline(identity_lines, branch);
+    if (!root.empty() && root.back() == '\r') root.pop_back();
+    if (!branch.empty() && branch.back() == '\r') branch.pop_back();
+    if (root.empty()) return state;
 
-    auto branches = capture_command("git -C " + quote(g.git_root) + " branch --list --no-color");
+    state.root = fs::path(root);
+    state.branch = branch == "HEAD" ? std::string{} : branch;
+
+    auto branches = capture_command("git -C " + quote(state.root) + " branch --list --no-color");
     std::stringstream lines(branches);
     std::string line;
     while (std::getline(lines, line)) {
@@ -696,13 +767,33 @@ static void refresh_project_git_state() {
             line.erase(line.begin());
         while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back())))
             line.pop_back();
-        if (!line.empty()) g.git_branches.push_back(line);
+        if (!line.empty()) state.branches.push_back(line);
     }
 
-    if (g.git_branch.empty()) {
-        auto sha = capture_command("git -C " + quote(g.git_root) + " rev-parse --short HEAD");
-        if (!sha.empty()) g.git_branch = "detached @ " + sha;
+    if (state.branch.empty()) {
+        auto sha = capture_command("git -C " + quote(state.root) + " rev-parse --short HEAD");
+        if (!sha.empty()) state.branch = "detached @ " + sha;
     }
+    return state;
+}
+
+static void request_project_git_refresh() {
+    if (g.git_refresh_running.exchange(true)) {
+        g.git_refresh_requested = true;
+        return;
+    }
+
+    auto project = g.project;
+    g.git_refresh_ready = false;
+    std::thread([project] {
+        auto state = inspect_project_git_state(project);
+        {
+            std::lock_guard lock(g.git_mutex);
+            g.pending_git_state = std::move(state);
+        }
+        g.git_refresh_ready = true;
+        g.git_refresh_running = false;
+    }).detach();
 }
 
 static std::string normalized_path_key(const fs::path& path) {
@@ -2387,8 +2478,12 @@ static void draw_engine_ui() {
 
 static void draw_project_git_ui() {
     ImGui::SeparatorText("Git");
+    if (g.git_refresh_running) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Refreshing...");
+    }
     if (g.git_root.empty()) {
-        ImGui::TextDisabled("Project folder is not a Git repository.");
+        ImGui::TextDisabled(g.git_refresh_running ? "Checking project repository..." : "Project folder is not a Git repository.");
         return;
     }
 
@@ -2407,7 +2502,9 @@ static void draw_project_git_ui() {
     }
     tooltip("Pull the current branch from its configured upstream.");
     ImGui::SameLine();
+    if (g.git_refresh_running) ImGui::BeginDisabled();
     if (ImGui::Button("Refresh Branches")) g.git_refresh_requested = true;
+    if (g.git_refresh_running) ImGui::EndDisabled();
 
     if (!git_available) ImGui::EndDisabled();
 
@@ -2624,11 +2721,10 @@ static void draw_footer() {
     const float footer_y = ImGui::GetWindowHeight() - ImGui::GetStyle().WindowPadding.y - footer_height;
     if (ImGui::GetCursorPosY() < footer_y) ImGui::SetCursorPosY(footer_y);
     ImGui::Separator();
-    ImGui::TextDisabled("Ctrl + Q Quit");
+    ImGui::TextDisabled("` Toggle Build Log    |    Ctrl + Q Quit");
 }
 
 static void draw_log_panel() {
-    ImGui::TextUnformatted("Build Log");
     ImGui::Checkbox("Auto-scroll", &g.auto_scroll); ImGui::SameLine(); ImGui::Checkbox("Clear on run", &g.clear_on_run);
     tooltip("Clear the log when a compile or package operation starts.");
     ImGui::SameLine(); if (ImGui::Button("Clear")) { std::lock_guard lock(g.mutex); g.logs.clear(); g.selected_logs.clear(); g.log_selection_anchor = -1; }
@@ -2745,13 +2841,22 @@ static float draw_ui() {
             g.plugin_git_cache.clear();
         }
     }
-    if (g.git_refresh_requested.exchange(false)) refresh_project_git_state();
+    if (g.git_refresh_ready.exchange(false)) {
+        std::lock_guard lock(g.git_mutex);
+        g.git_root = std::move(g.pending_git_state.root);
+        g.git_branch = std::move(g.pending_git_state.branch);
+        g.git_branches = std::move(g.pending_git_state.branches);
+        g.pending_git_state = {};
+    }
+    if (g.git_refresh_requested.exchange(false)) request_project_git_refresh();
 
     draw_top_context_selectors();
 
     const float available_height = ImGui::GetContentRegionAvail().y;
     const float footer_reserve = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 8.0f;
-    const float log_height = std::clamp(available_height * 0.24f, 180.0f, 260.0f);
+    const float expanded_log_height = std::clamp(available_height * 0.24f, 180.0f, 260.0f);
+    const float collapsed_log_height = ImGui::GetFrameHeightWithSpacing() + 6.0f;
+    const float log_height = g.log_expanded ? expanded_log_height : collapsed_log_height;
     const float content_height = std::max(580.0f, available_height - log_height - footer_reserve - ImGui::GetStyle().ItemSpacing.y);
 
     static bool project_tab_active = true;
@@ -2779,7 +2884,11 @@ static float draw_ui() {
 
     ImGui::Separator();
     ImGui::BeginChild("##embedded_build_log", ImVec2(0, log_height), ImGuiChildFlags_None);
-    draw_log_panel();
+    if (ImGui::Selectable(g.log_expanded ? "â¼ Build Log" : "â¶ Build Log", false,
+                          ImGuiSelectableFlags_None, ImVec2(0, ImGui::GetFrameHeight()))) {
+        g.log_expanded = !g.log_expanded;
+    }
+    if (g.log_expanded) draw_log_panel();
     ImGui::EndChild();
 
     draw_footer();
@@ -2859,7 +2968,7 @@ int main(int, char**) {
 #endif
             }
         };
-        int idle_wait_ms = (g.process_running || g.catalog_running) ? 33 : 100;
+        int idle_wait_ms = (g.process_running || g.catalog_running || g.git_refresh_running) ? 33 : 100;
         if (SDL_WaitEventTimeout(&event, idle_wait_ms)) {
             handle_event(event);
             while (SDL_PollEvent(&event)) handle_event(event);
@@ -2875,6 +2984,8 @@ int main(int, char**) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
+        if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false))
+            g.log_expanded = !g.log_expanded;
         if (!ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl &&
             ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
             running = false;
