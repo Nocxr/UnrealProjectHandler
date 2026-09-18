@@ -47,6 +47,7 @@ struct FavoritePlugin { std::string name; std::string url; };
 struct PluginGitState {
     bool git_repo = false;
     bool submodule = false;
+    fs::path git_root;
     std::string revision;
     std::string remote_url;
     std::string repo_name;
@@ -1838,12 +1839,18 @@ static std::optional<ImGuiKey> hotkey_key_from_name(std::string name) {
     if (name == "GRAVEACCENT" || name == "GRAVE" || name == "`") return ImGuiKey_GraveAccent;
     if (name.size() == 1 && name[0] >= 'A' && name[0] <= 'Z') return static_cast<ImGuiKey>(ImGuiKey_A + (name[0] - 'A'));
     if (name.size() == 1 && name[0] >= '0' && name[0] <= '9') return static_cast<ImGuiKey>(ImGuiKey_0 + (name[0] - '0'));
-    if (name == "F1") return ImGuiKey_F1; if (name == "F2") return ImGuiKey_F2;
-    if (name == "F3") return ImGuiKey_F3; if (name == "F4") return ImGuiKey_F4;
-    if (name == "F5") return ImGuiKey_F5; if (name == "F6") return ImGuiKey_F6;
-    if (name == "F7") return ImGuiKey_F7; if (name == "F8") return ImGuiKey_F8;
-    if (name == "F9") return ImGuiKey_F9; if (name == "F10") return ImGuiKey_F10;
-    if (name == "F11") return ImGuiKey_F11; if (name == "F12") return ImGuiKey_F12;
+    if (name == "F1") return ImGuiKey_F1;
+    if (name == "F2") return ImGuiKey_F2;
+    if (name == "F3") return ImGuiKey_F3;
+    if (name == "F4") return ImGuiKey_F4;
+    if (name == "F5") return ImGuiKey_F5;
+    if (name == "F6") return ImGuiKey_F6;
+    if (name == "F7") return ImGuiKey_F7;
+    if (name == "F8") return ImGuiKey_F8;
+    if (name == "F9") return ImGuiKey_F9;
+    if (name == "F10") return ImGuiKey_F10;
+    if (name == "F11") return ImGuiKey_F11;
+    if (name == "F12") return ImGuiKey_F12;
     if (name == "SPACE") return ImGuiKey_Space;
     if (name == "ENTER") return ImGuiKey_Enter;
     return std::nullopt;
@@ -2723,6 +2730,7 @@ static PluginGitState inspect_plugin_git_state(const fs::path& dir, const fs::pa
     auto git_root = capture_command("git -C " + quote(dir) + " rev-parse --show-toplevel");
     if (git_root.empty()) return state;
     state.git_repo = true;
+    state.git_root = fs::path(git_root);
 
     if (!root.empty()) {
         std::error_code ec;
@@ -2856,10 +2864,10 @@ static std::string plugin_module_name(const fs::path& dir) {
 }
 
 static void compile_plugin_module(const fs::path& dir) {
-    if (g.targets.empty()) { log_line("[ERROR] No project target available to compile plugin module."); return; }
     auto module = plugin_module_name(dir);
     if (module.empty()) { log_line("[ERROR] No C++ module found in plugin " + dir.filename().string()); return; }
-    auto target = g.targets[std::min<int>(g.compile_target, g.targets.size()-1)].name;
+    auto target = g.targets.empty() ? std::string("UnrealEditor")
+                                    : g.targets[std::min<int>(g.compile_target, g.targets.size()-1)].name;
     std::ostringstream command;
 #ifdef _WIN32
     command << quote(build_script()) << ' ' << target << " Win64 ";
@@ -2869,6 +2877,135 @@ static void compile_plugin_module(const fs::path& dir) {
     command << g.configs[g.compile_config] << " -Project=" << quote(g.project)
             << " -Module=" << module << " -WaitMutex -Verbose";
     run_command(command.str(), "Compile Plugin " + module, true);
+}
+
+
+struct ProjectPluginReference {
+    std::string name;
+    bool enabled = true;
+};
+
+static std::vector<ProjectPluginReference> project_plugin_references() {
+    std::vector<ProjectPluginReference> result;
+    if (g.project.empty()) return result;
+    auto text = read_text(g.project);
+    auto plugins_key = text.find("\"Plugins\"");
+    if (plugins_key == std::string::npos) return result;
+    auto array_start = text.find('[', plugins_key);
+    if (array_start == std::string::npos) return result;
+
+    int depth = 0;
+    size_t object_start = std::string::npos;
+    bool in_string = false, escape = false;
+    for (size_t i = array_start + 1; i < text.size(); ++i) {
+        char ch = text[i];
+        if (in_string) {
+            if (escape) escape = false;
+            else if (ch == '\\') escape = true;
+            else if (ch == '"') in_string = false;
+            continue;
+        }
+        if (ch == '"') { in_string = true; continue; }
+        if (ch == ']' && depth == 0) break;
+        if (ch == '{') {
+            if (depth == 0) object_start = i;
+            ++depth;
+        } else if (ch == '}' && depth > 0) {
+            --depth;
+            if (depth == 0 && object_start != std::string::npos) {
+                auto object = text.substr(object_start, i - object_start + 1);
+                auto name = json_string_value(object, "Name");
+                if (!name.empty()) {
+                    bool enabled = true;
+                    auto enabled_key = object.find("\"Enabled\"");
+                    if (enabled_key != std::string::npos) {
+                        auto colon = object.find(':', enabled_key);
+                        if (colon != std::string::npos) {
+                            auto value = object.substr(colon + 1);
+                            auto first = value.find_first_not_of(" \t\r\n");
+                            if (first != std::string::npos && value.compare(first, 5, "false") == 0) enabled = false;
+                        }
+                    }
+                    result.push_back({name, enabled});
+                }
+                object_start = std::string::npos;
+            }
+        }
+    }
+    return result;
+}
+
+static bool set_project_plugin_enabled(const std::string& plugin_name, bool enabled) {
+    if (g.project.empty()) return false;
+    auto text = read_text(g.project);
+    auto plugins_key = text.find("\"Plugins\"");
+    if (plugins_key == std::string::npos) return false;
+    auto array_start = text.find('[', plugins_key);
+    if (array_start == std::string::npos) return false;
+
+    int depth = 0;
+    size_t object_start = std::string::npos;
+    bool in_string = false, escape = false;
+    for (size_t i = array_start + 1; i < text.size(); ++i) {
+        char ch = text[i];
+        if (in_string) {
+            if (escape) escape = false;
+            else if (ch == '\\') escape = true;
+            else if (ch == '"') in_string = false;
+            continue;
+        }
+        if (ch == '"') { in_string = true; continue; }
+        if (ch == ']' && depth == 0) break;
+        if (ch == '{') {
+            if (depth == 0) object_start = i;
+            ++depth;
+        } else if (ch == '}' && depth > 0) {
+            --depth;
+            if (depth == 0 && object_start != std::string::npos) {
+                auto object_end = i;
+                auto object = text.substr(object_start, object_end - object_start + 1);
+                if (json_string_value(object, "Name") == plugin_name) {
+                    auto enabled_key = object.find("\"Enabled\"");
+                    if (enabled_key != std::string::npos) {
+                        auto colon = object.find(':', enabled_key);
+                        auto value_start = colon == std::string::npos ? std::string::npos : object.find_first_not_of(" \t\r\n", colon + 1);
+                        if (value_start == std::string::npos) return false;
+                        auto absolute = object_start + value_start;
+                        if (text.compare(absolute, 4, "true") == 0) text.replace(absolute, 4, enabled ? "true" : "false");
+                        else if (text.compare(absolute, 5, "false") == 0) text.replace(absolute, 5, enabled ? "true" : "false");
+                        else return false;
+                    } else {
+                        auto insert_at = object_end;
+                        auto before_close = text.find_last_not_of(" \t\r\n", insert_at - 1);
+                        bool needs_comma = before_close != std::string::npos && text[before_close] != '{' && text[before_close] != ',';
+                        std::string insertion = (needs_comma ? "," : "") + std::string("\n\t\t\t\"Enabled\": ") + (enabled ? "true" : "false");
+                        text.insert(insert_at, insertion);
+                    }
+                    std::ofstream out(g.project, std::ios::trunc);
+                    out << text;
+                    return static_cast<bool>(out);
+                }
+                object_start = std::string::npos;
+            }
+        }
+    }
+    return false;
+}
+
+static bool project_plugin_exists_locally(const std::string& name) {
+    if (g.project.empty()) return false;
+    auto plugins_root = g.project.parent_path() / "Plugins";
+    std::error_code ec;
+    if (!fs::exists(plugins_root, ec)) return false;
+    for (fs::recursive_directory_iterator it(plugins_root, fs::directory_options::skip_permission_denied, ec), end;
+         it != end; it.increment(ec)) {
+        if (ec) { ec.clear(); continue; }
+        if (!it->is_regular_file(ec) || it->path().extension() != ".uplugin") continue;
+        if (it->path().stem().string() == name) return true;
+        auto friendly = json_string_value(read_text(it->path()), "FriendlyName");
+        if (friendly == name) return true;
+    }
+    return false;
 }
 
 static void plugin_git_controls(const fs::path& dir, const PluginGitState& state) {
@@ -2937,7 +3074,7 @@ static void draw_plugin_list(const fs::path& root, bool refresh = false, bool sh
         if (ImGui::SmallButton("Open")) open_path(dir);
         ImGui::SameLine();
         auto module = plugin_module_name(dir);
-        const bool compile_ready = !module.empty() && !g.process_running && !g.targets.empty();
+        const bool compile_ready = !module.empty() && !g.process_running && fs::exists(build_script()) && fs::is_regular_file(g.project);
         if (!compile_ready) ImGui::BeginDisabled();
         if (ImGui::SmallButton("Compile Plugin")) compile_plugin_module(dir);
         if (!compile_ready) ImGui::EndDisabled();
@@ -2958,10 +3095,107 @@ static void draw_engine_marketplace_plugins() {
 
 static void draw_project_plugins() {
     if (!ImGui::CollapsingHeader("Project Plugins", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    auto root = g.project.empty() ? fs::path{} : g.project.parent_path() / "Plugins";
+    if (root.empty() || !fs::exists(root)) {
+        ImGui::TextDisabled("No project Plugins folder.");
+        return;
+    }
+
     bool refresh = ImGui::SmallButton("Refresh##project_plugins");
-    if (refresh && g.plugin_details_running) g.plugin_refresh_requested = true;
-    ImGui::SameLine(); ImGui::TextDisabled("Cached after first scan");
-    draw_plugin_list(g.project.empty() ? fs::path{} : g.project.parent_path() / "Plugins", refresh, true);
+    if (refresh) {
+        g.plugin_scan_cache.erase(normalized_path_key(root));
+        g.plugin_git_cache.clear();
+        if (g.plugin_details_running) g.plugin_refresh_requested = true;
+    }
+
+    const auto& plugins = list_plugins(root, refresh);
+    if (plugins.empty()) { ImGui::TextDisabled("No project plugins found."); return; }
+
+    std::vector<fs::path> missing;
+    for (const auto& dir : plugins)
+        if (!g.plugin_git_cache.contains(normalized_path_key(dir))) missing.push_back(dir);
+    request_plugin_details(std::move(missing));
+
+    std::map<std::string, std::vector<fs::path>> groups;
+    std::vector<fs::path> ungrouped;
+    for (const auto& dir : plugins) {
+        auto state_it = g.plugin_git_cache.find(normalized_path_key(dir));
+        if (state_it != g.plugin_git_cache.end() && state_it->second.git_repo && !state_it->second.git_root.empty()) {
+            groups[normalized_path_key(state_it->second.git_root)].push_back(dir);
+        } else {
+            ungrouped.push_back(dir);
+        }
+    }
+
+    auto draw_one = [&](const fs::path& dir) {
+        ImGui::PushID(dir.string().c_str());
+        ImGui::TextUnformatted(plugin_display_name(dir).c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", dir.string().c_str());
+        ImGui::SameLine();
+        auto state_it = g.plugin_git_cache.find(normalized_path_key(dir));
+        if (state_it != g.plugin_git_cache.end() && state_it->second.git_repo) {
+            ImGui::TextColored(state_it->second.submodule ? ImVec4(0.30f,0.68f,1.0f,1.0f) : ImVec4(0.58f,0.78f,0.58f,1.0f),
+                               "%s", state_it->second.submodule ? "Submodule" : "Git");
+        }
+        if (ImGui::SmallButton("Open")) open_path(dir);
+        ImGui::SameLine();
+        auto module = plugin_module_name(dir);
+        const bool compile_ready = !module.empty() && !g.process_running && fs::exists(build_script()) && fs::is_regular_file(g.project);
+        if (!compile_ready) ImGui::BeginDisabled();
+        if (ImGui::SmallButton("Compile Plugin")) compile_plugin_module(dir);
+        if (!compile_ready) ImGui::EndDisabled();
+        if (!module.empty()) { ImGui::SameLine(); ImGui::TextDisabled("Module: %s", module.c_str()); }
+        ImGui::PopID();
+    };
+
+    for (auto& [group_key, group_plugins] : groups) {
+        if (group_plugins.empty()) continue;
+        auto state_it = g.plugin_git_cache.find(normalized_path_key(group_plugins.front()));
+        if (state_it == g.plugin_git_cache.end()) continue;
+        const auto& state = state_it->second;
+        std::string label = state.repo_name.empty() ? state.git_root.filename().string() : state.repo_name;
+        label += " (" + std::to_string(group_plugins.size()) + " plugins)";
+        ImGui::PushID(group_key.c_str());
+        bool open = ImGui::CollapsingHeader(label.c_str());
+        ImGui::SameLine();
+        plugin_git_controls(state.git_root, state);
+        if (open) {
+            ImGui::Indent();
+            for (const auto& dir : group_plugins) draw_one(dir);
+            ImGui::Unindent();
+        }
+        ImGui::PopID();
+    }
+
+    if (!ungrouped.empty()) {
+        if (ImGui::CollapsingHeader("Local / Ungrouped Plugins", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Indent();
+            for (const auto& dir : ungrouped) draw_one(dir);
+            ImGui::Unindent();
+        }
+    }
+}
+
+static void draw_project_plugin_references() {
+    if (!ImGui::CollapsingHeader("Referenced / Engine Plugins", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    if (g.project.empty()) { ImGui::TextDisabled("Select a project first."); return; }
+    auto refs = project_plugin_references();
+    bool found_any = false;
+    for (auto& ref : refs) {
+        if (project_plugin_exists_locally(ref.name)) continue;
+        found_any = true;
+        ImGui::PushID(ref.name.c_str());
+        bool enabled = ref.enabled;
+        if (ImGui::Checkbox(ref.name.c_str(), &enabled)) {
+            if (set_project_plugin_enabled(ref.name, enabled))
+                log_line("[SYSTEM] " + ref.name + std::string(enabled ? " enabled" : " disabled") + " in " + g.project.filename().string());
+            else
+                log_line("[ERROR] Could not update plugin reference " + ref.name + " in " + g.project.filename().string());
+        }
+        tooltip("Plugin referenced by the .uproject but not stored in the project's Plugins folder. Usually an engine, marketplace, or externally provided plugin.");
+        ImGui::PopID();
+    }
+    if (!found_any) ImGui::TextDisabled("No external plugin references found in the .uproject.");
 }
 
 static void draw_favorite_plugins() {
@@ -3050,7 +3284,7 @@ static void draw_favorite_plugins() {
         if (target_exists && git_state != g.plugin_git_cache.end() && git_state->second.git_repo) {
             plugin_git_controls(target, git_state->second);
             auto module = plugin_module_name(target);
-            const bool can_compile_plugin = !module.empty() && !g.process_running && !g.targets.empty();
+            const bool can_compile_plugin = !module.empty() && !g.process_running && fs::exists(build_script()) && fs::is_regular_file(g.project);
             ImGui::SameLine();
             if (!can_compile_plugin) ImGui::BeginDisabled();
             if (ImGui::SmallButton("Compile Plugin")) compile_plugin_module(target);
@@ -3067,6 +3301,7 @@ static void draw_favorite_plugins() {
 static void draw_plugins_ui() {
     draw_engine_marketplace_plugins();
     draw_project_plugins();
+    draw_project_plugin_references();
     draw_favorite_plugins();
 }
 
