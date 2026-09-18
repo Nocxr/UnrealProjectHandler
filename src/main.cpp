@@ -3477,7 +3477,14 @@ static bool install_compiled_plugin_binaries(const fs::path& plugin_dir,
         }
 
         const auto destination = plugin_bin / filename;
-        if (normalized_path_key(source) != normalized_path_key(destination)) {
+        bool same_file = false;
+        ec.clear();
+        if (fs::exists(destination, ec)) {
+            ec.clear();
+            same_file = fs::equivalent(source, destination, ec);
+            if (ec) ec.clear();
+        }
+        if (!same_file && normalized_path_key(source) != normalized_path_key(destination)) {
             ec.clear();
             fs::copy_file(source, destination, fs::copy_options::overwrite_existing, ec);
             if (ec) {
@@ -3496,7 +3503,14 @@ static bool install_compiled_plugin_binaries(const fs::path& plugin_dir,
         });
         if (!pdb_source.empty()) {
             auto pdb_destination = plugin_bin / pdb_source.filename();
-            if (normalized_path_key(pdb_source) != normalized_path_key(pdb_destination)) {
+            bool same_pdb = false;
+            ec.clear();
+            if (fs::exists(pdb_destination, ec)) {
+                ec.clear();
+                same_pdb = fs::equivalent(pdb_source, pdb_destination, ec);
+                if (ec) ec.clear();
+            }
+            if (!same_pdb && normalized_path_key(pdb_source) != normalized_path_key(pdb_destination)) {
                 ec.clear();
                 fs::copy_file(pdb_source, pdb_destination, fs::copy_options::overwrite_existing, ec);
                 if (ec) log_line("[WARNING] Could not copy PDB for " + module + ": " + ec.message());
