@@ -1507,12 +1507,16 @@ static fs::path run_uat() {
 #endif
 }
 
-static fs::path editor_path() {
+static fs::path editor_path_for(const fs::path& engine) {
 #ifdef _WIN32
-    return g.engine / "Engine/Binaries/Win64/UnrealEditor.exe";
+    return engine / "Engine/Binaries/Win64/UnrealEditor.exe";
 #else
-    return g.engine / "Engine/Binaries/Mac/UnrealEditor.app/Contents/MacOS/UnrealEditor";
+    return engine / "Engine/Binaries/Mac/UnrealEditor.app/Contents/MacOS/UnrealEditor";
 #endif
+}
+
+static fs::path editor_path() {
+    return editor_path_for(g.engine);
 }
 
 static fs::path default_package_output() {
@@ -1800,6 +1804,23 @@ static void launch_editor(bool game) {
     std::system(command.c_str());
 #endif
     log_line(game ? "[SYSTEM] Game launched." : "[SYSTEM] Unreal Editor launched.");
+}
+
+static void launch_engine_home(const fs::path& engine) {
+    auto editor = editor_path_for(engine);
+    if (!fs::exists(editor)) { log_line("[ERROR] Unreal Editor not found for engine: " + engine.string()); return; }
+#ifdef _WIN32
+    auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", editor.wstring().c_str(),
+                                                          nullptr, nullptr, SW_SHOWNORMAL));
+    if (result <= 32) {
+        log_line("[ERROR] Could not launch Unreal Editor: " + editor.string());
+        return;
+    }
+#else
+    std::string command = quote(editor) + " >/dev/null 2>&1 &";
+    std::system(command.c_str());
+#endif
+    log_line("[SYSTEM] Unreal Editor launched: " + engine.string());
 }
 
 static void launch_editor_home() {
@@ -2582,117 +2603,218 @@ static bool tool_override_uses_folder(const ToolRow& tool) {
            name.find("UnrealSharp plugin") != std::string::npos;
 }
 
+static void draw_settings_summary() {
+    auto group_status = [](const std::string& group) {
+        int found = 0, total = 0;
+        for (const auto& tool : g.tools) {
+            bool belongs = group == "UnrealSharp" ? tool.group.rfind("UnrealSharp ", 0) == 0 : tool.group == group;
+            if (belongs) { ++total; if (tool.found) ++found; }
+        }
+        return std::pair<int,int>{found,total};
+    };
+
+    auto show = [](const char* label, bool ok) {
+        ImGui::TextColored(ok ? ImVec4(0.30f, 0.85f, 0.42f, 1.0f) : ImVec4(0.90f, 0.32f, 0.28f, 1.0f),
+                           "%s %s", label, ok ? "OK" : "Missing");
+    };
+
+    bool engine_ok = !g.engine.empty() && fs::exists(editor_path());
+    auto windows = group_status("Windows");
+    auto android = group_status("Android");
+    auto unrealsharp = group_status("UnrealSharp");
+
+    show("Engine", engine_ok);
+    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+    show("Windows", windows.second > 0 && windows.first == windows.second);
+    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+    show("Android", android.second > 0 && android.first == android.second);
+    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+    show("UnrealSharp", unrealsharp.second > 0 && unrealsharp.first == unrealsharp.second);
+}
+
+static void draw_hotkeys_settings() {
+    ImGui::TextDisabled("Editable shortcuts. Supported: A-Z, 0-9, F1-F12, GraveAccent, Space, Enter; modifiers: Ctrl, Shift, Alt.");
+
+    auto edit_hotkey = [](const char* label, std::string& value) {
+        std::array<char, 128> buffer{};
+        std::snprintf(buffer.data(), buffer.size(), "%s", value.c_str());
+        ImGui::SetNextItemWidth(240.0f);
+        if (ImGui::InputText(label, buffer.data(), buffer.size())) {
+            value = buffer.data();
+            save_settings();
+        }
+    };
+
+    edit_hotkey("Toggle Build Log", g.hotkey_toggle_log);
+    edit_hotkey("Quit", g.hotkey_quit);
+    edit_hotkey("Launch in Editor", g.hotkey_launch_editor);
+    edit_hotkey("Play", g.hotkey_play);
+    edit_hotkey("Compile Project", g.hotkey_compile);
+    edit_hotkey("Package Project", g.hotkey_package);
+
+    std::map<std::string, std::vector<std::string>> usage;
+    auto add_usage = [&](const char* action, const std::string& key) {
+        if (!key.empty()) usage[key].push_back(action);
+    };
+    add_usage("Toggle Build Log", g.hotkey_toggle_log);
+    add_usage("Quit", g.hotkey_quit);
+    add_usage("Launch in Editor", g.hotkey_launch_editor);
+    add_usage("Play", g.hotkey_play);
+    add_usage("Compile Project", g.hotkey_compile);
+    add_usage("Package Project", g.hotkey_package);
+
+    bool conflict = false;
+    for (const auto& [key, actions] : usage) {
+        if (actions.size() < 2) continue;
+        conflict = true;
+        std::string names;
+        for (const auto& action : actions) {
+            if (!names.empty()) names += ", ";
+            names += action;
+        }
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f), "Conflict: %s -> %s", key.c_str(), names.c_str());
+    }
+    if (!conflict) ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.42f, 1.0f), "No hotkey conflicts.");
+
+    if (ImGui::Button("Reset Hotkeys")) {
+        g.hotkey_toggle_log = "GraveAccent";
+        g.hotkey_quit = "Ctrl+Q";
+        g.hotkey_launch_editor = "Ctrl+E";
+        g.hotkey_play = "Ctrl+P";
+        g.hotkey_compile = "Ctrl+B";
+        g.hotkey_package = "Ctrl+Shift+B";
+        save_settings();
+    }
+}
+
+static void draw_tool_overrides_settings() {
+    ImGui::TextDisabled("Optional paths used instead of auto-detected tooling.");
+    bool refresh = false;
+    std::vector<std::string> groups;
+    for (const auto& tool : g.tools)
+        if (std::find(groups.begin(), groups.end(), tool.group) == groups.end()) groups.push_back(tool.group);
+
+    for (const auto& group : groups) {
+        int found = 0, total = 0;
+        for (const auto& tool : g.tools) if (tool.group == group) { ++total; if (tool.found) ++found; }
+        auto label = group + " " + std::to_string(found) + "/" + std::to_string(total);
+        if (!ImGui::CollapsingHeader(label.c_str())) continue;
+
+        for (const auto& tool : g.tools) if (tool.group == group) {
+            auto key = tool_key(tool.group, tool.name);
+            ImGui::PushID(key.c_str());
+            ImGui::SeparatorText(tool.name.c_str());
+            ImGui::TextColored(tool.found ? ImVec4(0.18f, 0.78f, 0.30f, 1.0f) : ImVec4(0.90f, 0.22f, 0.20f, 1.0f),
+                               "%s", tool.found ? "OK" : "MISSING");
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", tool.path.empty() ? "No path detected" : tool.path.string().c_str());
+
+            auto version = version_hint_for_tool(tool);
+            if (!version.empty()) ImGui::TextDisabled("Version: %s", version.c_str());
+
+            auto current = g.tool_overrides.contains(key) ? g.tool_overrides[key].string() : std::string{};
+            std::array<char, 4096> buffer{};
+            std::snprintf(buffer.data(), buffer.size(), "%s", current.c_str());
+
+            float actions_width = ImGui::CalcTextSize("Browse...").x + ImGui::CalcTextSize("Clear").x +
+                                  ImGui::GetStyle().FramePadding.x * 4.0f + ImGui::GetStyle().ItemSpacing.x * 2.0f;
+            ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - actions_width));
+            if (ImGui::InputTextWithHint("##override", "Manual override path", buffer.data(), buffer.size())) {
+                if (buffer[0]) g.tool_overrides[key] = buffer.data();
+                else g.tool_overrides.erase(key);
+                refresh = true;
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button("Browse...")) {
+                auto initial = current.empty() ? tool.path : fs::path(current);
+                if (tool_override_uses_folder(tool)) pick_override_folder(key, fs::is_regular_file(initial) ? initial.parent_path() : initial);
+                else pick_override_file(key, initial);
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button("Clear")) {
+                g.tool_overrides.erase(key);
+                refresh = true;
+            }
+
+            auto install = install_command_for_tool(tool);
+            if (!install.empty()) ImGui::TextWrapped("%s", install.c_str());
+            auto code = install_code_for_tool(tool);
+            if (code.empty()) ImGui::BeginDisabled();
+            if (ImGui::Button("Copy Code")) SDL_SetClipboardText(code.c_str());
+            if (code.empty()) ImGui::EndDisabled();
+            if (!code.empty()) tooltip(code.c_str());
+            ImGui::PopID();
+        }
+    }
+
+    if (refresh) {
+        inspect_tooling();
+        save_settings();
+    }
+}
+
 static void draw_settings_ui() {
-    draw_engine_ui();
-    ImGui::Spacing();
+    draw_settings_summary();
     ImGui::Separator();
-    ImGui::Spacing();
 
-    if (ImGui::Button("Reload Tool Catalog")) load_tool_catalog();
-    ImGui::SameLine();
-    bool catalog_running = g.catalog_running;
-    if (catalog_running) ImGui::BeginDisabled();
-    if (ImGui::Button("Check Catalog Update")) check_catalog_update_async(false);
-    ImGui::SameLine();
-    if (ImGui::Button("Update Catalog")) check_catalog_update_async(true);
-    if (catalog_running) ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (ImGui::Button("Open Catalog Folder")) open_path(tool_catalog_path().parent_path());
-    if (g.catalog_running) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("Working...");
-    }
-    ImGui::TextDisabled("%s", tool_catalog_path().string().c_str());
-    if (!g.tool_catalog_versions.empty()) {
-        g.tool_catalog_version = std::clamp(g.tool_catalog_version, 0, (int)g.tool_catalog_versions.size() - 1);
-        std::vector<const char*> labels;
-        for (const auto& version : g.tool_catalog_versions) labels.push_back(version.c_str());
-        if (ImGui::Combo("Catalog Version", &g.tool_catalog_version, labels.data(), (int)labels.size())) {
-            g.selected_tool_catalog_version = g.tool_catalog_versions[g.tool_catalog_version];
-            save_settings();
-        }
-    }
-    ImGui::Spacing();
-    if (ImGui::CollapsingHeader("Hotkeys", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::TextDisabled("Editable shortcuts. Supported keys: A-Z, 0-9, F1-F12, GraveAccent, Space, Enter; modifiers: Ctrl, Shift, Alt.");
-        auto edit_hotkey = [](const char* label, std::string& value) {
-            std::array<char, 128> buffer{};
-            std::snprintf(buffer.data(), buffer.size(), "%s", value.c_str());
-            ImGui::SetNextItemWidth(220.0f);
-            if (ImGui::InputText(label, buffer.data(), buffer.size())) {
-                value = buffer.data();
-                save_settings();
-            }
-        };
-        edit_hotkey("Toggle Build Log", g.hotkey_toggle_log);
-        edit_hotkey("Quit", g.hotkey_quit);
-        edit_hotkey("Launch in Editor", g.hotkey_launch_editor);
-        edit_hotkey("Play", g.hotkey_play);
-        edit_hotkey("Compile Project", g.hotkey_compile);
-        edit_hotkey("Package Project", g.hotkey_package);
-    }
-    ImGui::Spacing();
-    ImGui::SeparatorText("Tooling");
-    draw_tooling_ui();
-    ImGui::Spacing();
+    if (ImGui::BeginTabBar("##settings_tabs")) {
+        if (ImGui::BeginTabItem("General")) {
+            ImGui::SeparatorText("Application");
+            if (ImGui::Button("Open Settings Folder")) open_path(settings_path().parent_path());
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", settings_path().string().c_str());
 
-    if (ImGui::CollapsingHeader("Tool Overrides")) {
-        ImGui::TextDisabled("Optional paths used instead of auto-detected tooling.");
-        bool refresh = false;
-        std::vector<std::string> groups;
-        for (const auto& tool : g.tools)
-            if (std::find(groups.begin(), groups.end(), tool.group) == groups.end()) groups.push_back(tool.group);
-        for (const auto& group : groups) {
-            int found = 0, total = 0;
-            for (const auto& tool : g.tools) if (tool.group == group) { ++total; if (tool.found) ++found; }
-            auto label = group + " " + std::to_string(found) + "/" + std::to_string(total);
-            if (!ImGui::CollapsingHeader(label.c_str())) continue;
-            for (const auto& tool : g.tools) if (tool.group == group) {
-                auto key = tool_key(tool.group, tool.name);
-                ImGui::PushID(key.c_str());
-                ImGui::SeparatorText(tool.name.c_str());
-                ImGui::TextColored(tool.found ? ImVec4(0.18f, 0.78f, 0.30f, 1.0f) : ImVec4(0.90f, 0.22f, 0.20f, 1.0f),
-                                   "%s", tool.found ? "OK" : "MISSING");
+            ImGui::Spacing();
+            ImGui::SeparatorText("Tool Catalog");
+            if (ImGui::Button("Reload Catalog")) load_tool_catalog();
+            ImGui::SameLine();
+            const bool catalog_running = g.catalog_running;
+            if (catalog_running) ImGui::BeginDisabled();
+            if (ImGui::Button("Check Update")) check_catalog_update_async(false);
+            ImGui::SameLine();
+            if (ImGui::Button("Update Catalog")) check_catalog_update_async(true);
+            if (catalog_running) ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Open Catalog Folder")) open_path(tool_catalog_path().parent_path());
+
+            if (g.catalog_running) {
                 ImGui::SameLine();
-                ImGui::TextDisabled("%s", tool.path.empty() ? "No path detected" : tool.path.string().c_str());
-                auto version = version_hint_for_tool(tool);
-                if (!version.empty()) ImGui::TextDisabled("Version: %s", version.c_str());
-                auto current = g.tool_overrides.contains(key) ? g.tool_overrides[key].string() : std::string{};
-                std::array<char, 4096> buffer{};
-                std::snprintf(buffer.data(), buffer.size(), "%s", current.c_str());
-                float actions_width = ImGui::CalcTextSize("Browse...").x + ImGui::CalcTextSize("Clear").x +
-                                      ImGui::GetStyle().FramePadding.x * 4.0f + ImGui::GetStyle().ItemSpacing.x * 2.0f;
-                ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - actions_width));
-                if (ImGui::InputTextWithHint("##override", "Manual override path", buffer.data(), buffer.size())) {
-                    if (buffer[0]) g.tool_overrides[key] = buffer.data();
-                    else g.tool_overrides.erase(key);
-                    refresh = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Browse...")) {
-                    auto initial = current.empty() ? tool.path : fs::path(current);
-                    if (tool_override_uses_folder(tool)) pick_override_folder(key, fs::is_regular_file(initial) ? initial.parent_path() : initial);
-                    else pick_override_file(key, initial);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Clear")) {
-                    g.tool_overrides.erase(key);
-                    refresh = true;
-                }
-                auto install = install_command_for_tool(tool);
-                if (!install.empty()) ImGui::TextWrapped("%s", install.c_str());
-                auto code = install_code_for_tool(tool);
-                if (code.empty()) ImGui::BeginDisabled();
-                if (ImGui::Button("Copy Code")) SDL_SetClipboardText(code.c_str());
-                if (code.empty()) ImGui::EndDisabled();
-                if (!code.empty()) tooltip(code.c_str());
-                ImGui::PopID();
+                ImGui::TextDisabled("Working...");
             }
+
+            if (!g.tool_catalog_versions.empty()) {
+                g.tool_catalog_version = std::clamp(g.tool_catalog_version, 0, (int)g.tool_catalog_versions.size() - 1);
+                std::vector<const char*> labels;
+                for (const auto& version : g.tool_catalog_versions) labels.push_back(version.c_str());
+                if (ImGui::Combo("Catalog Version", &g.tool_catalog_version, labels.data(), (int)labels.size())) {
+                    g.selected_tool_catalog_version = g.tool_catalog_versions[g.tool_catalog_version];
+                    save_settings();
+                }
+            }
+            ImGui::EndTabItem();
         }
-        if (refresh) {
-            inspect_tooling();
-            save_settings();
+
+        if (ImGui::BeginTabItem("Engines")) {
+            draw_engine_ui();
+            ImGui::EndTabItem();
         }
+
+        if (ImGui::BeginTabItem("Tooling")) {
+            draw_tooling_ui();
+            ImGui::Spacing();
+            if (ImGui::CollapsingHeader("Tool Overrides"))
+                draw_tool_overrides_settings();
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Hotkeys")) {
+            draw_hotkeys_settings();
+            ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabBar();
     }
 }
 
@@ -3459,35 +3581,7 @@ static void draw_project_plugin_references() {
 
 static void draw_favorite_plugins() {
     if (!ImGui::CollapsingHeader("Favorite Plugins", ImGuiTreeNodeFlags_DefaultOpen)) return;
-    ImGui::TextDisabled("Save a Git URL and destination folder. Branches are read from the remote even before installation.");
-
-    static char name_buf[256];
-    static char url_buf[512] = "https://github.com/";
-    ImGui::SetNextItemWidth(200.0f);
-    ImGui::InputTextWithHint("##fav_name", "Folder Name", name_buf, sizeof(name_buf));
-    ImGui::SameLine();
-    auto add_width = ImGui::CalcTextSize("Add").x + ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetStyle().ItemSpacing.x;
-    ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - 200.0f - ImGui::GetStyle().ItemSpacing.x - add_width));
-    bool add_clicked = ImGui::InputTextWithHint("##fav_url", "https://github.com/org/plugin.git", url_buf, sizeof(url_buf),
-                                                ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SameLine();
-    if (ImGui::Button("Add")) add_clicked = true;
-
-    if (add_clicked && url_buf[0]) {
-        auto url = normalized_git_url(url_buf);
-        auto folder_name = name_buf[0] ? std::string(name_buf) : name_from_plugin_url(url);
-        if (!valid_plugin_folder_name(folder_name)) {
-            log_line("[ERROR] Folder Name must be a single folder name, without slashes or '..'.");
-        } else {
-            g.favorite_plugins.push_back({folder_name, url, {}});
-            request_favorite_remote_branches(url);
-            name_buf[0] = 0;
-            std::snprintf(url_buf, sizeof(url_buf), "%s", "https://github.com/");
-            save_settings();
-        }
-    }
-
-    if (g.favorite_plugins.empty()) { ImGui::TextDisabled("No favorite plugins yet."); return; }
+    if (g.favorite_plugins.empty()) ImGui::TextDisabled("No favorite plugins yet.");
 
     int remove = -1;
     for (int i = 0; i < (int)g.favorite_plugins.size(); ++i) {
@@ -3630,6 +3724,37 @@ static void draw_favorite_plugins() {
         g.favorite_plugins.erase(g.favorite_plugins.begin() + remove);
         save_settings();
     }
+
+    ImGui::SeparatorText("Add Favorite Plugin");
+    ImGui::TextDisabled("Save a Git URL and destination folder. Branches are read from the remote even before installation.");
+
+    static char name_buf[256];
+    static char url_buf[512] = "https://github.com/";
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::InputTextWithHint("##fav_name", "Folder Name", name_buf, sizeof(name_buf));
+    ImGui::SameLine();
+    auto add_width = ImGui::CalcTextSize("Add").x + ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+    ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - 200.0f - ImGui::GetStyle().ItemSpacing.x - add_width));
+    bool add_clicked = ImGui::InputTextWithHint("##fav_url", "https://github.com/org/plugin.git", url_buf, sizeof(url_buf),
+                                                ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (ImGui::Button("Add")) add_clicked = true;
+
+    if (add_clicked && url_buf[0]) {
+        auto url = normalized_git_url(url_buf);
+        auto folder_name = name_buf[0] ? std::string(name_buf) : name_from_plugin_url(url);
+        if (!valid_plugin_folder_name(folder_name)) {
+            log_line("[ERROR] Folder Name must be a single folder name, without slashes or '..'.");
+        } else {
+            g.favorite_plugins.push_back({folder_name, url, {}});
+            request_favorite_remote_branches(url);
+            name_buf[0] = 0;
+            std::snprintf(url_buf, sizeof(url_buf), "%s", "https://github.com/");
+            save_settings();
+        }
+    }
+
+
 }
 
 static void draw_plugins_ui() {
@@ -3739,33 +3864,59 @@ static void engine_combo_items() {
 }
 
 static void draw_engine_ui() {
-    if (ImGui::CollapsingHeader("Engines", ImGuiTreeNodeFlags_DefaultOpen)) {
-        auto* active = active_engine();
-        std::string current = g.engine.empty() ? "No Unreal installations found"
-                                                : (active ? engine_display_label(*active) : engine_version(g.engine));
-        float spacing = ImGui::GetStyle().ItemSpacing.x;
-        float label_width = ImGui::CalcTextSize("Engine Version").x;
-        float add_width = ImGui::CalcTextSize("Add Engine...").x + ImGui::GetStyle().FramePadding.x * 2.0f;
-        float refresh_width = ImGui::CalcTextSize("Refresh").x + ImGui::GetStyle().FramePadding.x * 2.0f;
-        float combo_width = ImGui::GetContentRegionAvail().x - label_width - add_width - refresh_width - spacing * 5.0f;
-        ImGui::SetNextItemWidth(std::max(160.0f, combo_width));
-        if (g.process_running) ImGui::BeginDisabled();
-        if (ImGui::BeginCombo("##engine_version", current.c_str())) {
-            engine_combo_items();
-            ImGui::EndCombo();
+    ImGui::TextDisabled("Installed Unreal Engine versions");
+    if (ImGui::Button("Refresh Engines")) discover_engines();
+    ImGui::SameLine();
+    if (ImGui::Button("Add Engine...")) pick_folder(DialogKind::Engine, g.engine);
+
+    if (g.engines.empty()) {
+        ImGui::TextDisabled("No Unreal Engine installations found.");
+        return;
+    }
+
+    if (ImGui::BeginTable("##engine_list", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH)) {
+        ImGui::TableSetupColumn("Engine", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+        ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 220.0f);
+
+        for (const auto& engine : g.engines) {
+            ImGui::PushID(engine.path.string().c_str());
+            ImGui::TableNextRow();
+
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextColored(engine.path == g.engine ? ImVec4(0.30f, 0.85f, 0.42f, 1.0f)
+                                                       : ImVec4(0.86f, 0.90f, 0.96f, 1.0f),
+                               "%s", engine_display_label(engine).c_str());
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextDisabled("%s", engine.path.string().c_str());
+
+            ImGui::TableSetColumnIndex(2);
+            if (engine.path == g.engine)
+                ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.42f, 1.0f), "Active");
+            else
+                ImGui::TextDisabled("Installed");
+
+            ImGui::TableSetColumnIndex(3);
+            if (engine.path != g.engine) {
+                if (g.process_running) ImGui::BeginDisabled();
+                if (ImGui::SmallButton("Set Active")) {
+                    g.engine = engine.path;
+                    g.plugin_scan_cache.clear();
+                    inspect_tooling();
+                    save_settings();
+                }
+                if (g.process_running) ImGui::EndDisabled();
+                ImGui::SameLine();
+            }
+            if (ImGui::SmallButton("Launch Editor")) launch_engine_home(engine.path);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Open Folder")) open_path(engine.path);
+
+            ImGui::PopID();
         }
-        ImGui::SameLine();
-        ImGui::TextUnformatted("Engine Version");
-        ImGui::SameLine();
-        if (ImGui::Button("Add Engine...")) pick_folder(DialogKind::Engine, g.engine);
-        ImGui::SameLine();
-        if (ImGui::Button("Refresh")) discover_engines();
-        if (g.process_running) ImGui::EndDisabled();
-        ImGui::TextDisabled("%s", g.engine.empty() ? "No engine selected" : g.engine.string().c_str());
-        bool can_launch_editor = fs::exists(editor_path());
-        if (ImGui::Button("Open Engine Folder")) open_path(g.engine);
-        ImGui::SameLine();
-        if (readiness_button("Launch Editor", can_launch_editor)) launch_editor_home();
+        ImGui::EndTable();
     }
 }
 
