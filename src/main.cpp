@@ -3407,40 +3407,50 @@ static std::string plugin_module_name(const fs::path& dir) {
     return result;
 }
 
-static fs::path newest_existing_file(const std::vector<fs::path>& candidates) {
-    fs::path newest;
-    fs::file_time_type newest_time{};
-    std::error_code ec;
-    for (const auto& candidate : candidates) {
-        if (!fs::is_regular_file(candidate, ec)) { ec.clear(); continue; }
-        auto time = fs::last_write_time(candidate, ec);
-        if (ec) { ec.clear(); continue; }
-        if (newest.empty() || time > newest_time) {
-            newest = candidate;
-            newest_time = time;
+static bool replace_json_string_value(std::string& text, const std::string& key, const std::string& value) {
+    const auto key_pos = text.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) return false;
+    const auto colon = text.find(':', key_pos);
+    if (colon == std::string::npos) return false;
+    const auto quote_begin = text.find('"', colon + 1);
+    if (quote_begin == std::string::npos) return false;
+
+    auto quote_end = quote_begin + 1;
+    bool escaped = false;
+    for (; quote_end < text.size(); ++quote_end) {
+        const char ch = text[quote_end];
+        if (escaped) {
+            escaped = false;
+            continue;
         }
+        if (ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') break;
     }
-    return newest;
+    if (quote_end >= text.size()) return false;
+
+    text.replace(quote_begin + 1, quote_end - quote_begin - 1, value);
+    return true;
 }
 
-static bool install_compiled_plugin_binaries(const fs::path& plugin_dir,
-                                             const fs::path& host_root,
-                                             const std::vector<std::string>& modules) {
+static bool finalize_compiled_plugin_manifest(const fs::path& plugin_dir) {
 #ifdef _WIN32
     const char* platform_dir = "Win64";
-    const char* library_ext = ".dll";
 #else
     const char* platform_dir = "Mac";
-    const char* library_ext = ".dylib";
 #endif
 
-    const auto engine_bin = g.engine / "Engine" / "Binaries" / platform_dir;
-    const auto engine_manifest = engine_bin / "UnrealEditor.modules";
-    const auto plugin_bin = plugin_dir / "Binaries" / platform_dir;
-    const auto plugin_manifest = plugin_bin / "UnrealEditor.modules";
+    const auto engine_manifest = g.engine / "Engine" / "Binaries" / platform_dir / "UnrealEditor.modules";
+    const auto plugin_manifest = plugin_dir / "Binaries" / platform_dir / "UnrealEditor.modules";
 
     if (!fs::is_regular_file(engine_manifest)) {
         log_line("[ERROR] Engine module manifest not found: " + engine_manifest.string());
+        return false;
+    }
+    if (!fs::is_regular_file(plugin_manifest)) {
+        log_line("[ERROR] UBT did not generate plugin module manifest: " + plugin_manifest.string());
         return false;
     }
 
@@ -3451,98 +3461,26 @@ static bool install_compiled_plugin_binaries(const fs::path& plugin_dir,
         return false;
     }
 
-    std::error_code ec;
-    fs::create_directories(plugin_bin, ec);
-    if (ec) {
-        log_line("[ERROR] Could not create plugin Binaries directory: " + plugin_bin.string());
+    auto plugin_text = read_text(plugin_manifest);
+    const auto previous_id = json_string_value(plugin_text, "BuildId");
+    if (!replace_json_string_value(plugin_text, "BuildId", build_id)) {
+        log_line("[ERROR] Could not update BuildId in " + plugin_manifest.string());
         return false;
     }
 
-    std::vector<std::pair<std::string, std::string>> installed;
-    for (const auto& module : modules) {
-        const auto filename = "UnrealEditor-" + module + std::string(library_ext);
-
-        // Project-target module builds normally land in the isolated project's
-        // Binaries folder. Keep the other paths as fallbacks for UE variations.
-        auto source = newest_existing_file({
-            host_root / "Binaries" / platform_dir / filename,
-            host_root / "Plugins" / plugin_dir.filename() / "Binaries" / platform_dir / filename,
-            plugin_dir / "Binaries" / platform_dir / filename,
-            engine_bin / filename
-        });
-
-        if (source.empty()) {
-            log_line("[ERROR] Compiled module binary not found for " + module + ". Checked isolated project, plugin, and engine Binaries folders.");
-            return false;
-        }
-
-        const auto destination = plugin_bin / filename;
-        bool same_file = false;
-        ec.clear();
-        if (fs::exists(destination, ec)) {
-            ec.clear();
-            same_file = fs::equivalent(source, destination, ec);
-            if (ec) ec.clear();
-        }
-        if (!same_file && normalized_path_key(source) != normalized_path_key(destination)) {
-            ec.clear();
-            fs::copy_file(source, destination, fs::copy_options::overwrite_existing, ec);
-            if (ec) {
-                log_line("[ERROR] Could not copy compiled module binary from " + source.string() +
-                         " to " + destination.string() + ": " + ec.message());
-                return false;
-            }
-        }
-
-#ifdef _WIN32
-        auto pdb_source = newest_existing_file({
-            host_root / "Binaries" / platform_dir / ("UnrealEditor-" + module + ".pdb"),
-            host_root / "Plugins" / plugin_dir.filename() / "Binaries" / platform_dir / ("UnrealEditor-" + module + ".pdb"),
-            plugin_dir / "Binaries" / platform_dir / ("UnrealEditor-" + module + ".pdb"),
-            engine_bin / ("UnrealEditor-" + module + ".pdb")
-        });
-        if (!pdb_source.empty()) {
-            auto pdb_destination = plugin_bin / pdb_source.filename();
-            bool same_pdb = false;
-            ec.clear();
-            if (fs::exists(pdb_destination, ec)) {
-                ec.clear();
-                same_pdb = fs::equivalent(pdb_source, pdb_destination, ec);
-                if (ec) ec.clear();
-            }
-            if (!same_pdb && normalized_path_key(pdb_source) != normalized_path_key(pdb_destination)) {
-                ec.clear();
-                fs::copy_file(pdb_source, pdb_destination, fs::copy_options::overwrite_existing, ec);
-                if (ec) log_line("[WARNING] Could not copy PDB for " + module + ": " + ec.message());
-            }
-        }
-#endif
-
-        log_line("[SYSTEM] Installed " + module + " from " + source.string());
-        installed.push_back({module, filename});
-    }
-
-    std::ofstream manifest(plugin_manifest, std::ios::trunc);
-    manifest << "{\n";
-    manifest << "  \"BuildId\": \"" << json_escape(build_id) << "\",\n";
-    manifest << "  \"Modules\": {\n";
-    for (size_t i = 0; i < installed.size(); ++i) {
-        manifest << "    \"" << json_escape(installed[i].first) << "\": \""
-                 << json_escape(installed[i].second) << "\"";
-        manifest << (i + 1 < installed.size() ? "," : "") << "\n";
-    }
-    manifest << "  }\n";
-    manifest << "}\n";
-    manifest.close();
-
-    if (!manifest) {
+    std::ofstream out(plugin_manifest, std::ios::trunc);
+    out << plugin_text;
+    if (!out) {
         log_line("[ERROR] Could not write plugin module manifest: " + plugin_manifest.string());
         return false;
     }
 
-    log_line("[SYSTEM] Installed " + std::to_string(installed.size()) +
-             " compiled module binaries into " + plugin_bin.string());
-    log_line("[SYSTEM] Wrote plugin UnrealEditor.modules with engine BuildId " + build_id);
+    if (previous_id != build_id) {
+        log_line("[SYSTEM] Preserved UBT-generated module manifest and synced BuildId: " +
+                 (previous_id.empty() ? std::string{"<missing>"} : previous_id) + " -> " + build_id);
+    } else {
+        log_line("[SYSTEM] Preserved UBT-generated module manifest; BuildId already matches " + build_id);
+    }
     return true;
 }
 
@@ -3685,10 +3623,10 @@ static void compile_plugin_module(const fs::path& dir) {
         return true;
     };
 
-    auto finish = [dir, host_root, modules](bool success) {
+    auto finish = [dir](bool success) {
         if (!success) return;
-        if (!install_compiled_plugin_binaries(dir, host_root, modules))
-            log_line("[ERROR] Plugin compiled, but its binaries could not be installed into the plugin folder.");
+        if (!finalize_compiled_plugin_manifest(dir))
+            log_line("[ERROR] Plugin compiled, but its UBT-generated module manifest could not be finalized.");
     };
 
     run_command_with_prep(command.str(), "Compile Plugin " + descriptor.stem().string(),
