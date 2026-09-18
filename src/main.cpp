@@ -3492,71 +3492,10 @@ static bool build_and_install_unrealsharp_managed(const fs::path& plugin_dir, co
         return false;
     }
 
-    const auto managed_root = plugin_dir / "Managed" / "UnrealSharp";
+    // UnrealSharp's Managed/Directory.Build.props redirects solution outputs directly
+    // into the plugin's Binaries/Managed/<TFM> folders. Do not try to harvest
+    // project-local bin/Release folders; verify the actual install location instead.
     const auto install_root = plugin_dir / "Binaries" / "Managed";
-    std::error_code ec;
-
-    struct Candidate {
-        fs::path path;
-        fs::file_time_type time{};
-    };
-    std::map<std::pair<std::string, std::string>, Candidate> newest;
-
-    for (fs::recursive_directory_iterator it(managed_root, fs::directory_options::skip_permission_denied, ec), end;
-         it != end; it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        if (!it->is_regular_file(ec)) continue;
-
-        const auto path = it->path();
-        std::string tfm;
-        for (const auto& part : path) {
-            const auto value = part.string();
-            if (value == "net10.0" || value == "netstandard2.0") tfm = value;
-        }
-        if (tfm.empty()) continue;
-
-        const auto parent = path.parent_path();
-        if (parent.filename() != tfm || parent.parent_path().filename() != "Release" ||
-            parent.parent_path().parent_path().filename() != "bin")
-            continue;
-
-        const auto ext = path.extension().string();
-        if (ext != ".dll" && ext != ".pdb" && ext != ".json" && ext != ".xml") continue;
-
-        auto time = fs::last_write_time(path, ec);
-        if (ec) { ec.clear(); continue; }
-
-        auto key = std::make_pair(tfm, path.filename().string());
-        auto found = newest.find(key);
-        if (found == newest.end() || time > found->second.time)
-            newest[key] = {path, time};
-    }
-
-    if (newest.empty()) {
-        log_line("[ERROR] UnrealSharp managed build succeeded but no managed outputs were found.");
-        return false;
-    }
-
-    size_t copied = 0;
-    for (const auto& [key, candidate] : newest) {
-        const auto destination_dir = install_root / key.first;
-        fs::create_directories(destination_dir, ec);
-        if (ec) {
-            log_line("[ERROR] Could not create managed install directory: " + destination_dir.string());
-            return false;
-        }
-
-        const auto destination = destination_dir / candidate.path.filename();
-        ec.clear();
-        fs::copy_file(candidate.path, destination, fs::copy_options::overwrite_existing, ec);
-        if (ec) {
-            log_line("[ERROR] Could not install managed assembly " + candidate.path.string() +
-                     " -> " + destination.string() + ": " + ec.message());
-            return false;
-        }
-        ++copied;
-    }
-
     const std::vector<fs::path> required = {
         install_root / "net10.0" / "UnrealSharp.dll",
         install_root / "net10.0" / "UnrealSharp.Binds.dll",
@@ -3569,17 +3508,21 @@ static bool build_and_install_unrealsharp_managed(const fs::path& plugin_dir, co
         install_root / "netstandard2.0" / "UnrealSharp.SourceGenerators.dll",
         install_root / "netstandard2.0" / "Newtonsoft.Json.dll"
     };
+
+    size_t present = 0;
     for (const auto& required_file : required) {
         if (!fs::is_regular_file(required_file)) {
             log_line("[ERROR] Required UnrealSharp managed assembly is still missing: " + required_file.string());
             return false;
         }
+        ++present;
     }
 
-    log_line("[SYSTEM] Installed " + std::to_string(copied) +
-             " UnrealSharp managed build outputs into " + install_root.string());
+    log_line("[SYSTEM] Verified " + std::to_string(present) +
+             " UnrealSharp managed outputs in " + install_root.string());
     return true;
 }
+
 
 static bool finalize_compiled_plugin_manifest(const fs::path& plugin_dir,
                                               const fs::path& host_root,
