@@ -3423,6 +3423,7 @@ static void compile_plugin_module(const fs::path& dir) {
     auto host_plugin_dir = host_plugins / descriptor.stem();
     auto host_project = host_root / "HostProject.uproject";
     auto source_dir = host_root / "Source";
+    auto config_dir = host_root / "Config";
     auto target_file = source_dir / "HostProjectEditor.Target.cs";
 
     std::ostringstream command;
@@ -3446,13 +3447,15 @@ static void compile_plugin_module(const fs::path& dir) {
     g.log_expanded = true;
     log_line("[SYSTEM] Compiling only selected plugin " + descriptor.stem().string() + " modules: " + module_list);
 
-    auto prepare = [host_root, host_plugins, host_plugin_dir, host_project, source_dir, target_file,
+    auto prepare = [host_root, host_plugins, host_plugin_dir, host_project, source_dir, config_dir, target_file,
                     dir, descriptor, dependencies]() -> bool {
         std::error_code ec;
         fs::create_directories(host_plugins, ec);
         if (ec) { log_line("[ERROR] Could not create plugin compile host: " + host_root.string()); return false; }
         fs::create_directories(source_dir, ec);
         if (ec) { log_line("[ERROR] Could not create plugin compile target directory: " + source_dir.string()); return false; }
+        fs::create_directories(config_dir, ec);
+        if (ec) { log_line("[ERROR] Could not create plugin compile Config directory: " + config_dir.string()); return false; }
 
 #ifdef _WIN32
         if (!fs::exists(host_plugin_dir / descriptor.filename(), ec)) {
