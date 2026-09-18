@@ -3170,6 +3170,57 @@ static std::vector<std::string> plugin_module_names(const fs::path& dir) {
     return modules;
 }
 
+static std::vector<std::string> plugin_dependency_names(const fs::path& dir) {
+    std::vector<std::string> deps;
+    auto descriptor = plugin_descriptor_path(dir);
+    if (descriptor.empty()) return deps;
+
+    auto text = read_text(descriptor);
+    auto plugins_key = text.find("\"Plugins\"");
+    if (plugins_key == std::string::npos) return deps;
+    auto array_start = text.find('[', plugins_key);
+    if (array_start == std::string::npos) return deps;
+
+    int depth = 0;
+    bool in_string = false, escape = false;
+    size_t object_start = std::string::npos;
+    for (size_t i = array_start + 1; i < text.size(); ++i) {
+        char ch = text[i];
+        if (in_string) {
+            if (escape) escape = false;
+            else if (ch == '\\') escape = true;
+            else if (ch == '"') in_string = false;
+            continue;
+        }
+        if (ch == '"') { in_string = true; continue; }
+        if (ch == ']' && depth == 0) break;
+        if (ch == '{') {
+            if (depth == 0) object_start = i;
+            ++depth;
+        } else if (ch == '}' && depth > 0) {
+            --depth;
+            if (depth == 0 && object_start != std::string::npos) {
+                auto object = text.substr(object_start, i - object_start + 1);
+                auto name = json_string_value(object, "Name");
+                if (!name.empty()) deps.push_back(name);
+                object_start = std::string::npos;
+            }
+        }
+    }
+    return deps;
+}
+
+static std::string json_path_string(const fs::path& path) {
+    auto value = path.generic_string();
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char ch : value) {
+        if (ch == '\\' || ch == '"') escaped += '\\';
+        escaped += ch;
+    }
+    return escaped;
+}
+
 static std::string plugin_module_name(const fs::path& dir) {
     auto key = normalized_path_key(dir);
     if (auto found = g.plugin_module_cache.find(key); found != g.plugin_module_cache.end()) return found->second;
@@ -3206,6 +3257,61 @@ static void compile_plugin_module(const fs::path& dir) {
         return;
     }
 
+    // Build against a tiny host project that contains only the selected plugin.
+    // This keeps unrelated project/engine plugins out of the rules scan.
+    auto host_root = g.project.empty()
+        ? fs::temp_directory_path() / "UPH" / "PluginCompile" / descriptor.stem()
+        : g.project.parent_path() / "Intermediate" / "UPH" / "PluginCompile" / descriptor.stem();
+    auto host_plugins = host_root / "Plugins";
+    auto host_plugin_dir = host_plugins / descriptor.stem();
+    auto host_project = host_root / "HostProject.uproject";
+
+    std::error_code ec;
+    fs::create_directories(host_plugins, ec);
+    if (ec) {
+        log_line("[ERROR] Could not create plugin compile host: " + host_root.string());
+        return;
+    }
+
+#ifdef _WIN32
+    if (fs::exists(host_plugin_dir, ec)) {
+        std::string remove_link = "cmd /S /C \"rmdir " + quote(host_plugin_dir) + "\"";
+        std::system(remove_link.c_str());
+    }
+    std::string make_link = "cmd /S /C \"mklink /J " + quote(host_plugin_dir) + " " + quote(dir) + " >nul\"";
+    if (std::system(make_link.c_str()) != 0) {
+        log_line("[ERROR] Could not create plugin compile junction: " + host_plugin_dir.string());
+        return;
+    }
+#else
+    fs::remove(host_plugin_dir, ec);
+    ec.clear();
+    fs::create_directory_symlink(dir, host_plugin_dir, ec);
+    if (ec) {
+        log_line("[ERROR] Could not create plugin compile symlink: " + ec.message());
+        return;
+    }
+#endif
+
+    auto dependencies = plugin_dependency_names(dir);
+    std::ofstream host(host_project, std::ios::trunc);
+    host << "{\n";
+    host << "  \"FileVersion\": 3,\n";
+    host << "  \"DisableEnginePluginsByDefault\": true,\n";
+    host << "  \"Plugins\": [\n";
+    host << "    {\"Name\": \"" << json_escape(descriptor.stem().string()) << "\", \"Enabled\": true}";
+    for (const auto& dep : dependencies)
+        host << ",\n    {\"Name\": \"" << json_escape(dep) << "\", \"Enabled\": true}";
+    host << "\n  ]\n";
+    host << "}\n";
+    host.close();
+    if (!host) {
+        log_line("[ERROR] Could not write plugin compile host project: " + host_project.string());
+        return;
+    }
+
+    auto host_descriptor = host_plugin_dir / descriptor.filename();
+
     std::ostringstream command;
 #ifdef _WIN32
     command << quote(build_script()) << " UnrealEditor Win64 ";
@@ -3213,8 +3319,8 @@ static void compile_plugin_module(const fs::path& dir) {
     command << "bash " << quote(build_script()) << " UnrealEditor Mac ";
 #endif
     command << g.configs[g.compile_config]
-            << " -Plugin=" << quote(descriptor)
-            << " -DisableAllPlugins"
+            << " -Project=" << quote(host_project)
+            << " -Plugin=" << quote(host_descriptor)
             << " -NoHotReload -WaitMutex";
     for (const auto& module : modules)
         command << " -Module=" << module;
@@ -3224,7 +3330,17 @@ static void compile_plugin_module(const fs::path& dir) {
         if (i) module_list += ", ";
         module_list += modules[i];
     }
+
+    g.log_expanded = true;
     log_line("[SYSTEM] Compiling only plugin " + descriptor.stem().string() + " modules: " + module_list);
+    if (!dependencies.empty()) {
+        std::string dep_list;
+        for (size_t i = 0; i < dependencies.size(); ++i) {
+            if (i) dep_list += ", ";
+            dep_list += dependencies[i];
+        }
+        log_line("[SYSTEM] Required engine plugin dependencies enabled: " + dep_list);
+    }
     run_command(command.str(), "Compile Plugin " + descriptor.stem().string(), true);
 }
 
@@ -3427,7 +3543,7 @@ static void draw_plugin_list(const fs::path& root, bool refresh = false, bool sh
         const bool compile_ready = !module.empty() && !g.process_running && fs::exists(build_script());
         if (!compile_ready) ImGui::BeginDisabled();
         if (ImGui::SmallButton("Compile Plugin")) compile_plugin_module(dir);
-        tooltip("Compile only this plugin's C++ modules with UnrealBuildTool. Unrelated project plugins are disabled.");
+        tooltip("Compile only this .uplugin's modules in a minimal host project. Unrelated project and engine plugins are excluded.");
         if (!compile_ready) ImGui::EndDisabled();
         if (!module.empty()) { ImGui::SameLine(); ImGui::TextDisabled("Module: %s", module.c_str()); }
         ImGui::PopID();
@@ -3537,7 +3653,7 @@ static void draw_project_plugins() {
         const bool compile_ready = !module.empty() && !g.process_running && fs::exists(build_script());
         if (!compile_ready) ImGui::BeginDisabled();
         if (ImGui::SmallButton("Compile Plugin")) compile_plugin_module(dir);
-        tooltip("Compile only this plugin's C++ modules with UnrealBuildTool. Unrelated project plugins are disabled.");
+        tooltip("Compile only this .uplugin's modules in a minimal host project. Unrelated project and engine plugins are excluded.");
         if (!compile_ready) ImGui::EndDisabled();
         if (!module.empty()) { ImGui::SameLine(); ImGui::TextDisabled("Module: %s", module.c_str()); }
         ImGui::PopID();
