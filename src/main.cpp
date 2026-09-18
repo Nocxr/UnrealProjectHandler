@@ -3344,6 +3344,25 @@ static std::vector<std::string> plugin_module_names(const fs::path& dir) {
     return modules;
 }
 
+static std::vector<std::string> plugin_source_module_names(const fs::path& dir) {
+    std::vector<std::string> modules;
+    const auto source_root = dir / "Source";
+    std::error_code ec;
+    if (!fs::exists(source_root, ec)) return modules;
+
+    for (const auto& entry : fs::recursive_directory_iterator(source_root, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        const auto filename = entry.path().filename().string();
+        constexpr const char* suffix = ".Build.cs";
+        if (filename.size() <= std::char_traits<char>::length(suffix) || !filename.ends_with(suffix)) continue;
+        auto module = filename.substr(0, filename.size() - std::char_traits<char>::length(suffix));
+        if (!module.empty() && std::find(modules.begin(), modules.end(), module) == modules.end())
+            modules.push_back(std::move(module));
+    }
+    return modules;
+}
+
 static std::vector<std::string> plugin_dependency_names(const fs::path& dir) {
     std::vector<std::string> deps;
     auto descriptor = plugin_descriptor_path(dir);
@@ -3435,7 +3454,9 @@ static bool replace_json_string_value(std::string& text, const std::string& key,
     return true;
 }
 
-static bool finalize_compiled_plugin_manifest(const fs::path& plugin_dir) {
+static bool finalize_compiled_plugin_manifest(const fs::path& plugin_dir,
+                                              const fs::path& host_root,
+                                              const std::vector<std::string>& source_modules) {
 #ifdef _WIN32
     const char* platform_dir = "Win64";
 #else
@@ -3443,7 +3464,51 @@ static bool finalize_compiled_plugin_manifest(const fs::path& plugin_dir) {
 #endif
 
     const auto engine_manifest = g.engine / "Engine" / "Binaries" / platform_dir / "UnrealEditor.modules";
-    const auto plugin_manifest = plugin_dir / "Binaries" / platform_dir / "UnrealEditor.modules";
+    const auto plugin_bin = plugin_dir / "Binaries" / platform_dir;
+    const auto plugin_manifest = plugin_bin / "UnrealEditor.modules";
+
+    std::error_code ec;
+    fs::create_directories(plugin_bin, ec);
+    if (ec) {
+        log_line("[ERROR] Could not create plugin Binaries directory: " + plugin_bin.string());
+        return false;
+    }
+
+    // UBT may emit helper modules that are not declared in the .uplugin (for example
+    // UnrealSharpUtilities). Windows still needs those imported DLLs beside the plugin DLLs.
+    for (const auto& module : source_modules) {
+#ifdef _WIN32
+        const auto filename = "UnrealEditor-" + module + ".dll";
+#else
+        const auto filename = "UnrealEditor-" + module + ".dylib";
+#endif
+        const auto destination = plugin_bin / filename;
+        if (fs::is_regular_file(destination)) continue;
+
+        const std::vector<fs::path> candidates = {
+            host_root / "Binaries" / platform_dir / filename,
+            host_root / "Plugins" / plugin_dir.filename() / "Binaries" / platform_dir / filename,
+            g.engine / "Engine" / "Binaries" / platform_dir / filename
+        };
+
+        fs::path source;
+        for (const auto& candidate : candidates) {
+            if (fs::is_regular_file(candidate)) { source = candidate; break; }
+        }
+        if (source.empty()) {
+            log_line("[WARNING] Built plugin helper module binary not found for " + module + ": " + filename);
+            continue;
+        }
+
+        ec.clear();
+        fs::copy_file(source, destination, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            log_line("[ERROR] Could not copy plugin helper module " + module + " from " +
+                     source.string() + " to " + destination.string() + ": " + ec.message());
+            return false;
+        }
+        log_line("[SYSTEM] Installed plugin helper module " + module + " from " + source.string());
+    }
 
     if (!fs::is_regular_file(engine_manifest)) {
         log_line("[ERROR] Engine module manifest not found: " + engine_manifest.string());
@@ -3497,6 +3562,7 @@ static void compile_plugin_module(const fs::path& dir) {
     }
 
     auto modules = plugin_module_names(dir);
+    auto source_modules = plugin_source_module_names(dir);
     if (modules.empty()) {
         log_line("[ERROR] No C++ modules found in plugin " + descriptor.filename().string());
         return;
@@ -3623,9 +3689,9 @@ static void compile_plugin_module(const fs::path& dir) {
         return true;
     };
 
-    auto finish = [dir](bool success) {
+    auto finish = [dir, host_root, source_modules](bool success) {
         if (!success) return;
-        if (!finalize_compiled_plugin_manifest(dir))
+        if (!finalize_compiled_plugin_manifest(dir, host_root, source_modules))
             log_line("[ERROR] Plugin compiled, but its UBT-generated module manifest could not be finalized.");
     };
 
