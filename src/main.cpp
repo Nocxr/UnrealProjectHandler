@@ -77,8 +77,6 @@ struct AppState {
     bool clean_output = false;
     bool auto_scroll = true;
     bool clear_on_run = false;
-    bool show_log = false;
-    bool dock_log = true;
     std::set<int> selected_logs;
     int log_selection_anchor = -1;
     std::atomic<bool> process_running{false};
@@ -339,8 +337,6 @@ static void save_settings() {
     out << "unrealsharp_target=" << g.unrealsharp_target << '\n';
     out << "unrealsharp=" << g.unrealsharp << '\n';
     out << "clean_output=" << g.clean_output << '\n';
-    out << "show_log=" << g.show_log << '\n';
-    out << "dock_log=" << g.dock_log << '\n';
     if (!g.selected_tool_catalog_version.empty()) out << "tool_catalog_version=" << g.selected_tool_catalog_version << '\n';
     for (const auto& [key, path] : g.tool_overrides) if (!path.empty()) out << "tool_override=" << key << '|' << path.string() << '\n';
     for (const auto& plugin : g.favorite_plugins) if (!plugin.name.empty() && !plugin.url.empty())
@@ -368,8 +364,6 @@ static void load_settings() {
             else if (key == "unrealsharp_target") g.unrealsharp_target = std::stoi(value);
             else if (key == "unrealsharp") g.unrealsharp = std::stoi(value) != 0;
             else if (key == "clean_output") g.clean_output = std::stoi(value) != 0;
-            else if (key == "show_log") g.show_log = std::stoi(value) != 0;
-            else if (key == "dock_log") g.dock_log = std::stoi(value) != 0;
             else if (key == "tool_catalog_version") g.selected_tool_catalog_version = value;
             else if (key == "tool_override") {
                 auto split_override = value.find('|');
@@ -1857,6 +1851,11 @@ static void draw_settings_ui() {
             save_settings();
         }
     }
+    ImGui::Spacing();
+    ImGui::SeparatorText("Tooling");
+    draw_tooling_ui();
+    ImGui::Spacing();
+
     if (ImGui::CollapsingHeader("Tool Overrides")) {
         ImGui::TextDisabled("Optional paths used instead of auto-detected tooling.");
         bool refresh = false;
@@ -2467,11 +2466,6 @@ static void draw_project_ui() {
     ImGui::SeparatorText("Process Status");
     ImGui::TextColored(g.process_running ? ImVec4(0.90f, 0.22f, 0.20f, 1.0f) : ImVec4(0.18f, 0.78f, 0.30f, 1.0f),
                        "%s", g.process_running ? "BUSY - build operation running" : "READY - okay to compile or package");
-    ImGui::Checkbox("Show Log", &g.show_log);
-    ImGui::SameLine();
-    if (!g.show_log) ImGui::BeginDisabled();
-    ImGui::Checkbox("Lock Log to Side", &g.dock_log);
-    if (!g.show_log) ImGui::EndDisabled();
     save_settings();
 }
 
@@ -2529,59 +2523,11 @@ static void draw_footer() {
     const float footer_y = ImGui::GetWindowHeight() - ImGui::GetStyle().WindowPadding.y - footer_height;
     if (ImGui::GetCursorPosY() < footer_y) ImGui::SetCursorPosY(footer_y);
     ImGui::Separator();
-    ImGui::TextDisabled("` Toggle Log Window    |    Ctrl + Q Quit");
+    ImGui::TextDisabled("Ctrl + Q Quit");
 }
 
-static float draw_ui() {
-    if (g.plugin_details_ready.exchange(false)) {
-        std::lock_guard lock(g.plugin_mutex);
-        for (auto& [path, state] : g.pending_plugin_git_cache)
-            g.plugin_git_cache.insert_or_assign(path, std::move(state));
-        g.pending_plugin_git_cache.clear();
-    }
-    if (g.plugin_refresh_requested.exchange(false)) {
-        if (g.plugin_details_running) {
-            g.plugin_refresh_requested = true;
-        } else {
-            g.plugin_scan_cache.clear();
-            g.plugin_git_cache.clear();
-        }
-    }
-    draw_top_context_selectors();
-    if (ImGui::BeginTabBar("##main_tabs")) {
-        if (ImGui::BeginTabItem("Project")) {
-            draw_project_ui();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Tooling")) {
-            draw_tooling_ui();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Plugins")) {
-            draw_plugins_ui();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Settings")) {
-            draw_settings_ui();
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
-    }
-    draw_footer();
-    return ImGui::GetCursorPosY();
-}
-
-static void draw_log_window() {
-    auto* viewport = ImGui::GetMainViewport();
-    if (g.dock_log) {
-        ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + viewport->Size.x + 12.0f, viewport->Pos.y), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(760.0f, viewport->Size.y), ImGuiCond_Always);
-    } else {
-        ImGui::SetNextWindowSize(ImVec2(760.0f, 700.0f), ImGuiCond_FirstUseEver);
-    }
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse;
-    if (g.dock_log) flags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize;
-    ImGui::Begin("Build Log", nullptr, flags);
+static void draw_log_panel() {
+    ImGui::TextUnformatted("Build Log");
     ImGui::Checkbox("Auto-scroll", &g.auto_scroll); ImGui::SameLine(); ImGui::Checkbox("Clear on run", &g.clear_on_run);
     tooltip("Clear the log when a compile or package operation starts.");
     ImGui::SameLine(); if (ImGui::Button("Clear")) { std::lock_guard lock(g.mutex); g.logs.clear(); g.selected_logs.clear(); g.log_selection_anchor = -1; }
@@ -2681,7 +2627,56 @@ static void draw_log_window() {
     }
     if (g.auto_scroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 8) ImGui::SetScrollHereY(1.0f);
     ImGui::EndChild();
-    ImGui::End();
+}
+
+static float draw_ui() {
+    if (g.plugin_details_ready.exchange(false)) {
+        std::lock_guard lock(g.plugin_mutex);
+        for (auto& [path, state] : g.pending_plugin_git_cache)
+            g.plugin_git_cache.insert_or_assign(path, std::move(state));
+        g.pending_plugin_git_cache.clear();
+    }
+    if (g.plugin_refresh_requested.exchange(false)) {
+        if (g.plugin_details_running) {
+            g.plugin_refresh_requested = true;
+        } else {
+            g.plugin_scan_cache.clear();
+            g.plugin_git_cache.clear();
+        }
+    }
+
+    draw_top_context_selectors();
+
+    const float available_height = ImGui::GetContentRegionAvail().y;
+    const float footer_reserve = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 8.0f;
+    const float log_height = std::clamp(available_height * 0.34f, 210.0f, 300.0f);
+    const float content_height = std::max(200.0f, available_height - log_height - footer_reserve - ImGui::GetStyle().ItemSpacing.y);
+
+    ImGui::BeginChild("##main_content", ImVec2(0, content_height), ImGuiChildFlags_None);
+    if (ImGui::BeginTabBar("##main_tabs")) {
+        if (ImGui::BeginTabItem("Project")) {
+            draw_project_ui();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Plugins")) {
+            draw_plugins_ui();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Settings")) {
+            draw_settings_ui();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::EndChild();
+
+    ImGui::Separator();
+    ImGui::BeginChild("##embedded_build_log", ImVec2(0, log_height), ImGuiChildFlags_None);
+    draw_log_panel();
+    ImGui::EndChild();
+
+    draw_footer();
+    return ImGui::GetCursorPosY();
 }
 
 int main(int, char**) {
@@ -2773,10 +2768,6 @@ int main(int, char**) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
-        if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) {
-            g.show_log = !g.show_log;
-            save_settings();
-        }
         if (!ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl &&
             ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
             running = false;
@@ -2790,7 +2781,6 @@ int main(int, char**) {
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
         draw_ui();
         ImGui::End();
-        if (g.show_log) draw_log_window();
         ImGui::Render();
         int width, height;
         SDL_GetWindowSizeInPixels(g_window, &width, &height);
