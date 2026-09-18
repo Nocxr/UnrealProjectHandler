@@ -1653,7 +1653,7 @@ static std::string package_command() {
 
 static void run_command(std::string command, const std::string& name, bool refresh_plugins = false, bool refresh_git = false) {
     if (g.process_running.exchange(true)) { log_line("[ERROR] Another operation is already running."); return; }
-    if (name == "Compile" || name == "Package") g.log_expanded = true;
+    if (name == "Compile" || name == "Package" || name.rfind("Compile Plugin ", 0) == 0) g.log_expanded = true;
     g.stop_requested = false;
     if (g.clear_on_run) { std::lock_guard lock(g.mutex); g.logs.clear(); }
     log_line("[SYSTEM] Starting " + name + ": " + command);
@@ -3130,6 +3130,46 @@ static fs::path plugin_descriptor_path(const fs::path& dir) {
     return {};
 }
 
+static std::vector<std::string> plugin_module_names(const fs::path& dir) {
+    std::vector<std::string> modules;
+    auto descriptor = plugin_descriptor_path(dir);
+    if (descriptor.empty()) return modules;
+
+    auto text = read_text(descriptor);
+    auto modules_key = text.find("\"Modules\"");
+    if (modules_key == std::string::npos) return modules;
+    auto array_start = text.find('[', modules_key);
+    if (array_start == std::string::npos) return modules;
+
+    int depth = 0;
+    bool in_string = false, escape = false;
+    size_t object_start = std::string::npos;
+    for (size_t i = array_start + 1; i < text.size(); ++i) {
+        char ch = text[i];
+        if (in_string) {
+            if (escape) escape = false;
+            else if (ch == '\\') escape = true;
+            else if (ch == '"') in_string = false;
+            continue;
+        }
+        if (ch == '"') { in_string = true; continue; }
+        if (ch == ']' && depth == 0) break;
+        if (ch == '{') {
+            if (depth == 0) object_start = i;
+            ++depth;
+        } else if (ch == '}' && depth > 0) {
+            --depth;
+            if (depth == 0 && object_start != std::string::npos) {
+                auto object = text.substr(object_start, i - object_start + 1);
+                auto name = json_string_value(object, "Name");
+                if (!name.empty()) modules.push_back(name);
+                object_start = std::string::npos;
+            }
+        }
+    }
+    return modules;
+}
+
 static std::string plugin_module_name(const fs::path& dir) {
     auto key = normalized_path_key(dir);
     if (auto found = g.plugin_module_cache.find(key); found != g.plugin_module_cache.end()) return found->second;
@@ -3160,37 +3200,31 @@ static void compile_plugin_module(const fs::path& dir) {
         return;
     }
 
-    auto module = plugin_module_name(dir);
-    if (module.empty()) {
-        log_line("[ERROR] No C++ module found in plugin " + descriptor.filename().string());
-        return;
-    }
-
-    auto package_dir = g.project.empty()
-        ? fs::temp_directory_path() / "UPH" / "PluginBuild" / descriptor.stem()
-        : g.project.parent_path() / "Intermediate" / "UPH" / "PluginBuild" / descriptor.stem();
-
-    std::error_code ec;
-    fs::create_directories(package_dir, ec);
-    if (ec) {
-        log_line("[ERROR] Could not create isolated plugin build directory: " + package_dir.string());
+    auto modules = plugin_module_names(dir);
+    if (modules.empty()) {
+        log_line("[ERROR] No C++ modules found in plugin " + descriptor.filename().string());
         return;
     }
 
     std::ostringstream command;
 #ifdef _WIN32
-    command << quote(run_uat());
-    const char* host_platform = "Win64";
+    command << quote(build_script()) << " UnrealEditor Win64 ";
 #else
-    command << "bash " << quote(run_uat());
-    const char* host_platform = "Mac";
+    command << "bash " << quote(build_script()) << " UnrealEditor Mac ";
 #endif
-    command << " BuildPlugin -Verbose"
+    command << g.configs[g.compile_config]
             << " -Plugin=" << quote(descriptor)
-            << " -Package=" << quote(package_dir)
-            << " -TargetPlatforms=" << host_platform;
+            << " -DisableAllPlugins"
+            << " -NoHotReload -WaitMutex";
+    for (const auto& module : modules)
+        command << " -Module=" << module;
 
-    log_line("[SYSTEM] Building plugin in isolation so unrelated project plugins are not loaded.");
+    std::string module_list;
+    for (size_t i = 0; i < modules.size(); ++i) {
+        if (i) module_list += ", ";
+        module_list += modules[i];
+    }
+    log_line("[SYSTEM] Compiling only plugin " + descriptor.stem().string() + " modules: " + module_list);
     run_command(command.str(), "Compile Plugin " + descriptor.stem().string(), true);
 }
 
@@ -3390,10 +3424,10 @@ static void draw_plugin_list(const fs::path& root, bool refresh = false, bool sh
         if (ImGui::SmallButton("Open")) open_path(dir);
         ImGui::SameLine();
         auto module = plugin_module_name(dir);
-        const bool compile_ready = !module.empty() && !g.process_running && fs::exists(run_uat());
+        const bool compile_ready = !module.empty() && !g.process_running && fs::exists(build_script());
         if (!compile_ready) ImGui::BeginDisabled();
         if (ImGui::SmallButton("Compile Plugin")) compile_plugin_module(dir);
-        tooltip("Build this .uplugin in isolation with RunUAT BuildPlugin so unrelated project plugins are not loaded.");
+        tooltip("Compile only this plugin's C++ modules with UnrealBuildTool. Unrelated project plugins are disabled.");
         if (!compile_ready) ImGui::EndDisabled();
         if (!module.empty()) { ImGui::SameLine(); ImGui::TextDisabled("Module: %s", module.c_str()); }
         ImGui::PopID();
@@ -3500,10 +3534,10 @@ static void draw_project_plugins() {
         if (ImGui::SmallButton("Open")) open_path(dir);
         ImGui::SameLine();
         auto module = plugin_module_name(dir);
-        const bool compile_ready = !module.empty() && !g.process_running && fs::exists(run_uat());
+        const bool compile_ready = !module.empty() && !g.process_running && fs::exists(build_script());
         if (!compile_ready) ImGui::BeginDisabled();
         if (ImGui::SmallButton("Compile Plugin")) compile_plugin_module(dir);
-        tooltip("Build this .uplugin in isolation with RunUAT BuildPlugin so unrelated project plugins are not loaded.");
+        tooltip("Compile only this plugin's C++ modules with UnrealBuildTool. Unrelated project plugins are disabled.");
         if (!compile_ready) ImGui::EndDisabled();
         if (!module.empty()) { ImGui::SameLine(); ImGui::TextDisabled("Module: %s", module.c_str()); }
         ImGui::PopID();
