@@ -3563,6 +3563,10 @@ static void compile_plugin_module(const fs::path& dir) {
 
     auto modules = plugin_module_names(dir);
     auto source_modules = plugin_source_module_names(dir);
+    auto build_modules = modules;
+    for (const auto& module : source_modules)
+        if (std::find(build_modules.begin(), build_modules.end(), module) == build_modules.end())
+            build_modules.push_back(module);
     if (modules.empty()) {
         log_line("[ERROR] No C++ modules found in plugin " + descriptor.filename().string());
         return;
@@ -3605,18 +3609,20 @@ static void compile_plugin_module(const fs::path& dir) {
     command << g.configs[g.compile_config]
             << " -Project=" << quote(host_project)
             << " -NoHotReload -WaitMutex";
-    for (const auto& module : modules)
+    for (const auto& module : build_modules)
         command << " -Module=" << module;
 
     std::string module_list;
-    for (size_t i = 0; i < modules.size(); ++i) {
+    for (size_t i = 0; i < build_modules.size(); ++i) {
         if (i) module_list += ", ";
-        module_list += modules[i];
+        module_list += build_modules[i];
     }
 
     g.log_expanded = true;
     log_line("[SYSTEM] Compiling selected plugin " + descriptor.stem().string() +
              " for real project target " + editor_target + ": " + module_list);
+    if (build_modules.size() != modules.size())
+        log_line("[SYSTEM] Also compiling undeclared helper/source modules required by the plugin.");
 
     auto prepare = [host_root, host_plugins, host_plugin_dir, host_project, source_dir, config_dir, target_file,
                     dir, descriptor, dependencies, editor_target]() -> bool {
