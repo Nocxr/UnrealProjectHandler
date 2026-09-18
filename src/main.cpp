@@ -52,6 +52,8 @@ struct PluginGitState {
     std::string remote_url;
     std::string repo_name;
     std::vector<std::string> branches;
+    std::string short_sha;
+    bool dirty = false;
     int ahead = 0;
     int behind = 0;
     bool tracking_known = false;
@@ -2855,6 +2857,8 @@ static PluginGitState inspect_plugin_git_root_state(const fs::path& git_root, co
 
     auto branch = capture_command("git -C " + quote(git_root) + " symbolic-ref --quiet --short HEAD");
     auto sha = capture_command("git -C " + quote(git_root) + " rev-parse --short HEAD");
+    state.short_sha = sha;
+    state.dirty = !capture_command("git -C " + quote(git_root) + " status --porcelain").empty();
     state.revision = branch.empty() ? (sha.empty() ? "unborn branch" : "detached @ " + sha) : branch;
     state.remote_url = capture_command("git -C " + quote(git_root) + " remote get-url origin");
     state.repo_name = repo_name_from_url(state.remote_url);
@@ -3285,6 +3289,29 @@ static void draw_project_plugins() {
         if (g.plugin_details_running) g.plugin_refresh_requested = true;
     }
 
+    std::map<std::string, fs::path> outdated_repos;
+    for (const auto& [path_key, state] : g.plugin_git_cache) {
+        if (state.git_repo && state.behind > 0 && !state.git_root.empty())
+            outdated_repos[normalized_path_key(state.git_root)] = state.git_root;
+    }
+    ImGui::SameLine();
+    const bool disable_update_all = outdated_repos.empty() || g.process_running;
+    if (disable_update_all) ImGui::BeginDisabled();
+    if (ImGui::SmallButton("Update All Outdated")) {
+        std::vector<std::pair<std::string,std::string>> steps;
+        for (const auto& [key, repo_path] : outdated_repos) {
+            auto name = repo_path.filename().string();
+            steps.push_back({"Fetch " + name, "git -C " + quote(repo_path) + " fetch --all --prune"});
+            steps.push_back({"Pull " + name, "git -C " + quote(repo_path) + " pull --ff-only"});
+        }
+        run_command_sequence(std::move(steps), "Update Outdated Plugins", true);
+    }
+    if (disable_update_all) ImGui::EndDisabled();
+    if (!outdated_repos.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.24f, 1.0f), "%d behind", (int)outdated_repos.size());
+    }
+
     const auto& plugins = list_plugins(root, refresh);
     if (plugins.empty()) { ImGui::TextDisabled("No project plugins found."); return; }
 
@@ -3333,10 +3360,11 @@ static void draw_project_plugins() {
         std::string label = state.repo_name.empty() ? state.git_root.filename().string() : state.repo_name;
         label += " (" + std::to_string(group_plugins.size()) + " plugins)";
         ImGui::PushID(group_key.c_str());
-        if (ImGui::BeginTable("##repo_group_row", 5, ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn("Repo", ImGuiTableColumnFlags_WidthStretch, 2.5f);
-            ImGui::TableSetupColumn("Remote", ImGuiTableColumnFlags_WidthStretch, 1.9f);
-            ImGui::TableSetupColumn("Branch", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+        if (ImGui::BeginTable("##repo_group_row", 6, ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Repo", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+            ImGui::TableSetupColumn("Remote", ImGuiTableColumnFlags_WidthStretch, 1.7f);
+            ImGui::TableSetupColumn("Branch", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+            ImGui::TableSetupColumn("Commit", ImGuiTableColumnFlags_WidthFixed, 90.0f);
             ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 105.0f);
             ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 70.0f);
             ImGui::TableNextRow();
@@ -3367,9 +3395,19 @@ static void draw_project_plugins() {
             }
 
             ImGui::TableSetColumnIndex(3);
-            draw_plugin_git_status(state);
+            if (!state.short_sha.empty()) {
+                ImGui::TextColored(state.dirty ? ImVec4(1.0f, 0.72f, 0.24f, 1.0f)
+                                               : ImVec4(0.62f, 0.72f, 0.82f, 1.0f),
+                                   "%s%s", state.short_sha.c_str(), state.dirty ? "*" : "");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", state.dirty ? "Working tree has uncommitted changes." : "Clean working tree.");
+            } else {
+                ImGui::TextDisabled("-");
+            }
 
             ImGui::TableSetColumnIndex(4);
+            draw_plugin_git_status(state);
+
+            ImGui::TableSetColumnIndex(5);
             if (ImGui::SmallButton("Update##repo")) {
                 run_command_sequence({
                     {"Fetch", "git -C " + quote(state.git_root) + " fetch --all --prune"},
@@ -3489,11 +3527,12 @@ static void draw_favorite_plugins() {
             else plugin.branch = remote_branches.front();
         }
 
-        if (ImGui::BeginTable("##favorite_row", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH)) {
+        if (ImGui::BeginTable("##favorite_row", 5, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH)) {
             ImGui::TableSetupColumn("Plugin", ImGuiTableColumnFlags_WidthStretch, 1.4f);
-            ImGui::TableSetupColumn("Repository", ImGuiTableColumnFlags_WidthStretch, 2.1f);
+            ImGui::TableSetupColumn("Repository", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn("Installed", ImGuiTableColumnFlags_WidthFixed, 70.0f);
             ImGui::TableSetupColumn("Branch", ImGuiTableColumnFlags_WidthFixed, 180.0f);
-            ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+            ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthStretch, 2.6f);
             ImGui::TableNextRow();
 
             ImGui::TableSetColumnIndex(0);
@@ -3503,13 +3542,13 @@ static void draw_favorite_plugins() {
             auto favorite_repo = repo_name_from_url(plugin.url);
             ImGui::TextColored(ImVec4(0.42f, 0.72f, 1.0f, 1.0f), "%s",
                                favorite_repo.empty() ? plugin.url.c_str() : favorite_repo.c_str());
-            ImGui::SameLine();
-            if (target_exists)
-                ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.42f, 1.0f), "Installed");
-            else
-                ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.24f, 1.0f), "Not installed");
 
             ImGui::TableSetColumnIndex(2);
+            ImGui::TextColored(target_exists ? ImVec4(0.30f, 0.85f, 0.42f, 1.0f)
+                                             : ImVec4(0.88f, 0.34f, 0.30f, 1.0f),
+                               "%s", target_exists ? "Yes" : "No");
+
+            ImGui::TableSetColumnIndex(3);
             if (installed_git) {
                 const auto& state = git_state->second;
                 const char* current = state.revision.empty() ? "Unknown" : state.revision.c_str();
@@ -3543,12 +3582,16 @@ static void draw_favorite_plugins() {
                 ImGui::TextDisabled("No branches");
             }
 
-            ImGui::TableSetColumnIndex(3);
+            ImGui::TableSetColumnIndex(4);
 
-            if (installed_git) {
-                draw_plugin_git_status(git_state->second);
-                ImGui::SameLine();
-            }
+            float actions_width = 0.0f;
+            auto button_width = [](const char* label) {
+                return ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+            };
+            actions_width += button_width(submodule_exists ? "Remove Submodule" : "Add Submodule");
+            actions_width += button_width("Clone") + button_width("URL") + button_width("X") + ImGui::GetStyle().ItemSpacing.x * 3.0f;
+            float available = ImGui::GetContentRegionAvail().x;
+            if (available > actions_width) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (available - actions_width));
 
             if (!can_submodule) ImGui::BeginDisabled();
             if (ImGui::SmallButton(submodule_exists ? "Remove Submodule" : "Add Submodule")) {
