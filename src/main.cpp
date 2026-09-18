@@ -3493,7 +3493,7 @@ static void compile_plugin_module(const fs::path& dir) {
         target << "        Type = TargetType.Editor;\n";
         target << "        DefaultBuildSettings = BuildSettingsVersion.V7;\n";
         target << "        IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_8;\n";
-        target << "        BuildEnvironment = TargetBuildEnvironment.Unique;\n";
+        target << "        bOverrideBuildEnvironment = true;\n";
         target << "        bAllowEnginePluginsEnabledByDefault = false;\n";
         target << "        EnablePlugins.Add(\"" << json_escape(descriptor.stem().string()) << "\");\n";
         target << "        BuildPlugins.Add(\"" << json_escape(descriptor.stem().string()) << "\");\n";
@@ -4781,7 +4781,7 @@ static void draw_footer() {
     if (ImGui::GetCursorPosY() < footer_y) ImGui::SetCursorPosY(footer_y);
     ImGui::Separator();
 
-    ImGui::TextDisabled("%s Show/Hide    |    %s Log    |    %s Editor    |    %s Play    |    %s Compile    |    %s Package    |    %s Quit",
+    ImGui::TextDisabled("%s Show/Hide | %s Log | %s Editor | %s Play | %s Build | %s Package | %s Quit",
                         g.hotkey_global_toggle.c_str(),
                         g.hotkey_toggle_log.c_str(),
                         g.hotkey_launch_editor.c_str(),
