@@ -796,6 +796,8 @@ static std::string detect_android_package() {
     return {};
 }
 
+static fs::path package_output();
+
 static fs::path find_android_apk() {
     std::vector<fs::path> roots;
     auto output = package_output();
