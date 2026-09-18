@@ -2511,9 +2511,10 @@ static void draw_project_git_ui() {
     if (g.git_root.empty()) {
         ImGui::TextDisabled(g.git_refresh_running ? "Checking project repository..." : "Project folder is not a Git repository.");
         if (!g.git_refresh_running && !g.project.empty()) {
-            if (g.process_running) ImGui::BeginDisabled();
+            const bool disable_init = g.process_running;
+            if (disable_init) ImGui::BeginDisabled();
             if (ImGui::Button("Initialize Git Repository")) initialize_project_git();
-            if (g.process_running) ImGui::EndDisabled();
+            if (disable_init) ImGui::EndDisabled();
             tooltip("Run git init in the project folder and create a starter Unreal .gitignore if one does not already exist.");
         }
         return;
