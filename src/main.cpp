@@ -875,8 +875,13 @@ static void refresh_adb_status_async() {
         else if (serial.empty()) status = "No device selected";
         else if (package.empty()) status = "Enter an Android package name";
         else {
-            auto pid = capture_command(adb_prefix(adb, serial) + " shell pidof " + quote(fs::path(package)));
-            status = pid.empty() ? "Stopped / not installed" : "Running (PID " + pid + ")";
+            auto installed = capture_command(adb_prefix(adb, serial) + " shell pm path " + quote(fs::path(package)));
+            if (installed.empty()) {
+                status = "Not installed";
+            } else {
+                auto pid = capture_command(adb_prefix(adb, serial) + " shell pidof " + quote(fs::path(package)));
+                status = pid.empty() ? "Installed - stopped" : "Installed - running (PID " + pid + ")";
+            }
         }
         {
             std::lock_guard lock(g.adb_mutex);
@@ -2938,9 +2943,12 @@ static void draw_project_ui() {
                 for (const auto& device : devices) {
                     bool selected = device == serial;
                     if (ImGui::Selectable(device.c_str(), selected)) {
-                        std::lock_guard lock(g.adb_mutex);
-                        g.adb_serial = device;
-                        g.adb_status = "Not checked";
+                        {
+                            std::lock_guard lock(g.adb_mutex);
+                            g.adb_serial = device;
+                            g.adb_status = g.adb_package.empty() ? "Package not selected" : "Checking device...";
+                        }
+                        if (!g.adb_package.empty()) refresh_adb_status_async();
                     }
                     if (selected) ImGui::SetItemDefaultFocus();
                 }
@@ -2962,10 +2970,15 @@ static void draw_project_ui() {
             }
             ImGui::SameLine();
             if (ImGui::Button("Detect Package##adb_package")) {
-                std::lock_guard lock(g.adb_mutex);
-                g.adb_package = detect_android_package();
-                g.adb_status = "Not checked";
+                auto detected = detect_android_package();
+                {
+                    std::lock_guard lock(g.adb_mutex);
+                    g.adb_package = detected;
+                    g.adb_status = detected.empty() ? "Package name not found in project config" : "Package detected - checking device...";
+                }
+                if (!detected.empty()) refresh_adb_status_async();
             }
+            tooltip("Read the Android package name from the Unreal project config, then check whether it is installed and running on the selected device.");
 
             ImGui::TextDisabled("Status: %s", status.c_str());
             bool adb_ready = !serial.empty() && !package.empty();
