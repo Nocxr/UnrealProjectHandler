@@ -133,10 +133,14 @@ struct AppState {
     std::atomic<bool> adb_logcat_running{false};
     std::atomic<bool> adb_logcat_stop{false};
     std::atomic<bool> plugin_details_ready{false};
+    std::atomic<int> operation_progress_current{0};
+    std::atomic<int> operation_progress_total{0};
     std::mutex mutex;
     std::mutex plugin_mutex;
     std::mutex git_mutex;
     std::mutex adb_mutex;
+    std::mutex progress_mutex;
+    std::string operation_progress_label;
     std::map<std::string, PluginGitState> pending_plugin_git_cache;
     ProjectGitState pending_git_state;
     fs::path git_root;
@@ -1698,6 +1702,52 @@ static void run_command(std::string command, const std::string& name, bool refre
     }).detach();
 }
 
+
+static void set_operation_progress(const std::string& label, int current, int total) {
+    {
+        std::lock_guard lock(g.progress_mutex);
+        g.operation_progress_label = label;
+    }
+    g.operation_progress_current = current;
+    g.operation_progress_total = total;
+}
+
+static void clear_operation_progress() {
+    g.operation_progress_current = 0;
+    g.operation_progress_total = 0;
+    std::lock_guard lock(g.progress_mutex);
+    g.operation_progress_label.clear();
+}
+
+static void run_command_sequence(std::vector<std::pair<std::string,std::string>> steps,
+                                 const std::string& name,
+                                 bool refresh_plugins = false,
+                                 bool refresh_git = false) {
+    if (steps.empty()) return;
+    if (g.process_running.exchange(true)) { log_line("[ERROR] Another operation is already running."); return; }
+    g.stop_requested = false;
+    if (g.clear_on_run) { std::lock_guard lock(g.mutex); g.logs.clear(); }
+    g.log_expanded = true;
+
+    std::thread([steps = std::move(steps), name, refresh_plugins, refresh_git] {
+        bool ok = true;
+        for (size_t i = 0; i < steps.size(); ++i) {
+            if (g.stop_requested) { ok = false; break; }
+            set_operation_progress(name + ": " + steps[i].first, static_cast<int>(i + 1), static_cast<int>(steps.size()));
+            log_line("[SYSTEM] " + name + " (" + std::to_string(i + 1) + "/" + std::to_string(steps.size()) + "): " + steps[i].first);
+            auto output = capture_command(steps[i].second);
+            if (!output.empty()) log_line(output);
+            // capture_command returns empty both for success-with-no-output and failure, so verify Git steps explicitly when possible
+            // by relying on the following step only for commands whose success is naturally required.
+        }
+        log_line(ok ? "[SYSTEM] " + name + " completed." : "[ERROR] " + name + " stopped.");
+        if (refresh_plugins) g.plugin_refresh_requested = true;
+        if (refresh_git) g.git_refresh_requested = true;
+        clear_operation_progress();
+        g.process_running = false;
+    }).detach();
+}
+
 static void open_path(const fs::path& path) {
     if (path.empty() || !fs::exists(path)) { log_line("[ERROR] Path does not exist: " + path.string()); return; }
 #ifdef _WIN32
@@ -2779,21 +2829,30 @@ static void request_plugin_details(std::vector<fs::path> plugins) {
     if (plugins.empty() || g.project.empty() || g.plugin_details_running.exchange(true)) return;
     auto project_root = g.project.parent_path();
     g.plugin_details_ready = false;
+
     std::thread([plugins = std::move(plugins), project_root] {
         std::map<std::string, PluginGitState> details;
-        std::map<std::string, PluginGitState> repo_states;
+        std::map<std::string, std::vector<fs::path>> repo_plugins;
+        std::vector<fs::path> no_repo;
 
         for (const auto& dir : plugins) {
             auto git_root = nested_plugin_git_root(dir, project_root);
-            if (git_root.empty()) {
-                details[normalized_path_key(dir)] = {};
-                continue;
-            }
-            auto root_key = normalized_path_key(git_root);
-            auto found = repo_states.find(root_key);
-            if (found == repo_states.end())
-                found = repo_states.emplace(root_key, inspect_plugin_git_root_state(git_root, project_root)).first;
-            details[normalized_path_key(dir)] = found->second;
+            if (git_root.empty()) no_repo.push_back(dir);
+            else repo_plugins[normalized_path_key(git_root)].push_back(dir);
+        }
+
+        const int total = static_cast<int>(repo_plugins.size());
+        int current = 0;
+        if (total > 0) set_operation_progress("Inspecting plugin repositories", 0, total);
+
+        for (const auto& dir : no_repo) details[normalized_path_key(dir)] = {};
+
+        for (auto& [root_key, dirs] : repo_plugins) {
+            ++current;
+            auto git_root = nested_plugin_git_root(dirs.front(), project_root);
+            set_operation_progress("Inspecting " + git_root.filename().string(), current, total);
+            auto state = inspect_plugin_git_root_state(git_root, project_root);
+            for (const auto& dir : dirs) details[normalized_path_key(dir)] = state;
         }
 
         {
@@ -2801,6 +2860,7 @@ static void request_plugin_details(std::vector<fs::path> plugins) {
             for (auto& [path, state] : details)
                 g.pending_plugin_git_cache.insert_or_assign(path, std::move(state));
         }
+        if (!g.process_running) clear_operation_progress();
         g.plugin_details_ready = true;
         g.plugin_details_running = false;
     }).detach();
@@ -3047,15 +3107,13 @@ static bool project_plugin_exists_locally(const std::string& name) {
     return false;
 }
 
-static void plugin_git_controls(const fs::path& dir, const PluginGitState& state) {
+static void plugin_git_controls(const fs::path& dir, const PluginGitState& state, const char* id_suffix = "") {
     if (!state.git_repo) return;
-    if (!state.repo_name.empty()) {
-        ImGui::TextDisabled("%s", state.repo_name.c_str());
-        ImGui::SameLine();
-    }
+
     const char* current = state.revision.empty() ? "Unknown" : state.revision.c_str();
+    std::string combo_id = std::string("##plugin_branch_") + id_suffix;
     ImGui::SetNextItemWidth(180.0f);
-    if (ImGui::BeginCombo("##plugin_branch", current)) {
+    if (ImGui::BeginCombo(combo_id.c_str(), current)) {
         for (const auto& branch : state.branches) {
             bool selected = branch == state.revision;
             if (ImGui::Selectable(branch.c_str(), selected) && !selected) {
@@ -3065,10 +3123,14 @@ static void plugin_git_controls(const fs::path& dir, const PluginGitState& state
         }
         ImGui::EndCombo();
     }
+
     ImGui::SameLine();
-    if (ImGui::SmallButton("Update")) {
-        run_command("git -C " + quote(dir) + " fetch --all --prune && git -C " + quote(dir) + " pull --ff-only",
-                    "Update Plugin " + dir.filename().string(), true);
+    std::string update_id = std::string("Update##plugin_update_") + id_suffix;
+    if (ImGui::SmallButton(update_id.c_str())) {
+        run_command_sequence({
+            {"Fetch", "git -C " + quote(dir) + " fetch --all --prune"},
+            {"Pull",  "git -C " + quote(dir) + " pull --ff-only"}
+        }, "Update Plugin " + dir.filename().string(), true);
     }
 }
 
@@ -3197,13 +3259,49 @@ static void draw_project_plugins() {
         std::string label = state.repo_name.empty() ? state.git_root.filename().string() : state.repo_name;
         label += " (" + std::to_string(group_plugins.size()) + " plugins)";
         ImGui::PushID(group_key.c_str());
-        bool open = ImGui::CollapsingHeader(label.c_str());
-        ImGui::SameLine();
-        plugin_git_controls(state.git_root, state);
-        if (open) {
-            ImGui::Indent();
-            for (const auto& dir : group_plugins) draw_one(dir);
-            ImGui::Unindent();
+        if (ImGui::BeginTable("##repo_group_row", 4, ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Repo", ImGuiTableColumnFlags_WidthStretch, 2.7f);
+            ImGui::TableSetupColumn("Remote", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn("Branch", ImGuiTableColumnFlags_WidthFixed, 190.0f);
+            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableNextRow();
+
+            ImGui::TableSetColumnIndex(0);
+            bool open = ImGui::TreeNodeEx("##repo_group", ImGuiTreeNodeFlags_SpanAvailWidth, "%s", label.c_str());
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextDisabled("%s", state.repo_name.empty() ? state.git_root.filename().string().c_str() : state.repo_name.c_str());
+
+            ImGui::TableSetColumnIndex(2);
+            const char* current = state.revision.empty() ? "Unknown" : state.revision.c_str();
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##repo_branch", current)) {
+                for (const auto& repo_branch : state.branches) {
+                    bool selected = repo_branch == state.revision;
+                    if (ImGui::Selectable(repo_branch.c_str(), selected) && !selected) {
+                        run_command("git -C " + quote(state.git_root) + " switch " + quote(fs::path(repo_branch)),
+                                    "Switch Plugin Branch " + state.git_root.filename().string(), true);
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            ImGui::TableSetColumnIndex(3);
+            if (ImGui::SmallButton("Update##repo")) {
+                run_command_sequence({
+                    {"Fetch", "git -C " + quote(state.git_root) + " fetch --all --prune"},
+                    {"Pull",  "git -C " + quote(state.git_root) + " pull --ff-only"}
+                }, "Update Plugin " + state.git_root.filename().string(), true);
+            }
+
+            ImGui::EndTable();
+
+            if (open) {
+                ImGui::Indent();
+                for (const auto& dir : group_plugins) draw_one(dir);
+                ImGui::Unindent();
+                ImGui::TreePop();
+            }
         }
         ImGui::PopID();
     }
@@ -3283,53 +3381,80 @@ static void draw_favorite_plugins() {
         bool can_clone = !g.project.empty() && !g.process_running && valid_folder;
         bool project_is_git = !g.git_root.empty();
         bool can_submodule = can_clone && project_is_git && (submodule_exists || !target_exists);
-        if (!can_submodule) ImGui::BeginDisabled();
-        if (ImGui::SmallButton(submodule_exists ? "Remove Submodule" : "Add Submodule")) {
-            auto root = g.project.parent_path();
-            if (submodule_exists) {
-                remove_plugin_submodule(root, submodule_path, plugin.name);
+
+        if (ImGui::BeginTable("##favorite_row", 5, ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn("Repo", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+            ImGui::TableSetupColumn("Branch", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+            ImGui::TableSetupColumn("Git", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+            ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 230.0f);
+            ImGui::TableNextRow();
+
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(plugin.name.c_str());
+
+            ImGui::TableSetColumnIndex(1);
+            auto favorite_repo = repo_name_from_url(plugin.url);
+            ImGui::TextDisabled("%s", favorite_repo.empty() ? plugin.url.c_str() : favorite_repo.c_str());
+
+            ImGui::TableSetColumnIndex(2);
+            if (target_exists && git_state != g.plugin_git_cache.end() && git_state->second.git_repo) {
+                const auto& state = git_state->second;
+                const char* current = state.revision.empty() ? "Unknown" : state.revision.c_str();
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::BeginCombo("##favorite_branch", current)) {
+                    for (const auto& repo_branch : state.branches) {
+                        bool selected = repo_branch == state.revision;
+                        if (ImGui::Selectable(repo_branch.c_str(), selected) && !selected) {
+                            run_command("git -C " + quote(target) + " switch " + quote(fs::path(repo_branch)),
+                                        "Switch Plugin Branch " + plugin.name, true);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
             } else {
-                run_command(add_plugin_submodule_command(root, submodule_path, plugin.url, plugin.name),
-                            "Add Submodule " + plugin.name, true);
+                ImGui::TextDisabled("-");
             }
-        }
-        if (!can_submodule) ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            if (!valid_folder) ImGui::SetTooltip("Folder Name must be a single folder name, without slashes or '..'.");
-            else if (!project_is_git) ImGui::SetTooltip("This project is not a Git repository. Use Clone, or initialize Git for the project first.");
-            else if (target_exists && !submodule_exists) ImGui::SetTooltip("That folder already exists and is not a submodule.");
-            else if (g.process_running) ImGui::SetTooltip("Wait for the current operation to finish.");
-            else ImGui::SetTooltip("Select a project first.");
-        }
-        ImGui::SameLine();
-        bool clone_ready = can_clone && !target_exists;
-        if (!clone_ready) ImGui::BeginDisabled();
-        if (ImGui::SmallButton("Clone")) {
-            run_command("git clone " + quote(fs::path(plugin.url)) + ' ' + quote(target), "Clone Plugin " + plugin.name, true);
-        }
-        if (!clone_ready) {
-            ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip(target_exists ? "The destination folder already exists." : "Select a project and wait for the current operation to finish.");
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Open URL")) open_url(plugin.url);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", plugin.url.c_str());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Remove")) remove = i;
-        ImGui::SameLine();
-        ImGui::TextUnformatted(plugin.name.c_str());
-        ImGui::SameLine();
-        auto favorite_repo = repo_name_from_url(plugin.url);
-        ImGui::TextDisabled("%s", favorite_repo.empty() ? plugin.url.c_str() : favorite_repo.c_str());
-        if (target_exists && git_state != g.plugin_git_cache.end() && git_state->second.git_repo) {
-            plugin_git_controls(target, git_state->second);
-            auto module = plugin_module_name(target);
-            const bool can_compile_plugin = !module.empty() && !g.process_running && fs::exists(build_script()) && fs::is_regular_file(g.project);
+
+            ImGui::TableSetColumnIndex(3);
+            if (target_exists && git_state != g.plugin_git_cache.end() && git_state->second.git_repo) {
+                if (ImGui::SmallButton("Update")) {
+                    run_command_sequence({
+                        {"Fetch", "git -C " + quote(target) + " fetch --all --prune"},
+                        {"Pull",  "git -C " + quote(target) + " pull --ff-only"}
+                    }, "Update Plugin " + plugin.name, true);
+                }
+                ImGui::SameLine();
+                auto module = plugin_module_name(target);
+                const bool can_compile_plugin = !module.empty() && !g.process_running && fs::exists(build_script()) && fs::is_regular_file(g.project);
+                if (!can_compile_plugin) ImGui::BeginDisabled();
+                if (ImGui::SmallButton("Compile")) compile_plugin_module(target);
+                if (!can_compile_plugin) ImGui::EndDisabled();
+            } else {
+                ImGui::TextDisabled("Not installed");
+            }
+
+            ImGui::TableSetColumnIndex(4);
+            if (!can_submodule) ImGui::BeginDisabled();
+            if (ImGui::SmallButton(submodule_exists ? "Remove Submodule" : "Add Submodule")) {
+                auto root = g.project.parent_path();
+                if (submodule_exists) remove_plugin_submodule(root, submodule_path, plugin.name);
+                else run_command(add_plugin_submodule_command(root, submodule_path, plugin.url, plugin.name),
+                                 "Add Submodule " + plugin.name, true);
+            }
+            if (!can_submodule) ImGui::EndDisabled();
             ImGui::SameLine();
-            if (!can_compile_plugin) ImGui::BeginDisabled();
-            if (ImGui::SmallButton("Compile Plugin")) compile_plugin_module(target);
-            if (!can_compile_plugin) ImGui::EndDisabled();
+            bool clone_ready = can_clone && !target_exists;
+            if (!clone_ready) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("Clone"))
+                run_command("git clone " + quote(fs::path(plugin.url)) + ' ' + quote(target), "Clone Plugin " + plugin.name, true);
+            if (!clone_ready) ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("URL")) open_url(plugin.url);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("X")) remove = i;
+
+            ImGui::EndTable();
         }
         ImGui::PopID();
     }
@@ -3340,6 +3465,20 @@ static void draw_favorite_plugins() {
 }
 
 static void draw_plugins_ui() {
+    int progress_total = g.operation_progress_total.load();
+    if (progress_total > 0) {
+        int progress_current = g.operation_progress_current.load();
+        std::string progress_label;
+        {
+            std::lock_guard lock(g.progress_mutex);
+            progress_label = g.operation_progress_label;
+        }
+        ImGui::TextColored(ImVec4(0.30f, 0.72f, 1.0f, 1.0f), "%s - running %d of %d",
+                           progress_label.c_str(), progress_current, progress_total);
+        float fraction = progress_total > 0 ? static_cast<float>(progress_current) / static_cast<float>(progress_total) : 0.0f;
+        ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f));
+        ImGui::Spacing();
+    }
     draw_engine_marketplace_plugins();
     draw_project_plugins();
     draw_project_plugin_references();
@@ -3901,6 +4040,12 @@ static void draw_project_ui() {
     ImGui::SeparatorText("Process Status");
     ImGui::TextColored(g.process_running ? ImVec4(0.90f, 0.22f, 0.20f, 1.0f) : ImVec4(0.18f, 0.78f, 0.30f, 1.0f),
                        "%s", g.process_running ? "BUSY - build operation running" : "READY - okay to compile or package");
+    if (g.operation_progress_total.load() > 0) {
+        std::string progress_label;
+        { std::lock_guard lock(g.progress_mutex); progress_label = g.operation_progress_label; }
+        ImGui::TextDisabled("%s - running %d of %d", progress_label.c_str(),
+                            g.operation_progress_current.load(), g.operation_progress_total.load());
+    }
     save_settings();
 }
 
