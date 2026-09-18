@@ -78,6 +78,11 @@ struct AppState {
     bool clean_output = false;
     bool project_has_cpp_module = false;
     bool auto_scroll = true;
+    std::string adb_serial;
+    std::string adb_package;
+    std::string adb_status{"Not checked"};
+    std::vector<std::string> adb_devices;
+    std::string adb_logcat;
     bool clear_on_run = false;
     bool log_expanded = true;
     std::set<int> selected_logs;
@@ -90,10 +95,15 @@ struct AppState {
     std::atomic<bool> git_refresh_ready{false};
     std::atomic<bool> plugin_refresh_requested{false};
     std::atomic<bool> plugin_details_running{false};
+    std::atomic<bool> adb_refresh_running{false};
+    std::atomic<bool> adb_action_running{false};
+    std::atomic<bool> adb_logcat_running{false};
+    std::atomic<bool> adb_logcat_stop{false};
     std::atomic<bool> plugin_details_ready{false};
     std::mutex mutex;
     std::mutex plugin_mutex;
     std::mutex git_mutex;
+    std::mutex adb_mutex;
     std::map<std::string, PluginGitState> pending_plugin_git_cache;
     ProjectGitState pending_git_state;
     fs::path git_root;
@@ -744,6 +754,196 @@ static std::string capture_command(const std::string& command) {
 #endif
 }
 
+static fs::path adb_executable() {
+    for (const auto& tool : g.tools)
+        if (tool.group == "Android" && tool.name == "ADB platform tools" && tool.found)
+            return tool.path;
+#ifdef _WIN32
+    return find_on_path("adb.exe");
+#else
+    return find_on_path("adb");
+#endif
+}
+
+static std::string detect_android_package() {
+    if (g.project.empty()) return {};
+    for (const auto& config : {
+             g.project.parent_path() / "Config/DefaultEngine.ini",
+             g.project.parent_path() / "Config/Android/AndroidEngine.ini"}) {
+        std::ifstream in(config);
+        std::string line;
+        while (std::getline(in, line)) {
+            auto pos = line.find("PackageName=");
+            if (pos == std::string::npos) continue;
+            auto value = line.substr(pos + 12);
+            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
+            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
+            if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+                value = value.substr(1, value.size() - 2);
+            auto replace_all = [](std::string& text, const std::string& token, const std::string& replacement) {
+                size_t p = 0;
+                while ((p = text.find(token, p)) != std::string::npos) {
+                    text.replace(p, token.size(), replacement);
+                    p += replacement.size();
+                }
+            };
+            auto project_name = g.project.stem().string();
+            replace_all(value, "[PROJECT]", project_name);
+            replace_all(value, "${PROJECT_NAME}", project_name);
+            return value;
+        }
+    }
+    return {};
+}
+
+static fs::path find_android_apk() {
+    std::vector<fs::path> roots;
+    auto output = package_output();
+    if (!output.empty()) roots.push_back(output);
+    if (!g.project.empty()) {
+        roots.push_back(g.project.parent_path() / "Binaries/Android");
+        roots.push_back(g.project.parent_path() / "Android");
+    }
+    fs::path newest;
+    fs::file_time_type newest_time{};
+    std::error_code ec;
+    for (const auto& root : roots) {
+        if (!fs::exists(root, ec)) { ec.clear(); continue; }
+        for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+             it != end; it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            if (!it->is_regular_file(ec) || it->path().extension() != ".apk") continue;
+            auto time = fs::last_write_time(it->path(), ec);
+            if (ec) { ec.clear(); continue; }
+            if (newest.empty() || time > newest_time) {
+                newest = it->path();
+                newest_time = time;
+            }
+        }
+    }
+    return newest;
+}
+
+static std::string adb_prefix(const fs::path& adb, const std::string& serial) {
+    if (adb.empty()) return {};
+    std::string command = quote(adb);
+    if (!serial.empty()) command += " -s " + quote(fs::path(serial));
+    return command;
+}
+
+static void refresh_adb_devices_async() {
+    if (g.adb_refresh_running.exchange(true)) return;
+    auto adb = adb_executable();
+    std::thread([adb] {
+        std::vector<std::string> devices;
+        if (!adb.empty()) {
+            auto output = capture_command(quote(adb) + " devices");
+            std::stringstream lines(output);
+            std::string line;
+            while (std::getline(lines, line)) {
+                if (line.find("\tdevice") == std::string::npos) continue;
+                auto tab = line.find('\t');
+                if (tab != std::string::npos) devices.push_back(line.substr(0, tab));
+            }
+        }
+        {
+            std::lock_guard lock(g.adb_mutex);
+            g.adb_devices = std::move(devices);
+            if (g.adb_serial.empty() ||
+                std::find(g.adb_devices.begin(), g.adb_devices.end(), g.adb_serial) == g.adb_devices.end())
+                g.adb_serial = g.adb_devices.empty() ? std::string{} : g.adb_devices.front();
+            g.adb_status = g.adb_devices.empty() ? "No authorized Android device connected" : "Device ready";
+        }
+        g.adb_refresh_running = false;
+    }).detach();
+}
+
+static void refresh_adb_status_async() {
+    if (g.adb_action_running.exchange(true)) return;
+    auto adb = adb_executable();
+    std::string serial, package;
+    {
+        std::lock_guard lock(g.adb_mutex);
+        serial = g.adb_serial;
+        package = g.adb_package;
+    }
+    std::thread([adb, serial, package] {
+        std::string status;
+        if (adb.empty()) status = "ADB not found";
+        else if (serial.empty()) status = "No device selected";
+        else if (package.empty()) status = "Enter an Android package name";
+        else {
+            auto pid = capture_command(adb_prefix(adb, serial) + " shell pidof " + quote(fs::path(package)));
+            status = pid.empty() ? "Stopped / not installed" : "Running (PID " + pid + ")";
+        }
+        {
+            std::lock_guard lock(g.adb_mutex);
+            g.adb_status = std::move(status);
+        }
+        g.adb_action_running = false;
+    }).detach();
+}
+
+static void run_adb_action(std::string args, std::string label, bool refresh_status = true) {
+    if (g.adb_action_running.exchange(true)) return;
+    auto adb = adb_executable();
+    std::string serial;
+    {
+        std::lock_guard lock(g.adb_mutex);
+        serial = g.adb_serial;
+    }
+    std::thread([adb, serial, args = std::move(args), label = std::move(label), refresh_status] {
+        if (adb.empty()) {
+            log_line("[ERROR] ADB not found.");
+        } else if (serial.empty()) {
+            log_line("[ERROR] No Android device selected.");
+        } else {
+            auto output = capture_command(adb_prefix(adb, serial) + " " + args);
+            if (!output.empty()) log_line("[ADB] " + label + ": " + output);
+            else log_line("[ADB] " + label + " completed.");
+        }
+        g.adb_action_running = false;
+        if (refresh_status) refresh_adb_status_async();
+    }).detach();
+}
+
+static void start_adb_logcat() {
+    if (g.adb_logcat_running.exchange(true)) return;
+    g.adb_logcat_stop = false;
+    auto adb = adb_executable();
+    std::thread([adb] {
+        while (!g.adb_logcat_stop) {
+            std::string serial, package;
+            {
+                std::lock_guard lock(g.adb_mutex);
+                serial = g.adb_serial;
+                package = g.adb_package;
+            }
+            std::string snapshot;
+            if (!adb.empty() && !serial.empty() && !package.empty()) {
+                auto pid = capture_command(adb_prefix(adb, serial) + " shell pidof " + quote(fs::path(package)));
+                if (!pid.empty())
+                    snapshot = capture_command(adb_prefix(adb, serial) + " logcat -d --pid=" + pid + " -v time -t 250");
+                else
+                    snapshot = "App is not running.";
+            } else {
+                snapshot = adb.empty() ? "ADB not found." : (serial.empty() ? "No device selected." : "Enter an Android package name.");
+            }
+            {
+                std::lock_guard lock(g.adb_mutex);
+                g.adb_logcat = std::move(snapshot);
+            }
+            for (int i = 0; i < 10 && !g.adb_logcat_stop; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        g.adb_logcat_running = false;
+    }).detach();
+}
+
+static void stop_adb_logcat() {
+    g.adb_logcat_stop = true;
+}
+
 static ProjectGitState inspect_project_git_state(const fs::path& project) {
     ProjectGitState state;
     if (project.empty()) return state;
@@ -859,6 +1059,13 @@ static void select_project(fs::path project) {
     remember_project(project);
     match_project_engine(project);
     inspect_project();
+    {
+        std::lock_guard lock(g.adb_mutex);
+        g.adb_package = detect_android_package();
+        g.adb_status = "Not checked";
+        g.adb_logcat.clear();
+    }
+    refresh_adb_devices_async();
     g.git_refresh_requested = true;
     log_line("[SYSTEM] Project: " + project.string());
     save_settings();
@@ -2667,16 +2874,8 @@ static void draw_project_ui() {
             "Launch the staged or deployed build after packaging."
         };
         ImGui::TextUnformatted("Build Pipeline");
-        for (size_t i = 0; i < 6; ++i) {
+        for (size_t i = 0; i < g.operations.size(); ++i) {
             if (i) ImGui::SameLine();
-            auto id = std::string(names[i]) + "##package_operation_" + std::to_string(i);
-            ImGui::Checkbox(id.c_str(), &g.operations[i]);
-            tooltip(help[i]);
-        }
-        ImGui::Spacing();
-        ImGui::SeparatorText("Device Operations");
-        for (size_t i = 6; i < g.operations.size(); ++i) {
-            if (i > 6) ImGui::SameLine();
             auto id = std::string(names[i]) + "##package_operation_" + std::to_string(i);
             ImGui::Checkbox(id.c_str(), &g.operations[i]);
             tooltip(help[i]);
@@ -2706,6 +2905,107 @@ static void draw_project_ui() {
     if (package_preview.empty()) ImGui::EndDisabled();
     command_preview(package_preview, "##package_preview");
     tooltip("Command that will be executed with the current package settings.");
+
+    if (g.package_platform == 2) {
+        ImGui::SeparatorText("ADB Device");
+        auto adb = adb_executable();
+        std::vector<std::string> devices;
+        std::string serial, package, status, logcat;
+        {
+            std::lock_guard lock(g.adb_mutex);
+            devices = g.adb_devices;
+            serial = g.adb_serial;
+            package = g.adb_package;
+            status = g.adb_status;
+            logcat = g.adb_logcat;
+        }
+
+        if (adb.empty()) {
+            ImGui::TextDisabled("ADB not found. Configure Android SDK / platform-tools in Settings.");
+        } else {
+            ImGui::SetNextItemWidth(260.0f);
+            const char* device_label = serial.empty() ? "No device" : serial.c_str();
+            if (ImGui::BeginCombo("Device", device_label)) {
+                for (const auto& device : devices) {
+                    bool selected = device == serial;
+                    if (ImGui::Selectable(device.c_str(), selected)) {
+                        std::lock_guard lock(g.adb_mutex);
+                        g.adb_serial = device;
+                        g.adb_status = "Not checked";
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            if (g.adb_refresh_running) ImGui::BeginDisabled();
+            if (ImGui::Button("Refresh Devices")) refresh_adb_devices_async();
+            if (g.adb_refresh_running) ImGui::EndDisabled();
+
+            std::array<char, 512> package_buffer{};
+            std::snprintf(package_buffer.data(), package_buffer.size(), "%s", package.c_str());
+            ImGui::SetNextItemWidth(420.0f);
+            if (ImGui::InputText("Package", package_buffer.data(), package_buffer.size())) {
+                std::lock_guard lock(g.adb_mutex);
+                g.adb_package = package_buffer.data();
+                g.adb_status = "Not checked";
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Detect##adb_package")) {
+                std::lock_guard lock(g.adb_mutex);
+                g.adb_package = detect_android_package();
+                g.adb_status = "Not checked";
+            }
+
+            ImGui::TextDisabled("Status: %s", status.c_str());
+            bool adb_ready = !serial.empty() && !package.empty();
+            if (!adb_ready || g.adb_action_running) ImGui::BeginDisabled();
+            if (ImGui::Button("Check Running")) refresh_adb_status_async();
+            ImGui::SameLine();
+            if (ImGui::Button("Start App"))
+                run_adb_action("shell monkey -p " + quote(fs::path(package)) + " -c android.intent.category.LAUNCHER 1", "Start App");
+            ImGui::SameLine();
+            if (ImGui::Button("Stop App"))
+                run_adb_action("shell am force-stop " + quote(fs::path(package)), "Stop App");
+            ImGui::SameLine();
+            if (ImGui::Button("Uninstall"))
+                run_adb_action("uninstall " + quote(fs::path(package)), "Uninstall");
+            if (!adb_ready || g.adb_action_running) ImGui::EndDisabled();
+
+            auto apk = find_android_apk();
+            ImGui::SameLine();
+            if (serial.empty() || apk.empty() || g.adb_action_running) ImGui::BeginDisabled();
+            if (ImGui::Button("Install Latest APK"))
+                run_adb_action("install -r " + quote(apk), "Install " + apk.filename().string());
+            if (serial.empty() || apk.empty() || g.adb_action_running) ImGui::EndDisabled();
+            if (!apk.empty()) {
+                ImGui::TextDisabled("APK: %s", apk.string().c_str());
+            } else {
+                ImGui::TextDisabled("APK: no .apk found in the current Android output or Binaries/Android.");
+            }
+
+            ImGui::SeparatorText("App Logcat");
+            if (!g.adb_logcat_running) {
+                if (!adb_ready) ImGui::BeginDisabled();
+                if (ImGui::Button("Start Watching")) start_adb_logcat();
+                if (!adb_ready) ImGui::EndDisabled();
+            } else {
+                if (ImGui::Button("Stop Watching")) stop_adb_logcat();
+                ImGui::SameLine();
+                ImGui::TextDisabled("Watching %s", package.c_str());
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear Logcat")) {
+                std::lock_guard lock(g.adb_mutex);
+                g.adb_logcat.clear();
+            }
+
+            std::vector<char> logcat_buffer(logcat.begin(), logcat.end());
+            logcat_buffer.push_back('\0');
+            ImGui::InputTextMultiline("##adb_logcat", logcat_buffer.data(), logcat_buffer.size(),
+                                      ImVec2(-1, 180), ImGuiInputTextFlags_ReadOnly);
+        }
+    }
 
     ImGui::SeparatorText("Process Status");
     ImGui::TextColored(g.process_running ? ImVec4(0.90f, 0.22f, 0.20f, 1.0f) : ImVec4(0.18f, 0.78f, 0.30f, 1.0f),
@@ -2986,6 +3286,11 @@ int main(int, char**) {
     discover_engines();
     if (!g.project.empty()) match_project_engine(g.project);
     inspect_project();
+    {
+        std::lock_guard lock(g.adb_mutex);
+        g.adb_package = detect_android_package();
+    }
+    refresh_adb_devices_async();
 #ifdef _WIN32
     if (install_tray_icon()) log_line("[SYSTEM] Tray icon ready. Closing the main window hides UPH to the tray.");
 #endif
@@ -3014,7 +3319,8 @@ int main(int, char**) {
 #endif
             }
         };
-        int idle_wait_ms = (g.process_running || g.catalog_running || g.git_refresh_running) ? 33 : 100;
+        int idle_wait_ms = (g.process_running || g.catalog_running || g.git_refresh_running ||
+                            g.adb_refresh_running || g.adb_action_running || g.adb_logcat_running) ? 33 : 100;
         if (SDL_WaitEventTimeout(&event, idle_wait_ms)) {
             handle_event(event);
             while (SDL_PollEvent(&event)) handle_event(event);
@@ -3065,6 +3371,7 @@ int main(int, char**) {
         if (frame_elapsed < minimum_frame_time)
             SDL_Delay(static_cast<Uint32>((minimum_frame_time - frame_elapsed).count()));
     }
+    stop_adb_logcat();
     remove_tray_icon();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
