@@ -4605,8 +4605,7 @@ static void draw_project_ui() {
     tooltip("Command that will be executed with the current package settings.");
     ImGui::Spacing();
 
-    if (g.package_platform == 2) {
-        ImGui::SeparatorText("Android / ADB");
+    ImGui::SeparatorText("Android / ADB");
         auto adb = adb_executable();
         std::vector<std::string> devices;
         std::string serial, package, status, logcat, device_info, app_version;
@@ -4824,7 +4823,6 @@ static void draw_project_ui() {
             }
             ImGui::EndTabBar();
         }
-    }
 
     ImGui::SeparatorText("Process Status");
     ImGui::TextColored(g.process_running ? ImVec4(0.90f, 0.22f, 0.20f, 1.0f) : ImVec4(0.18f, 0.78f, 0.30f, 1.0f),
