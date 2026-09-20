@@ -644,14 +644,6 @@ static void inspect_tooling() {
         if (auto override = g.tool_overrides.find(key); override != g.tool_overrides.end() && !override->second.empty()) path = override->second;
         g.tools.push_back({std::move(group), std::move(name), path, !path.empty() && fs::exists(path)});
     };
-    auto add_with_status = [](std::string group, std::string name, fs::path path, bool ready) {
-        auto key = tool_key(group, name);
-        if (auto override = g.tool_overrides.find(key); override != g.tool_overrides.end() && !override->second.empty()) {
-            path = override->second;
-            ready = fs::exists(path);
-        }
-        g.tools.push_back({std::move(group), std::move(name), std::move(path), ready});
-    };
     add("Windows", "Windows command processor", find_on_path("cmd.exe"));
     add("Windows", "Unreal build script", g.engine / "Engine/Build/BatchFiles/Build.bat");
     add("Windows", "Unreal AutomationTool", g.engine / "Engine/Build/BatchFiles/RunUAT.bat");
@@ -3035,8 +3027,7 @@ static void request_favorite_remote_branches(const std::string& url) {
 }
 
 static std::string add_plugin_submodule_command(const fs::path& root, const fs::path& relative,
-                                                const std::string& url, const std::string& folder_name,
-                                                const std::string& branch = {}) {
+                                                const std::string& url, const std::string& branch = {}) {
     auto target = root / relative;
     std::string command = "git -C " + quote(root) + " submodule add ";
     if (!branch.empty()) command += "-b " + quote(fs::path(branch)) + ' ';
@@ -4184,7 +4175,7 @@ static void draw_favorite_plugins() {
                 if (submodule_exists) {
                     remove_plugin_submodule(root, submodule_path, plugin.name);
                 } else {
-                    run_command(add_plugin_submodule_command(root, submodule_path, plugin.url, plugin.name, plugin.branch),
+                    run_command(add_plugin_submodule_command(root, submodule_path, plugin.url, plugin.branch),
                                 "Add Submodule " + plugin.name, true);
                 }
             }
