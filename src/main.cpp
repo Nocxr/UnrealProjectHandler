@@ -99,8 +99,6 @@ struct AppState {
     int compile_config = 0;
     int package_config = 0;
     int package_platform = 0;
-    int unrealsharp_target = 0;
-    bool unrealsharp = false;
     bool clean_output = false;
     bool project_has_cpp_module = false;
     bool auto_scroll = true;
@@ -358,7 +356,6 @@ static void ensure_default_tool_catalog() {
     item("Android", "Android SDK", "Android command line tools", "Install Android Studio command line tools or run Unreal SetupAndroid.", "winget install Google.AndroidStudio");
     item("Android", "Java runtime", "JDK 21 recommended", "Install Temurin JDK 21.", "winget install EclipseAdoptium.Temurin.21.JDK");
     item("iOS", "OpenSSH client", "Windows OpenSSH", "Install OpenSSH client.", "winget install Microsoft.OpenSSH.Beta");
-    item("UnrealSharp Windows", "UnrealSharp plugin", "Project plugin", "Install or repair UnrealSharp in your project's Plugins folder.", "", false);
     out << "    ]";
     for (const char* version : {"5.4", "5.5", "5.6", "5.7", "5.8"}) {
         out << ",\n    \"" << version << "\": [\n";
@@ -462,8 +459,6 @@ static void save_settings() {
     out << "compile_config=" << g.compile_config << '\n';
     out << "package_config=" << g.package_config << '\n';
     out << "package_platform=" << g.package_platform << '\n';
-    out << "unrealsharp_target=" << g.unrealsharp_target << '\n';
-    out << "unrealsharp=" << g.unrealsharp << '\n';
     out << "clean_output=" << g.clean_output << '\n';
     out << "clear_on_run=" << g.clear_on_run << '\n';
     out << "hotkey_global_toggle=" << g.hotkey_global_toggle << '\n';
@@ -497,8 +492,6 @@ static void load_settings() {
             else if (key == "compile_config") g.compile_config = std::stoi(value);
             else if (key == "package_config") g.package_config = std::stoi(value);
             else if (key == "package_platform") g.package_platform = std::stoi(value);
-            else if (key == "unrealsharp_target") g.unrealsharp_target = std::stoi(value);
-            else if (key == "unrealsharp") g.unrealsharp = std::stoi(value) != 0;
             else if (key == "clean_output") g.clean_output = std::stoi(value) != 0;
             else if (key == "clear_on_run") g.clear_on_run = std::stoi(value) != 0;
             else if (key == "hotkey_global_toggle") g.hotkey_global_toggle = value;
@@ -724,35 +717,6 @@ static void inspect_tooling() {
         command_path("xcrun --find metal 2>/dev/null")
 #endif
     );
-    auto plugin = first_existing({g.project.parent_path() / "Plugins/UnrealSharp", g.project.parent_path() / "Plugins/unrealsharp"});
-    if (plugin.empty()) plugin = g.project.parent_path() / "Plugins/UnrealSharp";
-    auto dotnet = find_on_path(
-#ifdef _WIN32
-        "dotnet.exe"
-#else
-        "dotnet"
-#endif
-    );
-    auto mapping = plugin / "Build/Scripts/Utilities/DotNetSdkUtilities.cs";
-    auto mapping_text = read_text(mapping);
-    auto unrealsharp_package = plugin / "Build/Scripts/BuildCommands/PackageProject.cs";
-    auto unrealsharp_package_text = read_text(unrealsharp_package);
-    auto add_unrealsharp = [&](const std::string& group, const std::string& token, bool package_mapping) {
-        add(group, "UnrealSharp plugin", plugin / "UnrealSharp.uplugin");
-        add(group, "Automation scripts", plugin / "Build/Scripts");
-        add(group, "Required .NET SDK manifest", plugin / "Managed/global.json");
-        add(group, "Managed binaries", plugin / "Binaries/Managed/net10.0");
-        add(group, ".NET host", dotnet);
-        const auto& source = package_mapping ? unrealsharp_package_text : mapping_text;
-        const auto& source_path = package_mapping ? unrealsharp_package : mapping;
-        add_with_status(group, token + (package_mapping ? " PackageProject mapping" : " .NET publish mapping"), source_path,
-                        source.find("UnrealTargetPlatform." + token) != std::string::npos);
-    };
-    add_unrealsharp("UnrealSharp Windows", "Win64", false);
-    add_unrealsharp("UnrealSharp Mac", "Mac", false);
-    add_unrealsharp("UnrealSharp iOS", "IOS", false);
-    add_unrealsharp("UnrealSharp Android", "Android", true);
-    add_unrealsharp("UnrealSharp XROS", "VisionOS", true);
 }
 
 static void discover_engines() {
@@ -1641,15 +1605,6 @@ static fs::path package_output() {
     return default_package_output();
 }
 
-static fs::path unrealsharp_scripts() {
-    if (g.project.empty()) return {};
-    for (const auto& name : {"UnrealSharp", "unrealsharp"}) {
-        auto candidate = g.project.parent_path() / "Plugins" / name / "Build/Scripts";
-        if (fs::exists(candidate)) return candidate;
-    }
-    return g.project.parent_path() / "Plugins/UnrealSharp/Build/Scripts";
-}
-
 static std::string compile_command(bool clean = false) {
     if (g.project.empty() || g.engine.empty() || g.targets.empty()) return {};
     std::ostringstream command;
@@ -1682,23 +1637,6 @@ static std::string package_command() {
 #endif
         return c.str();
     };
-    if (g.unrealsharp) {
-        std::vector<std::string> types;
-        for (const auto& target : g.targets)
-            if ((target.type == "Game" || target.type == "Client" || target.type == "Server") &&
-                std::find(types.begin(), types.end(), target.type) == types.end()) types.push_back(target.type);
-        if (types.empty()) return {};
-        g.unrealsharp_target = std::min<int>(g.unrealsharp_target, types.size() - 1);
-        std::ostringstream command;
-        command << uat_launch() << " PackageProject -Verbose -ScriptDir=" << quote(unrealsharp_scripts())
-                << " -Project=" << quote(g.project)
-                << " -ArchiveDirectory=" << quote(package_output())
-                << " -UETargetType=" << types[g.unrealsharp_target]
-                << " -UEBuildConfig=" << g.configs[g.package_config];
-        if (g.package_platform != 0) command << " -TargetPlatform=" << uat_platforms[g.package_platform];
-        if (g.package_platform >= 2) command << " -TargetArchitecture=Arm64";
-        return command.str();
-    }
     auto build_cook = [&] {
         std::ostringstream c;
         c << uat_launch() << " BuildCookRun -Verbose -project=" << quote(g.project) << " -noP4 -platform=" << uat_platforms[g.package_platform]
@@ -2153,10 +2091,7 @@ static bool tooling_group_ready(const std::string& group) {
 
 static bool package_platform_ready(int platform) {
     static const char* groups[] = {"Windows", "macOS", "Android", "iOS", "VisionOS"};
-    static const char* unrealsharp_groups[] = {"UnrealSharp Windows", "UnrealSharp Mac", "UnrealSharp Android", "UnrealSharp iOS", "UnrealSharp XROS"};
-    bool ready = tooling_group_ready(groups[platform]);
-    if (g.unrealsharp) ready = ready && tooling_group_ready(unrealsharp_groups[platform]);
-    return ready;
+    return tooling_group_ready(groups[platform]);
 }
 
 
@@ -2248,8 +2183,8 @@ static bool tray_can_launch_project() {
 }
 
 static bool tray_can_package() {
-    return fs::is_regular_file(g.project) && fs::exists(run_uat()) && package_platform_ready(g.package_platform) &&
-           !g.process_running && (!g.unrealsharp || fs::exists(unrealsharp_scripts()));
+    return fs::is_regular_file(g.project) && fs::exists(run_uat()) &&
+           package_platform_ready(g.package_platform) && !g.process_running;
 }
 
 static bool tray_can_launch_editor() {
@@ -2704,44 +2639,20 @@ static void remove_tray_icon() {}
 static void draw_tooling_ui() {
     if (ImGui::Button("Refresh Tooling")) inspect_tooling();
     if (ImGui::BeginTabBar("##tooling_tabs")) {
-        for (const char* group : {"Windows", "macOS", "Linux", "iOS", "VisionOS", "Android", "UnrealSharp"}) {
+        for (const char* group : {"Windows", "macOS", "Linux", "iOS", "VisionOS", "Android"}) {
             int found = 0, total = 0;
             for (const auto& tool : g.tools) {
-                bool belongs = std::string(group) == "UnrealSharp" ? tool.group.rfind("UnrealSharp ", 0) == 0 : tool.group == group;
-                if (belongs) { ++total; if (tool.found) ++found; }
+                if (tool.group == group) { ++total; if (tool.found) ++found; }
             }
             auto label = std::string(group) + " " + std::to_string(found) + "/" + std::to_string(total);
             push_tool_tab_colors(found, total);
             if (ImGui::BeginTabItem(label.c_str())) {
-                auto draw_rows = [](const std::string& selected_group) {
-                    for (const auto& tool : g.tools) if (tool.group == selected_group) {
-                        auto color = tool.found ? ImVec4(0.18f, 0.78f, 0.30f, 1.0f) : ImVec4(0.90f, 0.22f, 0.20f, 1.0f);
-                        ImGui::TextColored(color, "%-7s", tool.found ? "OK" : "MISSING");
-                        ImGui::SameLine();
-                        ImGui::TextUnformatted(tool.name.c_str());
-                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tool.path.empty() ? "Not found" : tool.path.string().c_str());
-                    }
-                };
-                if (std::string(group) == "UnrealSharp") {
-                    if (ImGui::BeginTabBar("##unrealsharp_platform_tabs")) {
-                        for (const auto& subtab : std::array<std::pair<const char*, const char*>, 5>{{
-                            {"Windows", "UnrealSharp Windows"}, {"Mac", "UnrealSharp Mac"},
-                            {"iOS", "UnrealSharp iOS"}, {"Android", "UnrealSharp Android"},
-                            {"XROS", "UnrealSharp XROS"}}}) {
-                            int sub_found = 0, sub_total = 0;
-                            for (const auto& tool : g.tools) if (tool.group == subtab.second) { ++sub_total; if (tool.found) ++sub_found; }
-                            auto sub_label = std::string(subtab.first) + " " + std::to_string(sub_found) + "/" + std::to_string(sub_total);
-                            push_tool_tab_colors(sub_found, sub_total);
-                            if (ImGui::BeginTabItem(sub_label.c_str())) {
-                                draw_rows(subtab.second);
-                                ImGui::EndTabItem();
-                            }
-                            ImGui::PopStyleColor(4);
-                        }
-                        ImGui::EndTabBar();
-                    }
-                } else {
-                    draw_rows(group);
+                for (const auto& tool : g.tools) if (tool.group == group) {
+                    auto color = tool.found ? ImVec4(0.18f, 0.78f, 0.30f, 1.0f) : ImVec4(0.90f, 0.22f, 0.20f, 1.0f);
+                    ImGui::TextColored(color, "%-7s", tool.found ? "OK" : "MISSING");
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(tool.name.c_str());
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tool.path.empty() ? "Not found" : tool.path.string().c_str());
                 }
                 ImGui::EndTabItem();
             }
@@ -2804,16 +2715,14 @@ static bool tool_override_uses_folder(const ToolRow& tool) {
     return name.find("SDK") != std::string::npos ||
            name.find("platform support") != std::string::npos ||
            name.find("Automation scripts") != std::string::npos ||
-           name.find("Managed binaries") != std::string::npos ||
-           name.find("UnrealSharp plugin") != std::string::npos;
+           name.find("Managed binaries") != std::string::npos;
 }
 
 static void draw_settings_summary() {
     auto group_status = [](const std::string& group) {
         int found = 0, total = 0;
         for (const auto& tool : g.tools) {
-            bool belongs = group == "UnrealSharp" ? tool.group.rfind("UnrealSharp ", 0) == 0 : tool.group == group;
-            if (belongs) { ++total; if (tool.found) ++found; }
+            if (tool.group == group) { ++total; if (tool.found) ++found; }
         }
         return std::pair<int,int>{found,total};
     };
@@ -2826,15 +2735,12 @@ static void draw_settings_summary() {
     bool engine_ok = !g.engine.empty() && fs::exists(editor_path());
     auto windows = group_status("Windows");
     auto android = group_status("Android");
-    auto unrealsharp = group_status("UnrealSharp");
 
     show("Engine", engine_ok);
     ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
     show("Windows", windows.second > 0 && windows.first == windows.second);
     ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
     show("Android", android.second > 0 && android.first == android.second);
-    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
-    show("UnrealSharp", unrealsharp.second > 0 && unrealsharp.first == unrealsharp.second);
 }
 
 static void draw_hotkeys_settings() {
@@ -3136,16 +3042,6 @@ static std::string add_plugin_submodule_command(const fs::path& root, const fs::
     if (!branch.empty()) command += "-b " + quote(fs::path(branch)) + ' ';
     command += quote(fs::path(url)) + ' ' + quote(relative) +
                           " && git -C " + quote(target) + " submodule update --init --recursive";
-    auto identity = folder_name + " " + url;
-    std::transform(identity.begin(), identity.end(), identity.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-    if (identity.find("unrealsharp") != std::string::npos) {
-        auto managed = target / "Managed";
-#ifdef _WIN32
-        command += " && cd /D " + quote(managed) + " && dotnet restore " + quote(fs::path("UnrealSharp/UnrealSharp.sln"));
-#else
-        command += " && cd " + quote(managed) + " && dotnet restore " + quote(fs::path("UnrealSharp/UnrealSharp.sln"));
-#endif
-    }
     return command;
 }
 
@@ -3507,76 +3403,6 @@ static bool replace_json_string_value(std::string& text, const std::string& key,
     return true;
 }
 
-static bool build_and_install_unrealsharp_managed(const fs::path& plugin_dir, const std::string& ue_config) {
-    const auto solution = plugin_dir / "Managed" / "UnrealSharp" / "UnrealSharp.sln";
-    if (!fs::is_regular_file(solution)) return true; // Not an UnrealSharp-style managed plugin.
-
-    log_line("[SYSTEM] Building UnrealSharp managed runtime and tooling assemblies...");
-
-    std::ostringstream command;
-#ifdef _WIN32
-    command << "set DOTNET_CLI_USE_MSBUILD_SERVER=0&& set MSBUILDUSESERVER=0&& dotnet build "
-            << quote(solution) << " -c Release -p:UETargetType=Editor -p:UEBuildConfig=" << ue_config;
-#else
-    command << "DOTNET_CLI_USE_MSBUILD_SERVER=0 MSBUILDUSESERVER=0 dotnet build "
-            << quote(solution) << " -c Release -p:UETargetType=Editor -p:UEBuildConfig=" << ue_config;
-#endif
-
-#ifdef _WIN32
-    auto wrapped = "cmd /S /C \"" + command.str() + " 2>&1\"";
-#else
-    auto wrapped = command.str() + " 2>&1";
-#endif
-    FILE* pipe = popen(wrapped.c_str(), "r");
-    if (!pipe) {
-        log_line("[ERROR] Could not start UnrealSharp managed build.");
-        return false;
-    }
-
-    char buffer[4096];
-    while (fgets(buffer, sizeof(buffer), pipe)) {
-        std::string line(buffer);
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
-        if (!line.empty()) log_line("[MANAGED] " + line);
-    }
-    const int status = pclose(pipe);
-    if (status != 0) {
-        log_line("[ERROR] UnrealSharp managed solution build failed.");
-        return false;
-    }
-
-    // UnrealSharp's Managed/Directory.Build.props redirects solution outputs directly
-    // into the plugin's Binaries/Managed/<TFM> folders. Do not try to harvest
-    // project-local bin/Release folders; verify the actual install location instead.
-    const auto install_root = plugin_dir / "Binaries" / "Managed";
-    const std::vector<fs::path> required = {
-        install_root / "net10.0" / "UnrealSharp.dll",
-        install_root / "net10.0" / "UnrealSharp.Binds.dll",
-        install_root / "net10.0" / "UnrealSharp.Core.dll",
-        install_root / "net10.0" / "UnrealSharp.Log.dll",
-        install_root / "net10.0" / "UnrealSharp.Plugins.dll",
-        install_root / "netstandard2.0" / "UnrealSharp.GlueGenerator.dll",
-        install_root / "netstandard2.0" / "UnrealSharp.Analyzers.dll",
-        install_root / "netstandard2.0" / "UnrealSharp.CodeFixer.dll",
-        install_root / "netstandard2.0" / "UnrealSharp.SourceGenerators.dll",
-        install_root / "netstandard2.0" / "Newtonsoft.Json.dll"
-    };
-
-    size_t present = 0;
-    for (const auto& required_file : required) {
-        if (!fs::is_regular_file(required_file)) {
-            log_line("[ERROR] Required UnrealSharp managed assembly is still missing: " + required_file.string());
-            return false;
-        }
-        ++present;
-    }
-
-    log_line("[SYSTEM] Verified " + std::to_string(present) +
-             " UnrealSharp managed outputs in " + install_root.string());
-    return true;
-}
-
-
 static bool finalize_compiled_plugin_manifest(const fs::path& plugin_dir,
                                               const fs::path& host_root,
                                               const std::vector<std::string>& source_modules) {
@@ -3597,8 +3423,8 @@ static bool finalize_compiled_plugin_manifest(const fs::path& plugin_dir,
         return false;
     }
 
-    // UBT may emit helper modules that are not declared in the .uplugin (for example
-    // UnrealSharpUtilities). Windows still needs those imported DLLs beside the plugin DLLs.
+    // UBT may emit helper modules that are not declared in the .uplugin. Windows still
+    // needs those imported DLLs beside the plugin DLLs.
     for (const auto& module : source_modules) {
 #ifdef _WIN32
         const auto filename = "UnrealEditor-" + module + ".dll";
@@ -3723,11 +3549,9 @@ static void compile_plugin_module(const fs::path& dir) {
 
     std::ostringstream command;
 #ifdef _WIN32
-    command << "set DOTNET_CLI_USE_MSBUILD_SERVER=0&& set MSBUILDUSESERVER=0&& "
-            << quote(build_script()) << ' ' << editor_target << " Win64 ";
+    command << quote(build_script()) << ' ' << editor_target << " Win64 ";
 #else
-    command << "DOTNET_CLI_USE_MSBUILD_SERVER=0 MSBUILDUSESERVER=0 "
-            << "bash " << quote(build_script()) << ' ' << editor_target << " Mac ";
+    command << "bash " << quote(build_script()) << ' ' << editor_target << " Mac ";
 #endif
     command << g.configs[g.compile_config]
             << " -Project=" << quote(host_project)
@@ -3749,11 +3573,6 @@ static void compile_plugin_module(const fs::path& dir) {
 
     auto prepare = [host_root, host_plugins, host_plugin_dir, host_project, source_dir, config_dir, target_file,
                     dir, descriptor, dependencies, editor_target]() -> bool {
-#ifdef _WIN32
-        std::system("dotnet build-server shutdown >nul 2>&1");
-#else
-        std::system("dotnet build-server shutdown >/dev/null 2>&1");
-#endif
         std::error_code ec;
         fs::create_directories(host_plugins, ec);
         if (ec) { log_line("[ERROR] Could not create plugin compile host: " + host_root.string()); return false; }
@@ -3818,15 +3637,10 @@ static void compile_plugin_module(const fs::path& dir) {
         return true;
     };
 
-    const std::string ue_config = g.configs[g.compile_config];
-    auto finish = [dir, host_root, source_modules, ue_config](bool success) {
+    auto finish = [dir, host_root, source_modules](bool success) {
         if (!success) return;
-        if (!finalize_compiled_plugin_manifest(dir, host_root, source_modules)) {
+        if (!finalize_compiled_plugin_manifest(dir, host_root, source_modules))
             log_line("[ERROR] Plugin compiled, but its UBT-generated module manifest could not be finalized.");
-            return;
-        }
-        if (!build_and_install_unrealsharp_managed(dir, ue_config))
-            log_line("[ERROR] Native plugin compile succeeded, but UnrealSharp managed binaries could not be prepared.");
     };
 
     run_command_with_prep(command.str(), "Compile Plugin " + descriptor.stem().string(),
@@ -4719,8 +4533,6 @@ static void draw_project_ui() {
 
     ImGui::SeparatorText("Package");
     ImGui::Spacing();
-    ImGui::Checkbox("Use UnrealSharp PackageProject", &g.unrealsharp);
-    tooltip("Use UnrealSharp's PackageProject automation command instead of Unreal BuildCookRun.");
     bool selected_platform_ready = package_platform_ready(g.package_platform);
     if (!selected_platform_ready) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.38f, 0.32f, 1.0f));
     if (ImGui::BeginCombo("Platform", g.platforms[g.package_platform])) {
@@ -4744,17 +4556,6 @@ static void draw_project_ui() {
     ImGui::Combo("Configuration##package", &g.package_config, g.configs.data(), (int)g.configs.size());
     tooltip("Unreal build configuration used for packaging.");
     ImGui::Spacing();
-    if (g.unrealsharp) {
-        std::vector<std::string> target_types;
-        for (const auto& target : g.targets)
-            if ((target.type == "Game" || target.type == "Client" || target.type == "Server") &&
-                std::find(target_types.begin(), target_types.end(), target.type) == target_types.end()) target_types.push_back(target.type);
-        std::vector<const char*> labels;
-        for (const auto& type : target_types) labels.push_back(type.c_str());
-        if (labels.empty()) ImGui::TextDisabled("No packageable project target types found");
-        else ImGui::Combo("Target Type", &g.unrealsharp_target, labels.data(), (int)labels.size());
-        tooltip("Target type passed to UnrealSharp PackageProject.");
-    }
     auto output = package_output();
     ImGui::TextUnformatted("Output Directory");
     ImGui::SetNextItemWidth(-95.0f);
@@ -4768,30 +4569,27 @@ static void draw_project_ui() {
     ImGui::Checkbox("Clean Output Before Package", &g.clean_output);
     tooltip("Delete the previous package output before starting. Unreal's cook cache is not removed.");
     ImGui::Spacing();
-    if (!g.unrealsharp) {
-        static const char* names[] = {"Build", "Cook", "Stage", "Pak", "Package", "Archive", "Deploy", "Run"};
-        static const char* help[] = {
-            "Compile project code before continuing.",
-            "Convert Unreal assets into platform-specific runtime data.",
-            "Copy binaries, cooked assets, configuration, and dependencies into a staging directory.",
-            "Pack cooked content into Unreal .pak container files.",
-            "Create the distributable application or platform package.",
-            "Copy the packaged build into the selected output directory.",
-            "Install the packaged build onto a connected device.",
-            "Launch the staged or deployed build after packaging."
-        };
-        ImGui::SeparatorText("Build Pipeline");
-        for (size_t i = 0; i < g.operations.size(); ++i) {
-            if (i) ImGui::SameLine();
-            auto id = std::string(names[i]) + "##package_operation_" + std::to_string(i);
-            ImGui::Checkbox(id.c_str(), &g.operations[i]);
-            tooltip(help[i]);
-        }
-        ImGui::Spacing();
+    static const char* names[] = {"Build", "Cook", "Stage", "Pak", "Package", "Archive", "Deploy", "Run"};
+    static const char* help[] = {
+        "Compile project code before continuing.",
+        "Convert Unreal assets into platform-specific runtime data.",
+        "Copy binaries, cooked assets, configuration, and dependencies into a staging directory.",
+        "Pack cooked content into Unreal .pak container files.",
+        "Create the distributable application or platform package.",
+        "Copy the packaged build into the selected output directory.",
+        "Install the packaged build onto a connected device.",
+        "Launch the staged or deployed build after packaging."
+    };
+    ImGui::SeparatorText("Build Pipeline");
+    for (size_t i = 0; i < g.operations.size(); ++i) {
+        if (i) ImGui::SameLine();
+        auto id = std::string(names[i]) + "##package_operation_" + std::to_string(i);
+        ImGui::Checkbox(id.c_str(), &g.operations[i]);
+        tooltip(help[i]);
     }
+    ImGui::Spacing();
     bool can_package = fs::is_regular_file(g.project) && fs::exists(run_uat()) &&
-                       package_platform_ready(g.package_platform) && !g.process_running &&
-                       (!g.unrealsharp || fs::exists(unrealsharp_scripts()));
+                       package_platform_ready(g.package_platform) && !g.process_running;
     if (readiness_button("Package Project", can_package)) {
         if (g.clean_output) clean_output();
         auto command = package_command();
