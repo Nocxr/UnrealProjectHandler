@@ -171,7 +171,22 @@ static std::atomic<bool> g_package_after_output_pick{false};
 static constexpr const char* TOOL_CATALOG_TEMPLATE_URL =
     "https://raw.githubusercontent.com/Nocxr/UnrealProjectHandler/main/config/tool-catalog.json";
 
-static fs::path settings_path() {
+static fs::path app_config_dir() {
+#ifdef _WIN32
+    const char* base = std::getenv("APPDATA");
+    return fs::path(base ? base : ".") / "UnrealProjectHandler";
+#elif defined(__APPLE__)
+    const char* base = std::getenv("HOME");
+    return fs::path(base ? base : ".") / "Library" / "Application Support" / "UnrealProjectHandler";
+#else
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) return fs::path(xdg) / "UnrealProjectHandler";
+    const char* home = std::getenv("HOME");
+    return fs::path(home ? home : ".") / ".config" / "UnrealProjectHandler";
+#endif
+}
+
+static fs::path legacy_settings_path() {
 #ifdef _WIN32
     const char* base = std::getenv("APPDATA");
 #else
@@ -180,8 +195,43 @@ static fs::path settings_path() {
     return fs::path(base ? base : ".") / ".uph-native.ini";
 }
 
+static fs::path legacy_tool_catalog_path() {
+#ifdef _WIN32
+    const char* base = std::getenv("APPDATA");
+#else
+    const char* base = std::getenv("HOME");
+#endif
+    return fs::path(base ? base : ".") / ".uph-tools.json";
+}
+
+static void ensure_config_storage() {
+    const auto dir = app_config_dir();
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    const auto settings = dir / "settings.ini";
+    const auto legacy_settings = legacy_settings_path();
+    if (!fs::exists(settings, ec) && fs::is_regular_file(legacy_settings, ec)) {
+        ec.clear();
+        fs::copy_file(legacy_settings, settings, fs::copy_options::overwrite_existing, ec);
+    }
+
+    const auto catalog = dir / "tool-catalog.json";
+    const auto legacy_catalog = legacy_tool_catalog_path();
+    if (!fs::exists(catalog, ec) && fs::is_regular_file(legacy_catalog, ec)) {
+        ec.clear();
+        fs::copy_file(legacy_catalog, catalog, fs::copy_options::overwrite_existing, ec);
+    }
+}
+
+static fs::path settings_path() {
+    ensure_config_storage();
+    return app_config_dir() / "settings.ini";
+}
+
 static fs::path tool_catalog_path() {
-    return settings_path().parent_path() / ".uph-tools.json";
+    ensure_config_storage();
+    return app_config_dir() / "tool-catalog.json";
 }
 
 static fs::path bundled_tool_catalog_path() {
@@ -194,6 +244,8 @@ static std::string read_file_text(const fs::path& path) {
 }
 
 static bool write_file_text(const fs::path& path, const std::string& text) {
+    std::error_code ec;
+    if (!path.parent_path().empty()) fs::create_directories(path.parent_path(), ec);
     std::ofstream out(path);
     out << text;
     return (bool)out;
@@ -400,6 +452,7 @@ static void log_line(const std::string& text) {
 }
 
 static void save_settings() {
+    ensure_config_storage();
     std::ofstream out(settings_path());
     out << "project=" << g.project.string() << '\n';
     for (const auto& project : g.recent_projects) if (!project.empty()) out << "recent_project=" << project.string() << '\n';
