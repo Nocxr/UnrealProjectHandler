@@ -73,3 +73,24 @@ uph engine select
 ```
 
 Type to fuzzy-filter, use Up/Down to move, Enter to select, Esc to cancel, and Backspace to edit the filter. Supplying a selector still works normally, while an ambiguous selector such as `uph engine select 5.8` opens the picker pre-filtered to matching entries.
+
+
+### Project and engine registration
+
+Project and engine selection no longer starts the UPH desktop app just to change saved state. If UPH is already running, the CLI syncs through IPC; otherwise it updates the shared settings headlessly.
+
+```powershell
+uph project add
+uph project add H:\projects\unreal\Ulu\Ulu.uproject
+uph project remove
+uph project remove Ulu
+
+uph engine add
+uph engine add H:\unreal\UE_5.8
+uph engine remove
+uph engine remove UE_5.8
+```
+
+With no argument, `project add` first checks the current directory for a single `.uproject`; if none is found it opens a Windows `.uproject` file picker rooted at the current directory. `engine add` first checks whether the current directory is an Unreal Engine root; otherwise it opens a folder picker. Remove with no argument uses the built-in fuzzy picker.
+
+Removed discovered engines are persisted as hidden paths so launcher/registry discovery does not immediately add them back. Adding or selecting that engine again unhides it.
