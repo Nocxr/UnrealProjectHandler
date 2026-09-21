@@ -16,6 +16,8 @@
 #include <thread>
 #include <vector>
 
+#include "unreal_file_index.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
@@ -84,6 +86,10 @@ static fs::path settings_path() {
 }
 static fs::path runtime_status_path() {
     return settings_path().parent_path() / "runtime-status.ini";
+}
+
+static fs::path unreal_index_path() {
+    return settings_path().parent_path() / "unreal-files.idx";
 }
 
 static fs::path runtime_log_path() {
@@ -556,6 +562,13 @@ static fs::path resolve_project_selector(const std::string& selector) {
     consider(current_directory_project());
     consider(g.project);
     for (const auto& project : g.recent_projects) consider(project);
+
+    uph::UnrealFileIndex index;
+    if (index.load(unreal_index_path())) {
+        for (const auto& record : index.search(selector, true, false, 50))
+            consider(record.path);
+    }
+
     if (matches.empty()) return {};
 
     const auto first = normalized_path_key(matches.front());
@@ -793,6 +806,10 @@ static void print_help() {
         "  uph                         Start UPH, or foreground the running app\n"
         "  uph status                  Show saved settings and live app state\n"
         "  uph logs [--follow]         Show/follow UPH runtime logs\n"
+        "  uph find [query] [--projects|--plugins] [--limit N]\n"
+        "                              Search cached .uproject/.uplugin index\n"
+        "  uph index status|rebuild [root...]|clear|test\n"
+        "                              Manage the Unreal file index\n"
         "  uph stop                    Stop the current tracked UPH operation\n"
         "  uph rerun                   Repeat the last CLI build/package/deploy\n"
         "  uph deploy [project] [config]\n"
@@ -824,9 +841,192 @@ static std::vector<fs::path> selectable_projects() {
     add(current_directory_project());
     add(g.project);
     for (const auto& project : g.recent_projects) add(project);
+
+    uph::UnrealFileIndex index;
+    if (index.load(unreal_index_path())) {
+        for (const auto& record : index.records())
+            if (record.kind == uph::UnrealFileKind::Project) add(record.path);
+    }
+
     return projects;
 }
 
+
+static int command_unreal_index(int argc, char** argv) {
+    const std::string action = argc >= 3 ? lower_copy(argv[2]) : "status";
+    const auto cache = unreal_index_path();
+
+    if (action == "status") {
+        uph::UnrealFileIndex index;
+        if (!index.load(cache)) {
+            std::cout << "Unreal file index: not built\n"
+                      << "Cache: " << cache.string() << '\n';
+            return 1;
+        }
+
+        std::size_t projects = 0;
+        std::size_t plugins = 0;
+        for (const auto& record : index.records()) {
+            if (record.kind == uph::UnrealFileKind::Project) ++projects;
+            else ++plugins;
+        }
+
+        std::cout << "Unreal file index: ready\n"
+                  << "Cache:    " << cache.string() << '\n'
+                  << "Projects: " << projects << '\n'
+                  << "Plugins:  " << plugins << '\n'
+                  << "Total:    " << index.records().size() << '\n';
+        return 0;
+    }
+
+    if (action == "clear") {
+        std::error_code ec;
+        const bool removed = fs::remove(cache, ec);
+        if (ec) {
+            std::cerr << "UPH: failed to remove index: " << ec.message() << '\n';
+            return 2;
+        }
+        std::cout << (removed ? "Cleared Unreal file index.\n" : "Unreal file index was already empty.\n");
+        return 0;
+    }
+
+    if (action == "test") {
+        std::string error;
+        if (!uph::run_unreal_file_index_self_test(&error)) {
+            std::cerr << "UPH: index self-test failed: " << error << '\n';
+            return 2;
+        }
+        std::cout << "Unreal file index self-test passed.\n";
+        return 0;
+    }
+
+    if (action == "rebuild") {
+        std::vector<fs::path> roots;
+        for (int i = 3; i < argc; ++i)
+            roots.emplace_back(argv[i]);
+        if (roots.empty()) roots = uph::UnrealFileIndex::default_roots();
+
+        if (roots.empty()) {
+            std::cerr << "UPH: no index roots available. Supply one or more paths.\n";
+            return 2;
+        }
+
+        std::cout << "Indexing .uproject and .uplugin files";
+        if (roots.size() == 1) std::cout << " under " << roots.front().string();
+        else std::cout << " across " << roots.size() << " roots";
+        std::cout << "...\n";
+
+        uph::UnrealFileIndex index;
+        const auto stats = index.rebuild(roots);
+        if (!index.save(cache)) {
+            std::cerr << "UPH: scan completed but the index could not be saved to "
+                      << cache.string() << '\n';
+            return 2;
+        }
+
+        for (const auto& warning : stats.warnings)
+            std::cerr << "Warning: " << warning << '\n';
+
+        std::cout << "Indexed " << stats.records << " Unreal files in "
+                  << stats.elapsed_ms << " ms\n"
+                  << "  Projects: " << stats.projects << '\n'
+                  << "  Plugins:  " << stats.plugins << '\n'
+                  << "  NTFS MFT roots: " << stats.ntfs_mft_roots << '\n'
+                  << "  Directory-walk roots: " << stats.walked_roots << '\n'
+                  << "Cache: " << cache.string() << '\n';
+        return 0;
+    }
+
+    std::cerr << "Usage: uph index status|rebuild [root...]|clear|test\n";
+    return 2;
+}
+
+static int command_find(int argc, char** argv) {
+    bool include_projects = true;
+    bool include_plugins = true;
+    bool type_filter_set = false;
+    std::size_t limit = 50;
+    std::vector<std::string> query_parts;
+
+    for (int i = 2; i < argc; ++i) {
+        const std::string value = argv[i];
+        if (value == "--projects" || value == "--project") {
+            if (!type_filter_set) {
+                include_projects = false;
+                include_plugins = false;
+                type_filter_set = true;
+            }
+            include_projects = true;
+            continue;
+        }
+        if (value == "--plugins" || value == "--plugin") {
+            if (!type_filter_set) {
+                include_projects = false;
+                include_plugins = false;
+                type_filter_set = true;
+            }
+            include_plugins = true;
+            continue;
+        }
+        if (value == "--all") {
+            include_projects = true;
+            include_plugins = true;
+            type_filter_set = true;
+            continue;
+        }
+        if (value == "--limit" && i + 1 < argc) {
+            try {
+                limit = static_cast<std::size_t>(std::stoul(argv[++i]));
+            } catch (...) {
+                std::cerr << "UPH: invalid --limit value.\n";
+                return 2;
+            }
+            continue;
+        }
+        query_parts.push_back(value);
+    }
+
+    std::string query;
+    for (const auto& part : query_parts) {
+        if (!query.empty()) query += ' ';
+        query += part;
+    }
+
+    uph::UnrealFileIndex index;
+    if (!index.load(unreal_index_path())) {
+        std::cerr << "UPH: Unreal file index has not been built yet.\n"
+                  << "Run: uph index rebuild\n"
+                  << "Or target a drive/root: uph index rebuild H:\\\n";
+        return 2;
+    }
+
+    const auto matches = index.search(query, include_projects, include_plugins, limit);
+    if (matches.empty()) {
+        std::cout << "No matching Unreal projects or plugins.\n";
+        return 1;
+    }
+
+    if (query.empty()) {
+        std::vector<std::string> labels;
+        labels.reserve(matches.size());
+        for (const auto& record : matches)
+            labels.push_back(std::string(uph::unreal_file_kind_name(record.kind)) + "  " +
+                             record.path.stem().string() + "  " + record.path.string());
+        auto picked = interactive_picker("Find Unreal Project / Plugin", labels);
+        if (!picked) return 1;
+        const auto& record = matches[*picked];
+        std::cout << uph::unreal_file_kind_name(record.kind) << "  "
+                  << record.path.stem().string() << '\n'
+                  << record.path.string() << '\n';
+        return 0;
+    }
+
+    for (const auto& record : matches)
+        std::cout << uph::unreal_file_kind_name(record.kind) << "  "
+                  << record.path.stem().string() << "  "
+                  << record.path.string() << '\n';
+    return 0;
+}
 
 static int command_project(int argc, char** argv) {
     std::string action = argc >= 3 ? lower_copy(argv[2]) : "current";
@@ -1183,6 +1383,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (command == "find") return command_find(argc, argv);
+    if (command == "index") return command_unreal_index(argc, argv);
     if (command == "project") return command_project(argc, argv);
     if (command == "engine") return command_engine(argc, argv);
 
