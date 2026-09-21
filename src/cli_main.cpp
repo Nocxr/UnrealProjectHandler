@@ -28,6 +28,9 @@ static constexpr std::uintptr_t UPH_COPYDATA_OPEN = 0x55504804;
 static constexpr std::uintptr_t UPH_COPYDATA_RUN = 0x55504805;
 static constexpr std::uintptr_t UPH_COPYDATA_BUILD = 0x55504806;
 static constexpr std::uintptr_t UPH_COPYDATA_PACKAGE = 0x55504807;
+static constexpr std::uintptr_t UPH_COPYDATA_STOP = 0x55504808;
+static constexpr std::uintptr_t UPH_COPYDATA_RERUN = 0x55504809;
+static constexpr std::uintptr_t UPH_COPYDATA_DEPLOY = 0x5550480A;
 
 struct Engine {
     std::string label;
@@ -68,6 +71,59 @@ static fs::path settings_path() {
     return fs::path(home ? home : ".") / ".config" / "UnrealProjectHandler" / "settings.ini";
 #endif
 }
+static fs::path runtime_status_path() {
+    return settings_path().parent_path() / "runtime-status.ini";
+}
+
+static fs::path runtime_log_path() {
+    return settings_path().parent_path() / "runtime.log";
+}
+
+static std::map<std::string, std::string> read_key_values(const fs::path& path) {
+    std::map<std::string, std::string> values;
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        auto split = line.find('=');
+        if (split == std::string::npos) continue;
+        values[line.substr(0, split)] = line.substr(split + 1);
+    }
+    return values;
+}
+
+static void print_runtime_logs(bool follow) {
+    const auto path = runtime_log_path();
+    std::uintmax_t offset = 0;
+
+    auto print_new = [&]() {
+        std::error_code ec;
+        if (!fs::exists(path, ec)) return;
+        auto size = fs::file_size(path, ec);
+        if (ec) return;
+        if (size < offset) offset = 0;
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return;
+        in.seekg(static_cast<std::streamoff>(offset));
+        std::string line;
+        while (std::getline(in, line)) std::cout << line << '\n';
+        auto pos = in.tellg();
+        offset = pos < 0 ? size : static_cast<std::uintmax_t>(pos);
+        std::cout.flush();
+    };
+
+    print_new();
+    if (!follow) return;
+
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        print_new();
+#ifdef _WIN32
+        if (!find_running_uph_window()) break;
+#endif
+    }
+}
+
 
 static std::string normalized_path_key(const fs::path& path) {
     std::error_code ec;
@@ -390,7 +446,12 @@ static void print_help() {
         "UPH - Unreal Project Handler\n\n"
         "Usage:\n"
         "  uph                         Start UPH, or foreground the running app\n"
-        "  uph status\n"
+        "  uph status                  Show saved settings and live app state\n"
+        "  uph logs [--follow]         Show/follow UPH runtime logs\n"
+        "  uph stop                    Stop the current tracked UPH operation\n"
+        "  uph rerun                   Repeat the last CLI build/package/deploy\n"
+        "  uph deploy [project] [config]\n"
+        "                              Package Android, install, and launch\n"
         "  uph project list|current|select <name|path>\n"
         "  uph engine list|current|select <name|path>\n"
         "  uph editor\n"
@@ -531,12 +592,39 @@ int main(int argc, char** argv) {
     }
 
     if (command == "status") {
-        std::cout << "Project:  " << (g.project.empty() ? "None" : g.project.string()) << '\n';
-        std::cout << "Engine:   " << (g.engine.empty() ? "None" : engine_version(g.engine)) << '\n';
-        if (!g.engine.empty()) std::cout << "          " << g.engine.string() << '\n';
-        std::cout << "Compile:  " << CONFIGS[std::clamp(g.compile_config, 0, 3)] << '\n';
-        std::cout << "Package:  " << PLATFORMS[std::clamp(g.package_platform, 0, 4)]
+        std::cout << "Project:   " << (g.project.empty() ? "None" : g.project.string()) << '\n';
+        std::cout << "Engine:    " << (g.engine.empty() ? "None" : engine_version(g.engine)) << '\n';
+        if (!g.engine.empty()) std::cout << "           " << g.engine.string() << '\n';
+        std::cout << "Compile:   " << CONFIGS[std::clamp(g.compile_config, 0, 3)] << '\n';
+        std::cout << "Package:   " << PLATFORMS[std::clamp(g.package_platform, 0, 4)]
                   << " / " << CONFIGS[std::clamp(g.package_config, 0, 3)] << '\n';
+
+        auto runtime = read_key_values(runtime_status_path());
+#ifdef _WIN32
+        const bool app_running = find_running_uph_window() != nullptr;
+#else
+        const bool app_running = runtime["app_running"] == "1";
+#endif
+        std::cout << "App:       " << (app_running ? "Running" : "Not running") << '\n';
+        if (!runtime.empty()) {
+            const auto running = runtime["process_running"] == "1";
+            auto operation = runtime["operation"];
+            auto result = runtime["result"];
+            auto progress = runtime["progress"];
+            std::cout << "Operation: " << (running ? (operation.empty() ? "Running" : operation) : "Idle");
+            if (!result.empty() && result != "none") std::cout << " (" << result << ")";
+            std::cout << '\n';
+            if (!progress.empty()) std::cout << "Progress:  " << progress << '\n';
+            if (!runtime["device"].empty()) std::cout << "Device:    " << runtime["device"] << '\n';
+            if (!runtime["android_package"].empty()) std::cout << "Android:   " << runtime["android_package"] << '\n';
+            if (!runtime["adb_status"].empty()) std::cout << "ADB:       " << runtime["adb_status"] << '\n';
+        }
+        return 0;
+    }
+
+    if (command == "logs") {
+        bool follow = argc >= 3 && (std::string(argv[2]) == "--follow" || std::string(argv[2]) == "-f");
+        print_runtime_logs(follow);
         return 0;
     }
 
@@ -547,6 +635,24 @@ int main(int argc, char** argv) {
     if (!ensure_app_for_action()) {
         std::cerr << "UPH: could not start or connect to the desktop app.\n";
         return 2;
+    }
+
+    if (command == "stop") {
+        if (!send_uph_copydata(UPH_COPYDATA_STOP, "")) {
+            std::cerr << "UPH: no tracked operation is currently running.\n";
+            return 2;
+        }
+        std::cout << "Stop requested.\n";
+        return 0;
+    }
+
+    if (command == "rerun") {
+        if (!send_uph_copydata(UPH_COPYDATA_RERUN, "")) {
+            std::cerr << "UPH: nothing rerunnable is available, or UPH is busy.\n";
+            return 2;
+        }
+        std::cout << "Last UPH operation started again.\n";
+        return 0;
     }
 
     if (command == "editor") {
@@ -622,6 +728,65 @@ int main(int argc, char** argv) {
         std::cout << "Building " << project.stem().string()
                   << " (" << CONFIGS[config] << ")\n"
                   << "Build started in the running UPH app.\n";
+        return 0;
+    }
+
+    if (command == "deploy") {
+        fs::path project = current_directory_project();
+        if (project.empty()) project = g.project;
+        fs::path output;
+        int config = g.package_config;
+
+        for (int i = 2; i < argc; ++i) {
+            std::string value = argv[i];
+            if (value == "--project" && ++i < argc) {
+                project = resolve_project_selector(argv[i]);
+                continue;
+            }
+            if (value == "--config" && ++i < argc) {
+                config = config_index(argv[i]);
+                continue;
+            }
+            if (value == "--output" && ++i < argc) {
+                output = argv[i];
+                continue;
+            }
+
+            int parsed_config = config_index(value);
+            if (parsed_config >= 0) {
+                config = parsed_config;
+                continue;
+            }
+            auto parsed_project = resolve_project_selector(value);
+            if (!parsed_project.empty()) {
+                project = parsed_project;
+                continue;
+            }
+
+            std::cerr << "UPH: unknown deploy argument: " << value << '\n';
+            return 2;
+        }
+
+        if (project.empty() || config < 0) {
+            std::cerr << "UPH: invalid deploy project/configuration.\n";
+            return 2;
+        }
+        if (output.empty())
+            output = project.parent_path() / "Builds" / "Android" / CONFIGS[config];
+
+        std::ostringstream payload;
+        payload << "project=" << project.string() << '\n';
+        payload << "config=" << config << '\n';
+        payload << "output=" << output.string() << '\n';
+
+        if (!send_uph_copydata(UPH_COPYDATA_DEPLOY, payload.str())) {
+            std::cerr << "UPH: deploy was rejected (UPH may be busy, Android tooling may be incomplete, or no device is selected).\n";
+            return 2;
+        }
+
+        std::cout << "Deploying " << project.stem().string() << " for Android ("
+                  << CONFIGS[config] << ")\n"
+                  << "Package -> Install -> Launch started in UPH.\n";
         return 0;
     }
 
