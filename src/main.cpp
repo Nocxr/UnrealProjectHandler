@@ -1273,6 +1273,11 @@ static constexpr UINT ID_TRAY_PACKAGE_PLATFORM_BASE = 41300;
 static constexpr UINT ID_TRAY_PACKAGE_CONFIG_BASE = 41400;
 static constexpr ULONG_PTR UPH_COPYDATA_SELECT_ENGINE = 0x55504801;
 static constexpr ULONG_PTR UPH_COPYDATA_SELECT_PROJECT = 0x55504802;
+static constexpr ULONG_PTR UPH_COPYDATA_EDITOR = 0x55504803;
+static constexpr ULONG_PTR UPH_COPYDATA_OPEN = 0x55504804;
+static constexpr ULONG_PTR UPH_COPYDATA_RUN = 0x55504805;
+static constexpr ULONG_PTR UPH_COPYDATA_BUILD = 0x55504806;
+static constexpr ULONG_PTR UPH_COPYDATA_PACKAGE = 0x55504807;
 
 static HWND g_tray_hwnd = nullptr;
 static WNDPROC g_original_window_proc = nullptr;
@@ -1630,6 +1635,118 @@ static void show_tray_menu() {
     }
 }
 
+static std::map<std::string, std::string> parse_ipc_fields(const std::string& payload) {
+    std::map<std::string, std::string> fields;
+    std::istringstream stream(payload);
+    std::string line;
+    while (std::getline(stream, line)) {
+        auto split = line.find('=');
+        if (split == std::string::npos) continue;
+        fields[line.substr(0, split)] = line.substr(split + 1);
+    }
+    return fields;
+}
+
+static bool ipc_prepare_project(const std::map<std::string, std::string>& fields) {
+    auto found = fields.find("project");
+    if (found == fields.end() || found->second.empty()) return true;
+    fs::path project = found->second;
+    if (!fs::is_regular_file(project)) return false;
+    g.project = project;
+    g.plugin_scan_cache.clear();
+    remember_project(project);
+    match_project_engine(project);
+    inspect_project();
+    return true;
+}
+
+static bool ipc_launch_project(bool game, const std::map<std::string, std::string>& fields) {
+    if (g.process_running) return false;
+    const auto old_project = g.project;
+    const auto old_engine = g.engine;
+    const auto old_targets = g.targets;
+    const auto old_tools = g.tools;
+    if (!ipc_prepare_project(fields)) return false;
+    const bool ready = fs::is_regular_file(g.project) && fs::exists(editor_path());
+    if (ready) launch_editor(game);
+    g.project = old_project;
+    g.engine = old_engine;
+    g.targets = old_targets;
+    g.tools = old_tools;
+    return ready;
+}
+
+static bool ipc_build(const std::map<std::string, std::string>& fields) {
+    if (g.process_running) return false;
+    const auto old_project = g.project;
+    const auto old_engine = g.engine;
+    const auto old_targets = g.targets;
+    const auto old_tools = g.tools;
+    const int old_config = g.compile_config;
+
+    if (!ipc_prepare_project(fields)) return false;
+    if (auto found = fields.find("config"); found != fields.end()) {
+        try { g.compile_config = std::clamp(std::stoi(found->second), 0, static_cast<int>(g.configs.size()) - 1); }
+        catch (...) { g.project = old_project; g.engine = old_engine; g.targets = old_targets; g.tools = old_tools; g.compile_config = old_config; return false; }
+    }
+
+    const bool ready = fs::is_regular_file(g.project) && fs::exists(build_script()) && !g.targets.empty();
+    auto command = ready ? compile_command() : std::string{};
+
+    g.project = old_project;
+    g.engine = old_engine;
+    g.targets = old_targets;
+    g.tools = old_tools;
+    g.compile_config = old_config;
+
+    if (!ready || command.empty()) return false;
+    run_command(command, "Compile");
+    return true;
+}
+
+static bool ipc_package(const std::map<std::string, std::string>& fields) {
+    if (g.process_running) return false;
+    const auto old_project = g.project;
+    const auto old_engine = g.engine;
+    const auto old_targets = g.targets;
+    const auto old_tools = g.tools;
+    const auto old_output = g.output;
+    const int old_platform = g.package_platform;
+    const int old_config = g.package_config;
+
+    if (!ipc_prepare_project(fields)) return false;
+    try {
+        if (auto found = fields.find("platform"); found != fields.end())
+            g.package_platform = std::clamp(std::stoi(found->second), 0, static_cast<int>(g.platforms.size()) - 1);
+        if (auto found = fields.find("config"); found != fields.end())
+            g.package_config = std::clamp(std::stoi(found->second), 0, static_cast<int>(g.configs.size()) - 1);
+    } catch (...) {
+        g.project = old_project; g.engine = old_engine; g.targets = old_targets; g.tools = old_tools;
+        g.output = old_output; g.package_platform = old_platform; g.package_config = old_config;
+        return false;
+    }
+    if (auto found = fields.find("output"); found != fields.end() && !found->second.empty())
+        g.output = found->second;
+
+    const bool ready = fs::is_regular_file(g.project) && fs::exists(run_uat()) &&
+                       package_platform_ready(g.package_platform) &&
+                       (!g.unrealsharp || fs::exists(unrealsharp_scripts()));
+    if (ready && g.clean_output) clean_output();
+    auto command = ready ? package_command() : std::string{};
+
+    g.project = old_project;
+    g.engine = old_engine;
+    g.targets = old_targets;
+    g.tools = old_tools;
+    g.output = old_output;
+    g.package_platform = old_platform;
+    g.package_config = old_config;
+
+    if (!ready || command.empty()) return false;
+    run_command(command, "Package");
+    return true;
+}
+
 static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_COPYDATA) {
         auto* copy = reinterpret_cast<COPYDATASTRUCT*>(lparam);
@@ -1645,6 +1762,21 @@ static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wpa
             select_project(fs::path(value));
             return TRUE;
         }
+
+        auto fields = parse_ipc_fields(value);
+        if (copy->dwData == UPH_COPYDATA_EDITOR) {
+            if (!tray_can_launch_editor()) return FALSE;
+            tray_launch_editor();
+            return TRUE;
+        }
+        if (copy->dwData == UPH_COPYDATA_OPEN)
+            return ipc_launch_project(false, fields) ? TRUE : FALSE;
+        if (copy->dwData == UPH_COPYDATA_RUN)
+            return ipc_launch_project(true, fields) ? TRUE : FALSE;
+        if (copy->dwData == UPH_COPYDATA_BUILD)
+            return ipc_build(fields) ? TRUE : FALSE;
+        if (copy->dwData == UPH_COPYDATA_PACKAGE)
+            return ipc_package(fields) ? TRUE : FALSE;
         return FALSE;
     }
 
@@ -2909,19 +3041,29 @@ static HWND find_running_uph_window() {
     return FindWindowW(nullptr, L"UPH - Unreal Project Handler");
 }
 
-static bool send_uph_copydata(ULONG_PTR command, const fs::path& path) {
+static bool send_uph_copydata_text(ULONG_PTR command, const std::string& value) {
     HWND hwnd = find_running_uph_window();
     if (!hwnd) return false;
-    auto value = path.string();
+    std::string payload = value.empty() ? std::string("\n") : value;
     COPYDATASTRUCT copy{};
     copy.dwData = command;
-    copy.cbData = static_cast<DWORD>(value.size() + 1);
-    copy.lpData = value.data();
+    copy.cbData = static_cast<DWORD>(payload.size() + 1);
+    copy.lpData = payload.data();
     DWORD_PTR result = 0;
     if (!SendMessageTimeoutW(hwnd, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&copy),
                              SMTO_ABORTIFHUNG | SMTO_BLOCK, 3000, &result))
         return false;
     return result == TRUE;
+}
+
+static bool send_uph_copydata(ULONG_PTR command, const fs::path& path) {
+    return send_uph_copydata_text(command, path.string());
+}
+
+static std::string cli_action_payload(bool include_project = true) {
+    std::ostringstream payload;
+    if (include_project && !g.project.empty()) payload << "project=" << g.project.string() << '\n';
+    return payload.str();
 }
 
 static bool foreground_running_uph() {
@@ -3156,6 +3298,16 @@ static bool cli_use_project_argument(int argc, char** argv, int index) {
             if (sub == "list" || sub == "current" || sub == "select")
                 return cli_engine_command(argc, argv, 2);
         }
+#ifdef _WIN32
+        if (find_running_uph_window()) {
+            if (!send_uph_copydata_text(UPH_COPYDATA_EDITOR, "")) {
+                std::cerr << "UPH: the running app rejected the editor launch.\n";
+                return 2;
+            }
+            std::cout << "Editor launch requested through UPH.\n";
+            return 0;
+        }
+#endif
         if (!fs::exists(editor_path())) {
             std::cerr << "UPH: selected Unreal Editor is not available. Use uph editor select <name|path>.\n";
             return 2;
@@ -3169,6 +3321,17 @@ static bool cli_use_project_argument(int argc, char** argv, int index) {
             std::cerr << "UPH: no project selected and no .uproject found in the current directory.\n";
             return 2;
         }
+#ifdef _WIN32
+        if (find_running_uph_window()) {
+            const auto ipc = command == "run" ? UPH_COPYDATA_RUN : UPH_COPYDATA_OPEN;
+            if (!send_uph_copydata_text(ipc, cli_action_payload())) {
+                std::cerr << "UPH: the running app rejected the " << command << " request.\n";
+                return 2;
+            }
+            std::cout << (command == "run" ? "Run" : "Open") << " requested through UPH.\n";
+            return 0;
+        }
+#endif
         if (!fs::exists(editor_path())) {
             std::cerr << "UPH: selected Unreal Editor is not available.\n";
             return 2;
@@ -3230,6 +3393,19 @@ static bool cli_use_project_argument(int argc, char** argv, int index) {
             return 2;
         }
         std::cout << "Building " << g.project.stem().string() << " (" << g.configs[g.compile_config] << ")\n";
+#ifdef _WIN32
+        if (find_running_uph_window()) {
+            std::ostringstream payload;
+            payload << cli_action_payload();
+            payload << "config=" << g.compile_config << '\n';
+            if (!send_uph_copydata_text(UPH_COPYDATA_BUILD, payload.str())) {
+                std::cerr << "UPH: the running app rejected the build request (it may be busy).\n";
+                return 2;
+            }
+            std::cout << "Build started in the running UPH app.\n";
+            return 0;
+        }
+#endif
         return run_command_sync(compile_command());
     }
 
@@ -3329,6 +3505,21 @@ static bool cli_use_project_argument(int argc, char** argv, int index) {
         std::cout << "Packaging " << g.project.stem().string() << " for " << g.platforms[g.package_platform]
                   << " (" << g.configs[g.package_config] << ")\n";
         std::cout << "Output: " << package_output().string() << "\n";
+#ifdef _WIN32
+        if (find_running_uph_window()) {
+            std::ostringstream payload;
+            payload << cli_action_payload();
+            payload << "platform=" << g.package_platform << '\n';
+            payload << "config=" << g.package_config << '\n';
+            payload << "output=" << package_output().string() << '\n';
+            if (!send_uph_copydata_text(UPH_COPYDATA_PACKAGE, payload.str())) {
+                std::cerr << "UPH: the running app rejected the package request (it may be busy or tooling is incomplete).\n";
+                return 2;
+            }
+            std::cout << "Package started in the running UPH app.\n";
+            return 0;
+        }
+#endif
         return run_command_sync(package_command());
     }
 
