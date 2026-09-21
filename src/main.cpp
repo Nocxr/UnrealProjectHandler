@@ -76,6 +76,7 @@ struct AppState {
     std::vector<fs::path> recent_projects;
     fs::path engine;
     std::vector<fs::path> known_engines;
+    std::vector<fs::path> hidden_engines;
     fs::path output;
     std::vector<Engine> engines;
     std::vector<Target> targets;
@@ -513,6 +514,7 @@ static void save_settings() {
     for (const auto& project : g.recent_projects) if (!project.empty()) out << "recent_project=" << project.string() << '\n';
     out << "engine=" << g.engine.string() << '\n';
     for (const auto& engine : g.known_engines) if (!engine.empty()) out << "known_engine=" << engine.string() << '\n';
+    for (const auto& engine : g.hidden_engines) if (!engine.empty()) out << "hidden_engine=" << engine.string() << '\n';
     out << "output=" << g.output.string() << '\n';
     out << "compile_target=" << g.compile_target << '\n';
     out << "compile_config=" << g.compile_config << '\n';
@@ -547,6 +549,7 @@ static void load_settings() {
             else if (key == "recent_project" && !value.empty()) g.recent_projects.emplace_back(value);
             else if (key == "engine") g.engine = value;
             else if (key == "known_engine" && !value.empty()) g.known_engines.emplace_back(value);
+            else if (key == "hidden_engine" && !value.empty()) g.hidden_engines.emplace_back(value);
             else if (key == "output") g.output = value;
             else if (key == "compile_target") g.compile_target = std::stoi(value);
             else if (key == "compile_config") g.compile_config = std::stoi(value);
@@ -778,6 +781,10 @@ static void discover_engines() {
         if (excluded_engine_path(path)) return;
 #endif
         if (!valid_engine(path)) return;
+        auto path_key = normalized_path_key(path);
+        if (std::any_of(g.hidden_engines.begin(), g.hidden_engines.end(),
+                        [&](const fs::path& item){ return normalized_path_key(item) == path_key; }))
+            return;
         auto canonical = fs::weakly_canonical(path);
         if (std::none_of(g.engines.begin(), g.engines.end(), [&](const Engine& e){ return e.path == canonical; }))
             g.engines.push_back({engine_version(canonical), canonical});
@@ -1653,6 +1660,8 @@ static void apply_dialog_result(std::unique_ptr<DialogResult> result) {
         g.engine = result->path;
         {
             auto key = normalized_path_key(result->path);
+            g.hidden_engines.erase(std::remove_if(g.hidden_engines.begin(), g.hidden_engines.end(),
+                [&](const fs::path& item){ return normalized_path_key(item) == key; }), g.hidden_engines.end());
             if (std::none_of(g.known_engines.begin(), g.known_engines.end(),
                              [&](const fs::path& item){ return normalized_path_key(item) == key; }))
                 g.known_engines.push_back(result->path);
@@ -2419,6 +2428,8 @@ static bool select_engine_path(const fs::path& engine) {
     g.engine = engine;
     {
         auto key = normalized_path_key(engine);
+        g.hidden_engines.erase(std::remove_if(g.hidden_engines.begin(), g.hidden_engines.end(),
+            [&](const fs::path& item){ return normalized_path_key(item) == key; }), g.hidden_engines.end());
         if (std::none_of(g.known_engines.begin(), g.known_engines.end(),
                          [&](const fs::path& item){ return normalized_path_key(item) == key; }))
             g.known_engines.push_back(engine);
@@ -2896,6 +2907,8 @@ static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wpa
             fs::path engine = value;
             if (!valid_engine(engine) || excluded_engine_path(engine)) return FALSE;
             auto key = normalized_path_key(engine);
+            g.hidden_engines.erase(std::remove_if(g.hidden_engines.begin(), g.hidden_engines.end(),
+                [&](const fs::path& item){ return normalized_path_key(item) == key; }), g.hidden_engines.end());
             if (std::none_of(g.known_engines.begin(), g.known_engines.end(),
                              [&](const fs::path& item){ return normalized_path_key(item) == key; }))
                 g.known_engines.push_back(engine);
@@ -2905,14 +2918,17 @@ static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wpa
             return TRUE;
         }
         if (copy->dwData == UPH_COPYDATA_REMOVE_ENGINE) {
-            auto key = normalized_path_key(fs::path(value));
-            auto before = g.known_engines.size();
+            fs::path engine = value;
+            auto key = normalized_path_key(engine);
             g.known_engines.erase(std::remove_if(g.known_engines.begin(), g.known_engines.end(),
                 [&](const fs::path& item){ return normalized_path_key(item) == key; }), g.known_engines.end());
+            if (std::none_of(g.hidden_engines.begin(), g.hidden_engines.end(),
+                             [&](const fs::path& item){ return normalized_path_key(item) == key; }))
+                g.hidden_engines.push_back(engine);
             if (!g.engine.empty() && normalized_path_key(g.engine) == key) g.engine.clear();
             discover_engines();
             save_settings();
-            return before != g.known_engines.size() ? TRUE : FALSE;
+            return TRUE;
         }
         auto fields = parse_ipc_fields(value);
         if (copy->dwData == UPH_COPYDATA_EDITOR) { if (!tray_can_launch_editor()) return FALSE; tray_launch_editor(); return TRUE; }
