@@ -53,7 +53,7 @@ ifeq ($(OS),Windows_NT)
 
     SDL_CFLAGS := -I$(SDL_DIR)/include
     APP_LIBS := -L$(SDL_BUILD_DIR) -lSDL3 -lopengl32 -lshell32
-    CLI_LIBS := -lshell32
+    CLI_LIBS := -lshell32 -lole32 -luuid
     APP_SUBSYSTEM := -mwindows
     CLI_SUBSYSTEM := -mconsole
 
