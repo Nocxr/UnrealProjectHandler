@@ -16,7 +16,7 @@ APP_SOURCES := src/main.cpp \
 	$(IMGUI_DIR)/backends/imgui_impl_sdl3.cpp \
 	$(IMGUI_DIR)/backends/imgui_impl_opengl3.cpp
 
-CLI_SOURCES := src/cli_main.cpp
+CLI_SOURCES := src/cli_main.cpp src/unreal_file_index.cpp
 
 WINDOWS_RESOURCES :=
 SDL_TARGETS :=
