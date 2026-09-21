@@ -61,3 +61,15 @@ make            # both
 make clean      # UPH outputs only, keep SDL cache
 make clean-all  # full dependency/build wipe
 ```
+
+
+### Interactive selection
+
+`uph` includes its own terminal fuzzy picker; no `fzf` install is required.
+
+```powershell
+uph project select
+uph engine select
+```
+
+Type to fuzzy-filter, use Up/Down to move, Enter to select, Esc to cancel, and Backspace to edit the filter. Supplying a selector still works normally, while an ambiguous selector such as `uph engine select 5.8` opens the picker pre-filtered to matching entries.
