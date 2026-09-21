@@ -2191,6 +2191,13 @@ static constexpr UINT ID_TRAY_RECENT_PROJECT_BASE = 41100;
 static constexpr UINT ID_TRAY_ENGINE_BASE = 41200;
 static constexpr UINT ID_TRAY_PACKAGE_PLATFORM_BASE = 41300;
 static constexpr UINT ID_TRAY_PACKAGE_CONFIG_BASE = 41400;
+static constexpr ULONG_PTR UPH_COPYDATA_SELECT_ENGINE = 0x55504801;
+static constexpr ULONG_PTR UPH_COPYDATA_SELECT_PROJECT = 0x55504802;
+static constexpr ULONG_PTR UPH_COPYDATA_EDITOR = 0x55504803;
+static constexpr ULONG_PTR UPH_COPYDATA_OPEN = 0x55504804;
+static constexpr ULONG_PTR UPH_COPYDATA_RUN = 0x55504805;
+static constexpr ULONG_PTR UPH_COPYDATA_BUILD = 0x55504806;
+static constexpr ULONG_PTR UPH_COPYDATA_PACKAGE = 0x55504807;
 
 static HWND g_tray_hwnd = nullptr;
 static WNDPROC g_original_window_proc = nullptr;
@@ -2311,18 +2318,27 @@ static void tray_launch_editor() {
     launch_editor_home();
 }
 
-static void select_tray_engine(size_t index) {
+static bool select_engine_path(const fs::path& engine) {
     if (g.process_running) {
         log_line("[ERROR] Stop the current operation before switching engines.");
-        return;
+        return false;
     }
-    if (index >= g.engines.size()) return;
-    g.engine = g.engines[index].path;
+    if (!valid_engine(engine) || excluded_engine_path(engine)) {
+        log_line("[ERROR] Selected folder is not a usable Unreal Engine installation.");
+        return false;
+    }
+    g.engine = engine;
     g.plugin_scan_cache.clear();
     discover_engines();
     inspect_project();
     log_line("[SYSTEM] Engine: " + g.engine.string());
     save_settings();
+    return true;
+}
+
+static void select_tray_engine(size_t index) {
+    if (index >= g.engines.size()) return;
+    select_engine_path(g.engines[index].path);
 }
 
 static void show_tray_menu() {
@@ -2600,7 +2616,102 @@ static void toggle_main_window_global() {
     else restore_main_window_from_tray();
 }
 
+static std::map<std::string, std::string> parse_ipc_fields(const std::string& payload) {
+    std::map<std::string, std::string> fields;
+    std::istringstream stream(payload);
+    std::string line;
+    while (std::getline(stream, line)) {
+        auto split = line.find('=');
+        if (split != std::string::npos) fields[line.substr(0, split)] = line.substr(split + 1);
+    }
+    return fields;
+}
+
+static bool ipc_prepare_project(const std::map<std::string, std::string>& fields) {
+    auto found = fields.find("project");
+    if (found == fields.end() || found->second.empty()) return true;
+    fs::path project = found->second;
+    if (!fs::is_regular_file(project)) return false;
+    g.project = project;
+    g.plugin_scan_cache.clear();
+    remember_project(project);
+    match_project_engine(project);
+    inspect_project();
+    return true;
+}
+
+static bool ipc_launch_project(bool game, const std::map<std::string, std::string>& fields) {
+    if (g.process_running) return false;
+    const auto old_project = g.project, old_engine = g.engine;
+    const auto old_targets = g.targets; const auto old_tools = g.tools;
+    if (!ipc_prepare_project(fields)) return false;
+    const bool ready = fs::is_regular_file(g.project) && fs::exists(editor_path());
+    if (ready) launch_editor(game);
+    g.project = old_project; g.engine = old_engine; g.targets = old_targets; g.tools = old_tools;
+    return ready;
+}
+
+static bool ipc_build(const std::map<std::string, std::string>& fields) {
+    if (g.process_running) return false;
+    const auto old_project = g.project, old_engine = g.engine;
+    const auto old_targets = g.targets; const auto old_tools = g.tools;
+    const int old_config = g.compile_config;
+    if (!ipc_prepare_project(fields)) return false;
+    if (auto found = fields.find("config"); found != fields.end()) {
+        try { g.compile_config = std::clamp(std::stoi(found->second), 0, static_cast<int>(g.configs.size()) - 1); }
+        catch (...) { return false; }
+    }
+    const bool ready = fs::is_regular_file(g.project) && fs::exists(build_script()) && !g.targets.empty();
+    auto command = ready ? compile_command() : std::string{};
+    g.project = old_project; g.engine = old_engine; g.targets = old_targets; g.tools = old_tools; g.compile_config = old_config;
+    if (!ready || command.empty()) return false;
+    run_command(command, "Compile");
+    return true;
+}
+
+static bool ipc_package(const std::map<std::string, std::string>& fields) {
+    if (g.process_running) return false;
+    const auto old_project = g.project, old_engine = g.engine;
+    const auto old_targets = g.targets; const auto old_tools = g.tools;
+    const auto old_output = g.output; const int old_platform = g.package_platform, old_config = g.package_config;
+    if (!ipc_prepare_project(fields)) return false;
+    try {
+        if (auto found = fields.find("platform"); found != fields.end()) g.package_platform = std::clamp(std::stoi(found->second), 0, static_cast<int>(g.platforms.size()) - 1);
+        if (auto found = fields.find("config"); found != fields.end()) g.package_config = std::clamp(std::stoi(found->second), 0, static_cast<int>(g.configs.size()) - 1);
+    } catch (...) { return false; }
+    if (auto found = fields.find("output"); found != fields.end() && !found->second.empty()) g.output = found->second;
+    const bool ready = fs::is_regular_file(g.project) && fs::exists(run_uat()) && package_platform_ready(g.package_platform);
+    if (ready && g.clean_output) clean_output();
+    auto command = ready ? package_command() : std::string{};
+    g.project = old_project; g.engine = old_engine; g.targets = old_targets; g.tools = old_tools;
+    g.output = old_output; g.package_platform = old_platform; g.package_config = old_config;
+    if (!ready || command.empty()) return false;
+    run_command(command, "Package");
+    return true;
+}
+
 static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_COPYDATA) {
+        auto* copy = reinterpret_cast<COPYDATASTRUCT*>(lparam);
+        if (!copy || !copy->lpData || copy->cbData == 0) return FALSE;
+        const char* bytes = static_cast<const char*>(copy->lpData);
+        std::string value(bytes, bytes + copy->cbData);
+        if (!value.empty() && value.back() == '\0') value.pop_back();
+        if (copy->dwData == UPH_COPYDATA_SELECT_ENGINE) return select_engine_path(fs::path(value)) ? TRUE : FALSE;
+        if (copy->dwData == UPH_COPYDATA_SELECT_PROJECT) {
+            if (g.process_running || !fs::is_regular_file(fs::path(value))) return FALSE;
+            select_project(fs::path(value));
+            return TRUE;
+        }
+        auto fields = parse_ipc_fields(value);
+        if (copy->dwData == UPH_COPYDATA_EDITOR) { if (!tray_can_launch_editor()) return FALSE; tray_launch_editor(); return TRUE; }
+        if (copy->dwData == UPH_COPYDATA_OPEN) return ipc_launch_project(false, fields) ? TRUE : FALSE;
+        if (copy->dwData == UPH_COPYDATA_RUN) return ipc_launch_project(true, fields) ? TRUE : FALSE;
+        if (copy->dwData == UPH_COPYDATA_BUILD) return ipc_build(fields) ? TRUE : FALSE;
+        if (copy->dwData == UPH_COPYDATA_PACKAGE) return ipc_package(fields) ? TRUE : FALSE;
+        return FALSE;
+    }
+
     if (message == WM_HOTKEY && static_cast<int>(wparam) == ID_GLOBAL_TOGGLE_HOTKEY) {
         toggle_main_window_global();
         return 0;
