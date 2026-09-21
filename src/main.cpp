@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -158,7 +159,7 @@ struct AppState {
     std::string operation_progress_label;
     std::string last_operation;
     std::string last_result{"none"};
-    ULONG_PTR last_ipc_command = 0;
+    std::uintptr_t last_ipc_command = 0;
     std::string last_ipc_payload;
     std::map<std::string, PluginGitState> pending_plugin_git_cache;
     ProjectGitState pending_git_state;
@@ -247,6 +248,38 @@ static void clear_runtime_log() {
 static void append_runtime_log(const std::string& text) {
     std::ofstream out(runtime_log_path(), std::ios::app);
     if (out) out << text << '\n';
+}
+
+static void write_runtime_status(bool app_running = true) {
+    std::string serial, package, adb_status;
+    {
+        std::lock_guard lock(g.adb_mutex);
+        serial = g.adb_serial;
+        package = g.adb_package;
+        adb_status = g.adb_status;
+    }
+    std::string progress;
+    {
+        std::lock_guard lock(g.progress_mutex);
+        progress = g.operation_progress_label;
+    }
+
+    std::ofstream out(runtime_status_path(), std::ios::trunc);
+    if (!out) return;
+    out << "app_running=" << (app_running ? 1 : 0) << '\n';
+    out << "project=" << g.project.string() << '\n';
+    out << "engine=" << g.engine.string() << '\n';
+    out << "process_running=" << (g.process_running ? 1 : 0) << '\n';
+    out << "operation=" << g.last_operation << '\n';
+    out << "result=" << g.last_result << '\n';
+    out << "progress=" << progress << '\n';
+    out << "compile_config=" << g.compile_config << '\n';
+    out << "package_platform=" << g.package_platform << '\n';
+    out << "package_config=" << g.package_config << '\n';
+    out << "output=" << g.output.string() << '\n';
+    out << "device=" << serial << '\n';
+    out << "android_package=" << package << '\n';
+    out << "adb_status=" << adb_status << '\n';
 }
 
 
@@ -5378,13 +5411,20 @@ int main(int, char**) {
     refresh_android_artifacts();
     refresh_adb_devices_async();
     check_app_main_commit_async();
+    clear_runtime_log();
+    write_runtime_status(true);
 #ifdef _WIN32
     if (install_tray_icon()) log_line("[SYSTEM] Tray icon ready. Closing the main window hides UPH to the tray.");
 #endif
     log_line("[SYSTEM] UPH native started.");
     bool running = true;
+    auto last_runtime_status_write = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     while (running) {
         auto frame_started = std::chrono::steady_clock::now();
+        if (frame_started - last_runtime_status_write >= std::chrono::milliseconds(500)) {
+            write_runtime_status(true);
+            last_runtime_status_write = frame_started;
+        }
         SDL_Event event;
         auto handle_event = [&](SDL_Event& current) {
             ImGui_ImplSDL3_ProcessEvent(&current);
@@ -5478,5 +5518,6 @@ int main(int, char**) {
     SDL_GL_DestroyContext(context);
     SDL_DestroyWindow(g_window);
     SDL_Quit();
+    write_runtime_status(false);
     return 0;
 }
