@@ -1635,7 +1635,8 @@ static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wpa
         auto* copy = reinterpret_cast<COPYDATASTRUCT*>(lparam);
         if (!copy || !copy->lpData || copy->cbData == 0) return FALSE;
         const char* bytes = static_cast<const char*>(copy->lpData);
-        std::string value(bytes, strnlen(bytes, copy->cbData));
+        std::string value(bytes, bytes + copy->cbData);
+        if (!value.empty() && value.back() == '\0') value.pop_back();
         if (copy->dwData == UPH_COPYDATA_SELECT_ENGINE) {
             return select_engine_path(fs::path(value)) ? TRUE : FALSE;
         }
