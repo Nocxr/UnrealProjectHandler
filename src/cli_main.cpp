@@ -19,6 +19,9 @@
 #include "unreal_file_index.h"
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <shellapi.h>
 #include <shobjidl.h>
