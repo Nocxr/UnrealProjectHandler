@@ -350,7 +350,7 @@ static std::string read_text(const fs::path& path) {
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
-static std::string json_string_value(const std::string& text, const std::string& key) {
+[[maybe_unused]] static std::string json_string_value(const std::string& text, const std::string& key) {
     auto search = "\"" + key + "\"";
     auto p = text.find(search);
     if (p == std::string::npos) return {};
