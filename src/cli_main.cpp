@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -17,6 +18,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
+#include <conio.h>
+#include <io.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -126,6 +129,156 @@ static void print_runtime_logs(bool follow) {
         if (!find_running_uph_window()) break;
 #endif
     }
+}
+
+
+
+static int fuzzy_score(const std::string& text, const std::string& query) {
+    if (query.empty()) return 0;
+    const auto haystack = lower_copy(text);
+    const auto needle = lower_copy(query);
+
+    int score = 0;
+    size_t at = 0;
+    int previous = -2;
+    for (char wanted : needle) {
+        auto found = haystack.find(wanted, at);
+        if (found == std::string::npos) return -1;
+        score += 10;
+        if (static_cast<int>(found) == previous + 1) score += 8;
+        if (found == 0 || haystack[found - 1] == ' ' || haystack[found - 1] == '\\' ||
+            haystack[found - 1] == '/' || haystack[found - 1] == '_' || haystack[found - 1] == '-')
+            score += 5;
+        score -= static_cast<int>(found - at);
+        previous = static_cast<int>(found);
+        at = found + 1;
+    }
+    score -= static_cast<int>(haystack.size() - needle.size()) / 8;
+    return score;
+}
+
+static std::vector<size_t> fuzzy_matches(const std::vector<std::string>& items, const std::string& query) {
+    std::vector<std::pair<int,size_t>> scored;
+    scored.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        int score = fuzzy_score(items[i], query);
+        if (score >= 0) scored.push_back({score, i});
+    }
+    std::stable_sort(scored.begin(), scored.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<size_t> result;
+    result.reserve(scored.size());
+    for (const auto& [score, index] : scored) {
+        (void)score;
+        result.push_back(index);
+    }
+    return result;
+}
+
+static std::optional<size_t> fallback_numbered_picker(const std::string& title,
+                                                      const std::vector<std::string>& items) {
+    if (items.empty()) return std::nullopt;
+    std::cout << title << "\n";
+    for (size_t i = 0; i < items.size(); ++i)
+        std::cout << "  " << (i + 1) << ") " << items[i] << "\n";
+    std::cout << "Select [1-" << items.size() << "] or 0 to cancel: ";
+    std::string input;
+    if (!std::getline(std::cin, input)) return std::nullopt;
+    try {
+        auto value = std::stoul(input);
+        if (value == 0 || value > items.size()) return std::nullopt;
+        return value - 1;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+static std::optional<size_t> interactive_picker(const std::string& title,
+                                                const std::vector<std::string>& items,
+                                                const std::string& initial_query = {}) {
+    if (items.empty()) return std::nullopt;
+#ifdef _WIN32
+    if (!_isatty(_fileno(stdin)) || !_isatty(_fileno(stdout)))
+        return fallback_numbered_picker(title, items);
+
+    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD original_mode = 0;
+    if (output == INVALID_HANDLE_VALUE || !GetConsoleMode(output, &original_mode))
+        return fallback_numbered_picker(title, items);
+
+    const bool vt_enabled = SetConsoleMode(output, original_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+    if (!vt_enabled)
+        return fallback_numbered_picker(title, items);
+
+    struct ConsoleRestore {
+        HANDLE output;
+        DWORD mode;
+        ~ConsoleRestore() {
+            std::cout << "\x1b[?25h\x1b[?1049l";
+            std::cout.flush();
+            SetConsoleMode(output, mode);
+        }
+    } restore{output, original_mode};
+
+    std::cout << "\x1b[?1049h\x1b[?25l";
+    std::string query = initial_query;
+    size_t selected = 0;
+    constexpr size_t max_visible = 12;
+
+    for (;;) {
+        auto matches = fuzzy_matches(items, query);
+        if (selected >= matches.size()) selected = matches.empty() ? 0 : matches.size() - 1;
+
+        std::cout << "\x1b[H\x1b[2J";
+        std::cout << title << "\n";
+        std::cout << "> " << query << "\n\n";
+
+        if (matches.empty()) {
+            std::cout << "  No matches\n";
+        } else {
+            size_t start = 0;
+            if (selected >= max_visible) start = selected - max_visible + 1;
+            const size_t end = std::min(matches.size(), start + max_visible);
+            for (size_t row = start; row < end; ++row) {
+                const bool active = row == selected;
+                std::cout << (active ? "\x1b[7m> " : "  ")
+                          << items[matches[row]]
+                          << (active ? "\x1b[0m" : "") << "\n";
+            }
+            if (matches.size() > max_visible)
+                std::cout << "\n  " << matches.size() << " matches\n";
+        }
+
+        std::cout << "\nType to filter  ↑/↓ move  Enter select  Esc cancel";
+        std::cout.flush();
+
+        int key = _getwch();
+        if (key == 0 || key == 224) {
+            int extended = _getwch();
+            if (extended == 72 && selected > 0) --selected;
+            else if (extended == 80 && !matches.empty() && selected + 1 < matches.size()) ++selected;
+            continue;
+        }
+
+        if (key == 27) return std::nullopt;
+        if (key == 13) {
+            if (!matches.empty()) return matches[selected];
+            continue;
+        }
+        if (key == 8 || key == 127) {
+            if (!query.empty()) query.pop_back();
+            selected = 0;
+            continue;
+        }
+        if (key >= 32 && key <= 126) {
+            query.push_back(static_cast<char>(key));
+            selected = 0;
+        }
+    }
+#else
+    (void)initial_query;
+    return fallback_numbered_picker(title, items);
+#endif
 }
 
 
@@ -456,8 +609,10 @@ static void print_help() {
         "  uph rerun                   Repeat the last CLI build/package/deploy\n"
         "  uph deploy [project] [config]\n"
         "                              Package Android, install, and launch\n"
-        "  uph project list|current|select <name|path>\n"
-        "  uph engine list|current|select <name|path>\n"
+        "  uph project list|current|select [name|path]\n"
+        "                              select with no value opens fuzzy picker\n"
+        "  uph engine list|current|select [name|path]\n"
+        "                              select with no value opens fuzzy picker\n"
         "  uph editor\n"
         "  uph open [project]\n"
         "  uph run [project]\n"
@@ -468,6 +623,21 @@ static void print_help() {
         "      --config <config>\n"
         "      --output <directory>\n";
 }
+
+static std::vector<fs::path> selectable_projects() {
+    std::vector<fs::path> projects;
+    std::set<std::string> seen;
+    auto add = [&](const fs::path& project) {
+        if (project.empty() || !fs::is_regular_file(project)) return;
+        auto key = normalized_path_key(project);
+        if (seen.insert(key).second) projects.push_back(project);
+    };
+    add(current_directory_project());
+    add(g.project);
+    for (const auto& project : g.recent_projects) add(project);
+    return projects;
+}
+
 
 static int command_project(int argc, char** argv) {
     std::string action = argc >= 3 ? lower_copy(argv[2]) : "current";
@@ -502,14 +672,28 @@ static int command_project(int argc, char** argv) {
     }
 
     if (action == "select") {
+        fs::path project;
         if (argc < 4) {
-            std::cerr << "Usage: uph project select <name|path>\n";
-            return 2;
-        }
-        auto project = resolve_project_selector(argv[3]);
-        if (project.empty()) {
-            std::cerr << "UPH: project not found or selector is ambiguous: " << argv[3] << '\n';
-            return 2;
+            auto projects = selectable_projects();
+            std::vector<std::string> labels;
+            labels.reserve(projects.size());
+            for (const auto& candidate : projects)
+                labels.push_back(candidate.stem().string() + "  " + candidate.string());
+            auto picked = interactive_picker("Select Unreal Project", labels);
+            if (!picked) return 1;
+            project = projects[*picked];
+        } else {
+            project = resolve_project_selector(argv[3]);
+            if (project.empty()) {
+                auto projects = selectable_projects();
+                std::vector<std::string> labels;
+                labels.reserve(projects.size());
+                for (const auto& candidate : projects)
+                    labels.push_back(candidate.stem().string() + "  " + candidate.string());
+                auto picked = interactive_picker("Select Unreal Project", labels, argv[3]);
+                if (!picked) return 1;
+                project = projects[*picked];
+            }
         }
 #ifdef _WIN32
         if (!ensure_app_for_action() ||
@@ -551,14 +735,25 @@ static int command_engine(int argc, char** argv) {
     }
 
     if (action == "select") {
-        if (argc < 4) {
-            std::cerr << "Usage: uph engine select <name|path>\n";
-            return 2;
-        }
         fs::path engine;
-        if (!resolve_engine_selector(argv[3], engine)) {
-            std::cerr << "UPH: engine not found or selector is ambiguous: " << argv[3] << '\n';
-            return 2;
+        if (argc < 4) {
+            auto engines = discover_engines();
+            std::vector<std::string> labels;
+            labels.reserve(engines.size());
+            for (const auto& candidate : engines)
+                labels.push_back(candidate.label + "  " + candidate.path.string());
+            auto picked = interactive_picker("Select Unreal Engine", labels);
+            if (!picked) return 1;
+            engine = engines[*picked].path;
+        } else if (!resolve_engine_selector(argv[3], engine)) {
+            auto engines = discover_engines();
+            std::vector<std::string> labels;
+            labels.reserve(engines.size());
+            for (const auto& candidate : engines)
+                labels.push_back(candidate.label + "  " + candidate.path.string());
+            auto picked = interactive_picker("Select Unreal Engine", labels, argv[3]);
+            if (!picked) return 1;
+            engine = engines[*picked].path;
         }
 #ifdef _WIN32
         if (!ensure_app_for_action() ||
