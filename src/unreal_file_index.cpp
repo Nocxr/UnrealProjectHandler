@@ -4,7 +4,10 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
+#include <cwctype>
 #include <fstream>
+#include <iterator>
 #include <set>
 #include <string_view>
 #include <unordered_map>
