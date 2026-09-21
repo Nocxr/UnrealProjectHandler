@@ -2856,10 +2856,15 @@ static void print_cli_help() {
         "  uph editor list|current|select <name|path>\n"
         "  uph open [project]          Open a project in Unreal Editor\n"
         "  uph run [project]           Launch a project with -game -log\n"
-        "  uph build [config]          Compile the current project\n"
-        "  uph compile [config]        Alias for build\n"
-        "  uph package [platform] [config]\n"
+        "  uph build [project] [config]\n"
+        "                              Compile using current settings or overrides\n"
+        "  uph compile ...             Alias for build\n"
+        "  uph package [project] [platform] [config]\n"
         "                              Package using current settings or overrides\n"
+        "      --project <project>      Override project for this command\n"
+        "      --platform <platform>    Override package platform\n"
+        "      --config <config>        Override build/package configuration\n"
+        "      --output <directory>     Override package output directory\n"
         "  uph help                    Show this help\n\n"
         "Platforms: Windows/Win64, Mac, Android, iOS, VisionOS\n"
         "Configs:   Development, Debug, Shipping, Test\n\n"
@@ -3040,7 +3045,7 @@ static bool cli_use_project_argument(int argc, char** argv, int index) {
     return true;
 }
 
-static int run_cli(int argc, char** argv) {
+[[maybe_unused]] static int run_cli(int argc, char** argv) {
     if (argc <= 1) {
 #ifdef _WIN32
         return launch_uph_app();
@@ -3099,14 +3104,47 @@ static int run_cli(int argc, char** argv) {
 
     if (command == "build" || command == "compile") {
         cli_apply_working_directory_project();
-        int arg = 2;
-        if (arg < argc) {
-            const int config = config_index(argv[arg]);
-            if (config < 0) {
-                std::cerr << "UPH: unknown build configuration: " << argv[arg] << "\n";
-                return 2;
+        for (int arg = 2; arg < argc; ++arg) {
+            const std::string value = argv[arg];
+            if (value == "--config") {
+                if (++arg >= argc) {
+                    std::cerr << "Usage: uph build [project] [config] [--config <config>]\n";
+                    return 2;
+                }
+                const int config = config_index(argv[arg]);
+                if (config < 0) {
+                    std::cerr << "UPH: unknown build configuration: " << argv[arg] << "\n";
+                    return 2;
+                }
+                g.compile_config = config;
+                continue;
             }
-            g.compile_config = config;
+            if (value == "--project") {
+                if (++arg >= argc) {
+                    std::cerr << "Usage: uph build --project <project>\n";
+                    return 2;
+                }
+                auto project = resolve_project_selector(argv[arg]);
+                if (project.empty()) {
+                    std::cerr << "UPH: project not found: " << argv[arg] << "\n";
+                    return 2;
+                }
+                use_cli_project(project, false);
+                continue;
+            }
+
+            const int config = config_index(value);
+            if (config >= 0) {
+                g.compile_config = config;
+                continue;
+            }
+            auto project = resolve_project_selector(value);
+            if (!project.empty()) {
+                use_cli_project(project, false);
+                continue;
+            }
+            std::cerr << "UPH: unknown build argument: " << value << "\n";
+            return 2;
         }
         if (g.project.empty() || !fs::is_regular_file(g.project)) {
             std::cerr << "UPH: no valid project selected.\n";
@@ -3116,28 +3154,89 @@ static int run_cli(int argc, char** argv) {
             std::cerr << "UPH: compile tooling or project target is unavailable.\n";
             return 2;
         }
+        std::cout << "Building " << g.project.stem().string() << " (" << g.configs[g.compile_config] << ")\n";
         return run_command_sync(compile_command());
     }
 
     if (command == "package") {
         cli_apply_working_directory_project();
-        int arg = 2;
-        if (arg < argc) {
-            const int platform = platform_index(argv[arg]);
-            if (platform < 0) {
-                std::cerr << "UPH: unknown platform: " << argv[arg] << "\n";
-                return 2;
+        bool platform_set = false;
+        bool config_set = false;
+        for (int arg = 2; arg < argc; ++arg) {
+            const std::string value = argv[arg];
+            if (value == "--platform") {
+                if (++arg >= argc) {
+                    std::cerr << "Usage: uph package --platform <platform>\n";
+                    return 2;
+                }
+                const int platform = platform_index(argv[arg]);
+                if (platform < 0) {
+                    std::cerr << "UPH: unknown platform: " << argv[arg] << "\n";
+                    return 2;
+                }
+                g.package_platform = platform;
+                platform_set = true;
+                continue;
             }
-            g.package_platform = platform;
-            ++arg;
-        }
-        if (arg < argc) {
-            const int config = config_index(argv[arg]);
-            if (config < 0) {
-                std::cerr << "UPH: unknown package configuration: " << argv[arg] << "\n";
-                return 2;
+            if (value == "--config") {
+                if (++arg >= argc) {
+                    std::cerr << "Usage: uph package --config <config>\n";
+                    return 2;
+                }
+                const int config = config_index(argv[arg]);
+                if (config < 0) {
+                    std::cerr << "UPH: unknown package configuration: " << argv[arg] << "\n";
+                    return 2;
+                }
+                g.package_config = config;
+                config_set = true;
+                continue;
             }
-            g.package_config = config;
+            if (value == "--output") {
+                if (++arg >= argc) {
+                    std::cerr << "Usage: uph package --output <directory>\n";
+                    return 2;
+                }
+                g.output = fs::path(argv[arg]);
+                continue;
+            }
+            if (value == "--project") {
+                if (++arg >= argc) {
+                    std::cerr << "Usage: uph package --project <project>\n";
+                    return 2;
+                }
+                auto project = resolve_project_selector(argv[arg]);
+                if (project.empty()) {
+                    std::cerr << "UPH: project not found: " << argv[arg] << "\n";
+                    return 2;
+                }
+                use_cli_project(project, false);
+                continue;
+            }
+
+            if (!platform_set) {
+                const int platform = platform_index(value);
+                if (platform >= 0) {
+                    g.package_platform = platform;
+                    platform_set = true;
+                    continue;
+                }
+            }
+            if (!config_set) {
+                const int config = config_index(value);
+                if (config >= 0) {
+                    g.package_config = config;
+                    config_set = true;
+                    continue;
+                }
+            }
+            auto project = resolve_project_selector(value);
+            if (!project.empty()) {
+                use_cli_project(project, false);
+                continue;
+            }
+            std::cerr << "UPH: unknown package argument: " << value << "\n";
+            return 2;
         }
         if (g.project.empty() || !fs::is_regular_file(g.project)) {
             std::cerr << "UPH: no valid project selected.\n";
@@ -3154,6 +3253,7 @@ static int run_cli(int argc, char** argv) {
         if (g.clean_output) clean_output();
         std::cout << "Packaging " << g.project.stem().string() << " for " << g.platforms[g.package_platform]
                   << " (" << g.configs[g.package_config] << ")\n";
+        std::cout << "Output: " << package_output().string() << "\n";
         return run_command_sync(package_command());
     }
 
@@ -3162,7 +3262,7 @@ static int run_cli(int argc, char** argv) {
     return 2;
 }
 
-static int run_gui() {
+[[maybe_unused]] static int run_gui() {
 #ifdef _WIN32
     if (!acquire_gui_instance()) return 0;
 #endif
