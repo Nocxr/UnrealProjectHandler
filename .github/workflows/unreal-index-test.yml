@@ -40,6 +40,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build CLI with MinGW
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          & "C:\mingw64\bin\g++.exe" -std=c++20 -O2 -Wall -Wextra -Wpedantic src/cli_main.cpp src/unreal_file_index.cpp -o build/uph-mingw.exe -lshell32 -lole32 -luuid -luser32 -ladvapi32 -mconsole
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run MinGW index self-test
+        shell: cmd
+        run: build\uph-mingw.exe index test
+
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
