@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -20,13 +21,13 @@
 
 namespace fs = std::filesystem;
 
-static constexpr ULONG_PTR UPH_COPYDATA_SELECT_ENGINE = 0x55504801;
-static constexpr ULONG_PTR UPH_COPYDATA_SELECT_PROJECT = 0x55504802;
-static constexpr ULONG_PTR UPH_COPYDATA_EDITOR = 0x55504803;
-static constexpr ULONG_PTR UPH_COPYDATA_OPEN = 0x55504804;
-static constexpr ULONG_PTR UPH_COPYDATA_RUN = 0x55504805;
-static constexpr ULONG_PTR UPH_COPYDATA_BUILD = 0x55504806;
-static constexpr ULONG_PTR UPH_COPYDATA_PACKAGE = 0x55504807;
+static constexpr std::uintptr_t UPH_COPYDATA_SELECT_ENGINE = 0x55504801;
+static constexpr std::uintptr_t UPH_COPYDATA_SELECT_PROJECT = 0x55504802;
+static constexpr std::uintptr_t UPH_COPYDATA_EDITOR = 0x55504803;
+static constexpr std::uintptr_t UPH_COPYDATA_OPEN = 0x55504804;
+static constexpr std::uintptr_t UPH_COPYDATA_RUN = 0x55504805;
+static constexpr std::uintptr_t UPH_COPYDATA_BUILD = 0x55504806;
+static constexpr std::uintptr_t UPH_COPYDATA_PACKAGE = 0x55504807;
 
 struct Engine {
     std::string label;
@@ -337,7 +338,7 @@ static bool launch_uph_app() {
     return false;
 }
 
-static bool send_uph_copydata(ULONG_PTR command, const std::string& value) {
+static bool send_uph_copydata(std::uintptr_t command, const std::string& value) {
     HWND hwnd = find_running_uph_window();
     if (!hwnd) return false;
     std::string payload = value.empty() ? std::string("\n") : value;
