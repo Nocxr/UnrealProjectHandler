@@ -75,6 +75,7 @@ struct AppState {
     fs::path project;
     std::vector<fs::path> recent_projects;
     fs::path engine;
+    std::vector<fs::path> known_engines;
     fs::path output;
     std::vector<Engine> engines;
     std::vector<Target> targets;
@@ -511,6 +512,7 @@ static void save_settings() {
     out << "project=" << g.project.string() << '\n';
     for (const auto& project : g.recent_projects) if (!project.empty()) out << "recent_project=" << project.string() << '\n';
     out << "engine=" << g.engine.string() << '\n';
+    for (const auto& engine : g.known_engines) if (!engine.empty()) out << "known_engine=" << engine.string() << '\n';
     out << "output=" << g.output.string() << '\n';
     out << "compile_target=" << g.compile_target << '\n';
     out << "compile_config=" << g.compile_config << '\n';
@@ -544,6 +546,7 @@ static void load_settings() {
             if (key == "project") g.project = value;
             else if (key == "recent_project" && !value.empty()) g.recent_projects.emplace_back(value);
             else if (key == "engine") g.engine = value;
+            else if (key == "known_engine" && !value.empty()) g.known_engines.emplace_back(value);
             else if (key == "output") g.output = value;
             else if (key == "compile_target") g.compile_target = std::stoi(value);
             else if (key == "compile_config") g.compile_config = std::stoi(value);
@@ -780,6 +783,7 @@ static void discover_engines() {
             g.engines.push_back({engine_version(canonical), canonical});
     };
     if (!g.engine.empty()) add(g.engine);
+    for (const auto& engine : g.known_engines) add(engine);
 #ifdef _WIN32
     for (const auto& path : registry_engine_paths()) add(path);
     for (const char* root : {"C:/Program Files/Epic Games", "D:/Epic Games"}) {
@@ -1647,6 +1651,12 @@ static void apply_dialog_result(std::unique_ptr<DialogResult> result) {
             return;
         }
         g.engine = result->path;
+        {
+            auto key = normalized_path_key(result->path);
+            if (std::none_of(g.known_engines.begin(), g.known_engines.end(),
+                             [&](const fs::path& item){ return normalized_path_key(item) == key; }))
+                g.known_engines.push_back(result->path);
+        }
         g.plugin_scan_cache.clear();
         discover_engines();
         log_line("[SYSTEM] Engine: " + result->path.string());
@@ -2273,6 +2283,10 @@ static constexpr ULONG_PTR UPH_COPYDATA_PACKAGE = 0x55504807;
 static constexpr ULONG_PTR UPH_COPYDATA_STOP = 0x55504808;
 static constexpr ULONG_PTR UPH_COPYDATA_RERUN = 0x55504809;
 static constexpr ULONG_PTR UPH_COPYDATA_DEPLOY = 0x5550480A;
+static constexpr ULONG_PTR UPH_COPYDATA_ADD_PROJECT = 0x5550480B;
+static constexpr ULONG_PTR UPH_COPYDATA_REMOVE_PROJECT = 0x5550480C;
+static constexpr ULONG_PTR UPH_COPYDATA_ADD_ENGINE = 0x5550480D;
+static constexpr ULONG_PTR UPH_COPYDATA_REMOVE_ENGINE = 0x5550480E;
 
 static HWND g_tray_hwnd = nullptr;
 static WNDPROC g_original_window_proc = nullptr;
@@ -2403,6 +2417,12 @@ static bool select_engine_path(const fs::path& engine) {
         return false;
     }
     g.engine = engine;
+    {
+        auto key = normalized_path_key(engine);
+        if (std::none_of(g.known_engines.begin(), g.known_engines.end(),
+                         [&](const fs::path& item){ return normalized_path_key(item) == key; }))
+            g.known_engines.push_back(engine);
+    }
     g.plugin_scan_cache.clear();
     discover_engines();
     inspect_project();
@@ -2854,6 +2874,45 @@ static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wpa
             if (g.process_running || !fs::is_regular_file(fs::path(value))) return FALSE;
             select_project(fs::path(value));
             return TRUE;
+        }
+        if (copy->dwData == UPH_COPYDATA_ADD_PROJECT) {
+            fs::path project = value;
+            if (!fs::is_regular_file(project) || lower_copy(project.extension().string()) != ".uproject") return FALSE;
+            remember_project(project);
+            save_settings();
+            log_line("[SYSTEM] Added project: " + project.string());
+            return TRUE;
+        }
+        if (copy->dwData == UPH_COPYDATA_REMOVE_PROJECT) {
+            auto key = normalized_path_key(fs::path(value));
+            auto before = g.recent_projects.size();
+            g.recent_projects.erase(std::remove_if(g.recent_projects.begin(), g.recent_projects.end(),
+                [&](const fs::path& item){ return normalized_path_key(item) == key; }), g.recent_projects.end());
+            if (normalized_path_key(g.project) == key) g.project.clear();
+            save_settings();
+            return before != g.recent_projects.size() || g.project.empty() ? TRUE : FALSE;
+        }
+        if (copy->dwData == UPH_COPYDATA_ADD_ENGINE) {
+            fs::path engine = value;
+            if (!valid_engine(engine) || excluded_engine_path(engine)) return FALSE;
+            auto key = normalized_path_key(engine);
+            if (std::none_of(g.known_engines.begin(), g.known_engines.end(),
+                             [&](const fs::path& item){ return normalized_path_key(item) == key; }))
+                g.known_engines.push_back(engine);
+            discover_engines();
+            save_settings();
+            log_line("[SYSTEM] Added engine: " + engine.string());
+            return TRUE;
+        }
+        if (copy->dwData == UPH_COPYDATA_REMOVE_ENGINE) {
+            auto key = normalized_path_key(fs::path(value));
+            auto before = g.known_engines.size();
+            g.known_engines.erase(std::remove_if(g.known_engines.begin(), g.known_engines.end(),
+                [&](const fs::path& item){ return normalized_path_key(item) == key; }), g.known_engines.end());
+            if (!g.engine.empty() && normalized_path_key(g.engine) == key) g.engine.clear();
+            discover_engines();
+            save_settings();
+            return before != g.known_engines.size() ? TRUE : FALSE;
         }
         auto fields = parse_ipc_fields(value);
         if (copy->dwData == UPH_COPYDATA_EDITOR) { if (!tray_can_launch_editor()) return FALSE; tray_launch_editor(); return TRUE; }
