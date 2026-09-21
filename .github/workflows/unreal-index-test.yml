@@ -1,0 +1,36 @@
+name: Unreal File Index Test
+
+on:
+  push:
+    branches:
+      - unreal-file-index
+  pull_request:
+    paths:
+      - "src/cli_main.cpp"
+      - "src/unreal_file_index.*"
+      - "Makefile"
+      - ".github/workflows/unreal-index-test.yml"
+
+jobs:
+  cli-index-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CLI
+        run: make cli
+
+      - name: Run index self-test
+        run: ./build/uph index test
+
+      - name: Exercise rebuild and search
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          mkdir -p "$root/Game/Plugins/SamplePlugin"
+          printf '{}\n' > "$root/Game/SampleProject.uproject"
+          printf '{}\n' > "$root/Game/Plugins/SamplePlugin/SamplePlugin.uplugin"
+          ./build/uph index rebuild "$root"
+          ./build/uph find SampleProject --projects
+          ./build/uph find SamplePlugin --plugins
