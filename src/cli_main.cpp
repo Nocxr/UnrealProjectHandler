@@ -79,6 +79,10 @@ static fs::path runtime_log_path() {
     return settings_path().parent_path() / "runtime.log";
 }
 
+#ifdef _WIN32
+static HWND find_running_uph_window();
+#endif
+
 static std::map<std::string, std::string> read_key_values(const fs::path& path) {
     std::map<std::string, std::string> values;
     std::ifstream in(path);
