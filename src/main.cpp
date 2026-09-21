@@ -2704,6 +2704,8 @@ static fs::path project_in_directory(const fs::path& directory) {
     return found;
 }
 
+static fs::path current_directory_project();
+
 static fs::path resolve_project_selector(const std::string& selector) {
     fs::path candidate = selector;
     std::error_code ec;
@@ -2722,6 +2724,8 @@ static fs::path resolve_project_selector(const std::string& selector) {
         if (stem == wanted || filename == wanted || full == wanted)
             matches.push_back(project);
     };
+    auto local_project = current_directory_project();
+    consider(local_project);
     consider(g.project);
     for (const auto& project : g.recent_projects) consider(project);
     if (matches.empty()) return {};
@@ -3001,11 +3005,17 @@ static int cli_project_command(int argc, char** argv, int index) {
             const bool current = !g.project.empty() && key == normalized_path_key(g.project);
             std::cout << (current ? "* " : "  ") << project.stem().string() << "  " << project.string() << "\n";
         };
+        print(current_directory_project());
         print(g.project);
         for (const auto& project : g.recent_projects) print(project);
         return 0;
     }
     if (action == "current") {
+        auto local_project = current_directory_project();
+        if (!local_project.empty()) {
+            std::cout << local_project.string() << "\n";
+            return 0;
+        }
         if (g.project.empty()) {
             std::cout << "No project selected.\n";
             return 1;
