@@ -394,8 +394,11 @@ bool UnrealFileIndex::save(const fs::path& cache_path) const {
 
     ec.clear();
     fs::copy_file(temporary, cache_path, fs::copy_options::overwrite_existing, ec);
-    fs::remove(temporary, ec);
-    return !ec;
+    if (ec) return false;
+
+    std::error_code cleanup_ec;
+    fs::remove(temporary, cleanup_ec);
+    return true;
 }
 
 UnrealIndexStats UnrealFileIndex::rebuild(const std::vector<fs::path>& roots) {
