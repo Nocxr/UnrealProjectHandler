@@ -89,3 +89,24 @@ make run
 ```
 
 macOS also builds `build/uph` as the CLI launcher and `build/uph-app` as the application. `make install` copies both to `~/.local/bin`.
+
+
+## Build targets
+
+The CLI and desktop app are now separate binaries with separate dependencies:
+
+```powershell
+make cli        # builds only build/uph.exe; no SDL/ImGui/OpenGL build
+make app        # builds only build/uph-app.exe and its SDL/ImGui dependencies
+make            # builds both
+```
+
+Normal cleanup preserves the SDL/CMake dependency build so routine rebuilds stay fast:
+
+```powershell
+make clean      # remove only UPH executables/resources
+make rebuild    # clean UPH outputs and rebuild both
+make clean-all  # full wipe, including build/SDL
+```
+
+Use `clean-all` only when you actually need to force SDL/CMake dependencies to rebuild.
