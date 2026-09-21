@@ -94,3 +94,25 @@ uph engine remove UE_5.8
 With no argument, `project add` first checks the current directory for a single `.uproject`; if none is found it opens a Windows `.uproject` file picker rooted at the current directory. `engine add` first checks whether the current directory is an Unreal Engine root; otherwise it opens a folder picker. Remove with no argument uses the built-in fuzzy picker.
 
 Removed discovered engines are persisted as hidden paths so launcher/registry discovery does not immediately add them back. Adding or selecting that engine again unhides it.
+
+### Unreal file index
+
+UPH can maintain a tiny machine-local index containing only Unreal project and plugin descriptors:
+
+```powershell
+uph index rebuild                 # index all fixed local drives
+uph index rebuild H:\            # index one drive/root
+uph index rebuild H:\projects D:\work
+uph index status
+uph index test                    # synthetic scanner/cache/search self-test
+uph index clear
+
+uph find Ulu
+uph find ScriptRuntime --plugins
+uph find Hollow --projects
+uph find --limit 200              # interactive fuzzy picker over indexed files
+```
+
+On Windows, whole NTFS drive roots first use direct MFT enumeration via `FSCTL_ENUM_USN_DATA`, avoiding a normal recursive directory walk when raw-volume access is available. If Windows denies raw-volume access or a supplied root is not a whole NTFS drive, UPH falls back to a permission-tolerant directory scan. The resulting cache lives beside UPH's other per-user configuration files as `unreal-files.idx`.
+
+Indexed projects are also included automatically in `uph project select`, so a project does not have to be manually registered before it can be found.
