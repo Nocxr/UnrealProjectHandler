@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -499,13 +500,7 @@ static bool resolve_engine_selector(const std::string& selector, fs::path& resul
     }
 
     const auto& matches = !exact.empty() ? exact : partial;
-    if (matches.size() != 1) {
-        if (matches.size() > 1) {
-            std::cerr << "UPH: engine selector is ambiguous; choose a folder name or path:\n";
-            for (const auto& path : matches) std::cerr << "  " << path.string() << "\n";
-        }
-        return false;
-    }
+    if (matches.size() != 1) return false;
     result = matches.front();
     return true;
 }
@@ -709,7 +704,7 @@ static int command_project(int argc, char** argv) {
         return 0;
     }
 
-    std::cerr << "Usage: uph project list|current|select <name|path>\n";
+    std::cerr << "Usage: uph project list|current|select [name|path]\n";
     return 2;
 }
 
@@ -770,7 +765,7 @@ static int command_engine(int argc, char** argv) {
         return 0;
     }
 
-    std::cerr << "Usage: uph engine list|current|select <name|path>\n";
+    std::cerr << "Usage: uph engine list|current|select [name|path]\n";
     return 2;
 }
 
