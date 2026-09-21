@@ -8,7 +8,7 @@ APP_TARGET := build/uph-app
 CLI_TARGET := build/uph
 TARGETS := $(APP_TARGET) $(CLI_TARGET)
 
-SOURCES := src/main.cpp \
+APP_SOURCES := src/main.cpp \
 	$(IMGUI_DIR)/imgui.cpp \
 	$(IMGUI_DIR)/imgui_draw.cpp \
 	$(IMGUI_DIR)/imgui_tables.cpp \
@@ -16,12 +16,15 @@ SOURCES := src/main.cpp \
 	$(IMGUI_DIR)/backends/imgui_impl_sdl3.cpp \
 	$(IMGUI_DIR)/backends/imgui_impl_opengl3.cpp
 
+CLI_SOURCES := src/cli_main.cpp
+
 WINDOWS_RESOURCES :=
 SDL_TARGETS :=
 RUNTIME_FILES :=
 SDL_CMAKE_GENERATOR :=
 APP_SUBSYSTEM :=
 CLI_SUBSYSTEM :=
+CLI_LIBS :=
 
 ifeq ($(OS),Windows_NT)
     SCOOP_ROOT ?= $(USERPROFILE)/scoop
@@ -38,45 +41,56 @@ ifeq ($(OS),Windows_NT)
         WINDRES := $(GCC_BIN)/windres.exe
     endif
     WINDRES ?= windres
+
     WINDOWS_RESOURCES := build/uph.res
     SDL_TARGETS := $(SDL_BUILD_DIR)/libSDL3.dll.a $(SDL_BUILD_DIR)/SDL3.dll
     RUNTIME_FILES := build/SDL3.dll
     SDL_CMAKE_GENERATOR := MinGW Makefiles
-    CXX ?= g++
+
     APP_TARGET := build/uph-app.exe
     CLI_TARGET := build/uph.exe
     TARGETS := $(APP_TARGET) $(CLI_TARGET)
+
     SDL_CFLAGS := -I$(SDL_DIR)/include
-    SDL_LIBS := -L$(SDL_BUILD_DIR) -lSDL3 -lopengl32 -lshell32
+    APP_LIBS := -L$(SDL_BUILD_DIR) -lSDL3 -lopengl32 -lshell32
+    CLI_LIBS := -lshell32
     APP_SUBSYSTEM := -mwindows
     CLI_SUBSYSTEM := -mconsole
+
     MKDIR := if not exist build mkdir build
-    RMDIR_BUILD := if exist build rmdir /S /Q build
+    CLEAN_UPH := if exist build\uph.exe del /Q build\uph.exe & if exist build\uph-app.exe del /Q build\uph-app.exe & if exist build\uph.res del /Q build\uph.res & if exist build\SDL3.dll del /Q build\SDL3.dll
+    DEEP_CLEAN := if exist build rmdir /S /Q build
 else
     SDL_TARGETS := $(SDL_BUILD_DIR)/libSDL3.dylib
     SDL_CMAKE_GENERATOR := Unix Makefiles
     MAKE_PROGRAM ?= make
     SDL_CFLAGS := -I$(SDL_DIR)/include
-    SDL_LIBS := -L$(SDL_BUILD_DIR) -Wl,-rpath,$(abspath $(SDL_BUILD_DIR)) -lSDL3 \
+    APP_LIBS := -L$(SDL_BUILD_DIR) -Wl,-rpath,$(abspath $(SDL_BUILD_DIR)) -lSDL3 \
 		-framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo
+    CLI_LIBS :=
     MKDIR := mkdir -p build
-    RMDIR_BUILD := $(RM) -r build
+    CLEAN_UPH := $(RM) -f $(APP_TARGET) $(CLI_TARGET)
+    DEEP_CLEAN := $(RM) -r build
 endif
 
-CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wpedantic $(SDL_CFLAGS) \
-	-I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
-LDFLAGS := $(SDL_LIBS)
+COMMON_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wpedantic
+APP_CXXFLAGS := $(COMMON_CXXFLAGS) $(SDL_CFLAGS) -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
+CLI_CXXFLAGS := $(COMMON_CXXFLAGS)
 
-.PHONY: all run install clean
-all: $(TARGETS)
+.PHONY: all app cli run install clean clean-all rebuild
+all: app cli
 
-$(APP_TARGET): $(SOURCES) $(WINDOWS_RESOURCES) $(SDL_TARGETS) $(RUNTIME_FILES)
+app: $(APP_TARGET)
+
+cli: $(CLI_TARGET)
+
+$(APP_TARGET): $(APP_SOURCES) $(WINDOWS_RESOURCES) $(SDL_TARGETS) $(RUNTIME_FILES)
 	@$(MKDIR)
-	$(CXX) $(CXXFLAGS) -DUPH_GUI_BUILD $(SOURCES) $(WINDOWS_RESOURCES) -o $@ $(LDFLAGS) $(APP_SUBSYSTEM)
+	$(CXX) $(APP_CXXFLAGS) $(APP_SOURCES) $(WINDOWS_RESOURCES) -o $@ $(APP_LIBS) $(APP_SUBSYSTEM)
 
-$(CLI_TARGET): $(SOURCES) $(WINDOWS_RESOURCES) $(SDL_TARGETS) $(RUNTIME_FILES)
+$(CLI_TARGET): $(CLI_SOURCES)
 	@$(MKDIR)
-	$(CXX) $(CXXFLAGS) -DUPH_CLI_BUILD $(SOURCES) $(WINDOWS_RESOURCES) -o $@ $(LDFLAGS) $(CLI_SUBSYSTEM)
+	$(CXX) $(CLI_CXXFLAGS) $(CLI_SOURCES) -o $@ $(CLI_LIBS) $(CLI_SUBSYSTEM)
 
 $(SDL_TARGETS): $(SDL_DIR)/CMakeLists.txt
 	cmake -S $(SDL_DIR) -B $(SDL_BUILD_DIR) -G "$(SDL_CMAKE_GENERATOR)" -DCMAKE_MAKE_PROGRAM="$(MAKE_PROGRAM)" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$(CC)" -DCMAKE_CXX_COMPILER="$(CXX)" -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF
@@ -105,4 +119,10 @@ run: all
 	./$(CLI_TARGET)
 
 clean:
-	$(RMDIR_BUILD)
+	$(CLEAN_UPH)
+
+clean-all:
+	$(DEEP_CLEAN)
+
+rebuild: clean
+	$(MAKE) all
