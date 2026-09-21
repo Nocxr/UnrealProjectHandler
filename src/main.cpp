@@ -609,6 +609,8 @@ static std::string engine_version(const fs::path& engine) {
     return major.empty() ? engine.filename().string() : "Unreal Engine " + major + "." + minor;
 }
 
+static std::string normalized_path_key(const fs::path& path);
+
 static bool valid_engine(const fs::path& path) {
     return fs::exists(path / "Engine/Build/Build.version") && fs::exists(path / "Engine/Binaries");
 }
