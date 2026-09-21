@@ -12,7 +12,7 @@ on:
       - ".github/workflows/unreal-index-test.yml"
 
 jobs:
-  cli-index-test:
+  linux-cli-index-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,3 +34,29 @@ jobs:
           ./build/uph index rebuild "$root"
           ./build/uph find SampleProject --projects
           ./build/uph find SamplePlugin --plugins
+
+  windows-cli-index-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CLI with MSVC
+        shell: cmd
+        run: |
+          if not exist build mkdir build
+          cl /nologo /std:c++20 /EHsc /W4 src\cli_main.cpp src\unreal_file_index.cpp /Febuild\uph.exe shell32.lib ole32.lib uuid.lib
+
+      - name: Run index self-test
+        shell: cmd
+        run: build\uph.exe index test
+
+      - name: Exercise rebuild and search
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "uph-index-fixture"
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "Game\Plugins\SamplePlugin") | Out-Null
+          '{}' | Set-Content (Join-Path $root "Game\SampleProject.uproject")
+          '{}' | Set-Content (Join-Path $root "Game\Plugins\SamplePlugin\SamplePlugin.uplugin")
+          .\build\uph.exe index rebuild $root
+          .\build\uph.exe find SampleProject --projects
+          .\build\uph.exe find SamplePlugin --plugins
