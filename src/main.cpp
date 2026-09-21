@@ -3051,7 +3051,7 @@ static bool send_uph_copydata_text(ULONG_PTR command, const std::string& value) 
     copy.lpData = payload.data();
     DWORD_PTR result = 0;
     if (!SendMessageTimeoutW(hwnd, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&copy),
-                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 3000, &result))
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 15000, &result))
         return false;
     return result == TRUE;
 }
