@@ -156,6 +156,10 @@ struct AppState {
     std::mutex favorite_remote_mutex;
     std::mutex app_update_mutex;
     std::string operation_progress_label;
+    std::string last_operation;
+    std::string last_result{"none"};
+    ULONG_PTR last_ipc_command = 0;
+    std::string last_ipc_payload;
     std::map<std::string, PluginGitState> pending_plugin_git_cache;
     ProjectGitState pending_git_state;
     fs::path git_root;
@@ -226,6 +230,25 @@ static fs::path settings_path() {
     ensure_config_storage();
     return app_config_dir() / "settings.ini";
 }
+static fs::path runtime_status_path() {
+    ensure_config_storage();
+    return app_config_dir() / "runtime-status.ini";
+}
+
+static fs::path runtime_log_path() {
+    ensure_config_storage();
+    return app_config_dir() / "runtime.log";
+}
+
+static void clear_runtime_log() {
+    std::ofstream(runtime_log_path(), std::ios::trunc);
+}
+
+static void append_runtime_log(const std::string& text) {
+    std::ofstream out(runtime_log_path(), std::ios::app);
+    if (out) out << text << '\n';
+}
+
 
 static fs::path tool_catalog_path() {
     ensure_config_storage();
@@ -442,6 +465,7 @@ static std::string timestamped(const std::string& text) {
 static void log_entry(const std::string& text, bool error = false) {
     std::lock_guard lock(g.mutex);
     g.logs.push_back({text, error});
+    append_runtime_log(text);
 }
 
 static void log_line(const std::string& text) {
@@ -1783,9 +1807,15 @@ static void run_command_with_prep(std::string command, const std::string& name,
                                   bool refresh_plugins = false, bool refresh_git = false,
                                   std::function<void(bool)> finish = {}) {
     if (g.process_running.exchange(true)) { log_line("[ERROR] Another operation is already running."); return; }
-    if (name == "Compile" || name == "Package" || name.rfind("Compile Plugin ", 0) == 0) g.log_expanded = true;
+    if (name == "Compile" || name == "Package" || name == "Deploy" || name.rfind("Compile Plugin ", 0) == 0) g.log_expanded = true;
     g.stop_requested = false;
-    if (g.clear_on_run) { std::lock_guard lock(g.mutex); g.logs.clear(); }
+    g.last_operation = name;
+    g.last_result = "running";
+    if (g.clear_on_run) {
+        std::lock_guard lock(g.mutex);
+        g.logs.clear();
+        clear_runtime_log();
+    }
 
     std::thread([command = std::move(command), name, prepare = std::move(prepare), refresh_plugins, refresh_git,
                  finish = std::move(finish)] {
@@ -1854,9 +1884,11 @@ static void run_command_with_prep(std::string command, const std::string& name,
                           detail_line.find("ERROR") != std::string::npos || detail_line.find("Error") != std::string::npos);
             }
         }
-        const bool success = status == 0;
+        const bool success = status == 0 && !g.stop_requested;
+        g.last_result = success ? "success" : (g.stop_requested ? "stopped" : "error");
         if (finish) finish(success);
-        log_line(success ? "[SYSTEM] " + name + " completed." : "[ERROR] " + name + " exited with an error.");
+        log_line(success ? "[SYSTEM] " + name + " completed." :
+                 (g.stop_requested ? "[ERROR] " + name + " stopped." : "[ERROR] " + name + " exited with an error."));
         if (refresh_plugins) g.plugin_refresh_requested = true;
         if (refresh_git) g.git_refresh_requested = true;
         g.process_running = false;
@@ -1891,7 +1923,13 @@ static void run_command_sequence(std::vector<std::pair<std::string,std::string>>
     if (steps.empty()) return;
     if (g.process_running.exchange(true)) { log_line("[ERROR] Another operation is already running."); return; }
     g.stop_requested = false;
-    if (g.clear_on_run) { std::lock_guard lock(g.mutex); g.logs.clear(); }
+    g.last_operation = name;
+    g.last_result = "running";
+    if (g.clear_on_run) {
+        std::lock_guard lock(g.mutex);
+        g.logs.clear();
+        clear_runtime_log();
+    }
     g.log_expanded = true;
 
     std::thread([steps = std::move(steps), name, refresh_plugins, refresh_git] {
@@ -1905,6 +1943,7 @@ static void run_command_sequence(std::vector<std::pair<std::string,std::string>>
             // capture_command returns empty both for success-with-no-output and failure, so verify Git steps explicitly when possible
             // by relying on the following step only for commands whose success is naturally required.
         }
+        g.last_result = ok ? "success" : "stopped";
         log_line(ok ? "[SYSTEM] " + name + " completed." : "[ERROR] " + name + " stopped.");
         if (refresh_plugins) g.plugin_refresh_requested = true;
         if (refresh_git) g.git_refresh_requested = true;
