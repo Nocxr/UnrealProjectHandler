@@ -19,6 +19,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <conio.h>
 #include <io.h>
 #endif
@@ -470,14 +471,47 @@ static fs::path browse_uproject(const fs::path& initial) {
 }
 
 static fs::path browse_engine_folder(const fs::path& initial) {
-    auto start = powershell_single_quote(initial.string());
-    auto script =
-        "Add-Type -AssemblyName System.Windows.Forms; "
-        "$d=New-Object System.Windows.Forms.FolderBrowserDialog; "
-        "$d.Description='Select Unreal Engine root folder'; "
-        "$d.SelectedPath='" + start + "'; "
-        "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Write($d.SelectedPath)}";
-    return fs::path(capture_powershell_dialog(script));
+    const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool uninitialize = SUCCEEDED(init);
+
+    IFileOpenDialog* dialog = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || !dialog) {
+        if (uninitialize) CoUninitialize();
+        return {};
+    }
+
+    DWORD options = 0;
+    if (SUCCEEDED(dialog->GetOptions(&options)))
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dialog->SetTitle(L"Select Unreal Engine Root Folder");
+
+    if (!initial.empty()) {
+        IShellItem* folder = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(initial.wstring().c_str(), nullptr,
+                                                  IID_PPV_ARGS(&folder))) && folder) {
+            dialog->SetFolder(folder);
+            folder->Release();
+        }
+    }
+
+    fs::path selected;
+    if (SUCCEEDED(dialog->Show(nullptr))) {
+        IShellItem* result = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&result)) && result) {
+            PWSTR raw_path = nullptr;
+            if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &raw_path)) && raw_path) {
+                selected = fs::path(raw_path);
+                CoTaskMemFree(raw_path);
+            }
+            result->Release();
+        }
+    }
+
+    dialog->Release();
+    if (uninitialize) CoUninitialize();
+    return selected;
 }
 #endif
 
@@ -683,6 +717,24 @@ static fs::path current_executable_path() {
     if (!length || length >= buffer.size()) return {};
     buffer.resize(length);
     return fs::path(buffer);
+}
+
+static fs::path selected_editor_path() {
+    if (g.engine.empty()) return {};
+    return g.engine / "Engine/Binaries/Win64/UnrealEditor.exe";
+}
+
+static bool launch_project_direct(const fs::path& project, bool game) {
+    auto editor = selected_editor_path();
+    if (!fs::is_regular_file(project) || !fs::is_regular_file(editor)) return false;
+
+    std::wstring parameters = L"\"" + project.wstring() + L"\"";
+    if (game) parameters += L" -game -log";
+
+    auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
+        nullptr, L"open", editor.wstring().c_str(), parameters.c_str(),
+        editor.parent_path().wstring().c_str(), SW_SHOWNORMAL));
+    return result > 32;
 }
 
 static bool launch_uph_app() {
@@ -1135,6 +1187,37 @@ int main(int argc, char** argv) {
     if (command == "engine") return command_engine(argc, argv);
 
 #ifdef _WIN32
+    if (command == "open" || command == "run") {
+        fs::path project;
+        if (argc >= 3) project = resolve_project_selector(argv[2]);
+        else {
+            project = current_directory_project();
+            if (project.empty()) project = g.project;
+        }
+        if (project.empty()) {
+            std::cerr << "UPH: no project selected and no .uproject found in the current directory.\n";
+            return 2;
+        }
+
+        if (find_running_uph_window()) {
+            auto ipc = command == "run" ? UPH_COPYDATA_RUN : UPH_COPYDATA_OPEN;
+            if (!send_uph_copydata(ipc, project_payload(project))) {
+                std::cerr << "UPH: the running app rejected the " << command << " request.\n";
+                return 2;
+            }
+            std::cout << (command == "run" ? "Run" : "Open") << " requested through UPH.\n";
+            return 0;
+        }
+
+        if (!launch_project_direct(project, command == "run")) {
+            std::cerr << "UPH: could not launch the selected Unreal Editor directly. Check the selected engine.\n";
+            return 2;
+        }
+        std::cout << "Launching " << project.stem().string()
+                  << (command == "run" ? " as game" : " in Unreal Editor") << ".\n";
+        return 0;
+    }
+
     if (!ensure_app_for_action()) {
         std::cerr << "UPH: could not start or connect to the desktop app.\n";
         return 2;
@@ -1164,26 +1247,6 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::cout << "Editor launch requested through UPH.\n";
-        return 0;
-    }
-
-    if (command == "open" || command == "run") {
-        fs::path project;
-        if (argc >= 3) project = resolve_project_selector(argv[2]);
-        else {
-            project = current_directory_project();
-            if (project.empty()) project = g.project;
-        }
-        if (project.empty()) {
-            std::cerr << "UPH: no project selected and no .uproject found in the current directory.\n";
-            return 2;
-        }
-        auto ipc = command == "run" ? UPH_COPYDATA_RUN : UPH_COPYDATA_OPEN;
-        if (!send_uph_copydata(ipc, project_payload(project))) {
-            std::cerr << "UPH: the app rejected the " << command << " request.\n";
-            return 2;
-        }
-        std::cout << (command == "run" ? "Run" : "Open") << " requested through UPH.\n";
         return 0;
     }
 
