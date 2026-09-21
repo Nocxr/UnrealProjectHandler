@@ -1271,6 +1271,8 @@ static constexpr UINT ID_TRAY_RECENT_PROJECT_BASE = 41100;
 static constexpr UINT ID_TRAY_ENGINE_BASE = 41200;
 static constexpr UINT ID_TRAY_PACKAGE_PLATFORM_BASE = 41300;
 static constexpr UINT ID_TRAY_PACKAGE_CONFIG_BASE = 41400;
+static constexpr ULONG_PTR UPH_COPYDATA_SELECT_ENGINE = 0x55504801;
+static constexpr ULONG_PTR UPH_COPYDATA_SELECT_PROJECT = 0x55504802;
 
 static HWND g_tray_hwnd = nullptr;
 static WNDPROC g_original_window_proc = nullptr;
@@ -1390,18 +1392,27 @@ static void tray_launch_editor() {
     launch_editor_home();
 }
 
-static void select_tray_engine(size_t index) {
+static bool select_engine_path(const fs::path& engine) {
     if (g.process_running) {
         log_line("[ERROR] Stop the current operation before switching engines.");
-        return;
+        return false;
     }
-    if (index >= g.engines.size()) return;
-    g.engine = g.engines[index].path;
+    if (!valid_engine(engine)) {
+        log_line("[ERROR] Selected folder is not a usable Unreal Engine installation.");
+        return false;
+    }
+    g.engine = engine;
     g.plugin_scan_cache.clear();
     discover_engines();
     inspect_project();
     log_line("[SYSTEM] Engine: " + g.engine.string());
     save_settings();
+    return true;
+}
+
+static void select_tray_engine(size_t index) {
+    if (index >= g.engines.size()) return;
+    select_engine_path(g.engines[index].path);
 }
 
 static void show_tray_menu() {
@@ -1620,6 +1631,22 @@ static void show_tray_menu() {
 }
 
 static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_COPYDATA) {
+        auto* copy = reinterpret_cast<COPYDATASTRUCT*>(lparam);
+        if (!copy || !copy->lpData || copy->cbData == 0) return FALSE;
+        const char* bytes = static_cast<const char*>(copy->lpData);
+        std::string value(bytes, strnlen(bytes, copy->cbData));
+        if (copy->dwData == UPH_COPYDATA_SELECT_ENGINE) {
+            return select_engine_path(fs::path(value)) ? TRUE : FALSE;
+        }
+        if (copy->dwData == UPH_COPYDATA_SELECT_PROJECT) {
+            if (g.process_running || !fs::is_regular_file(fs::path(value))) return FALSE;
+            select_project(fs::path(value));
+            return TRUE;
+        }
+        return FALSE;
+    }
+
     if (message == WM_CLOSE && g_tray_installed) {
         hide_main_window_to_tray();
         return 0;
@@ -2881,6 +2908,21 @@ static HWND find_running_uph_window() {
     return FindWindowW(nullptr, L"UPH - Unreal Project Handler");
 }
 
+static bool send_uph_copydata(ULONG_PTR command, const fs::path& path) {
+    HWND hwnd = find_running_uph_window();
+    if (!hwnd) return false;
+    auto value = path.string();
+    COPYDATASTRUCT copy{};
+    copy.dwData = command;
+    copy.cbData = static_cast<DWORD>(value.size() + 1);
+    copy.lpData = value.data();
+    DWORD_PTR result = 0;
+    if (!SendMessageTimeoutW(hwnd, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&copy),
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 3000, &result))
+        return false;
+    return result == TRUE;
+}
+
 static bool foreground_running_uph() {
     HWND hwnd = find_running_uph_window();
     if (!hwnd) return false;
@@ -2957,6 +2999,17 @@ static int cli_select_engine(const std::string& selector) {
         }
         return 2;
     }
+#ifdef _WIN32
+    if (find_running_uph_window()) {
+        if (!send_uph_copydata(UPH_COPYDATA_SELECT_ENGINE, engine)) {
+            std::cerr << "UPH: the running app rejected the engine change (it may be busy).\n";
+            return 2;
+        }
+        g.engine = engine;
+        std::cout << "Selected engine: " << engine_version(g.engine) << "\n" << g.engine.string() << "\n";
+        return 0;
+    }
+#endif
     g.engine = engine;
     g.plugin_scan_cache.clear();
     discover_engines();
@@ -3033,6 +3086,17 @@ static int cli_project_command(int argc, char** argv, int index) {
             std::cerr << "UPH: project not found or selector is ambiguous: " << argv[index + 1] << "\n";
             return 2;
         }
+#ifdef _WIN32
+        if (find_running_uph_window()) {
+            if (!send_uph_copydata(UPH_COPYDATA_SELECT_PROJECT, project)) {
+                std::cerr << "UPH: the running app rejected the project change (it may be busy).\n";
+                return 2;
+            }
+            g.project = project;
+            std::cout << "Selected project: " << g.project.string() << "\n";
+            return 0;
+        }
+#endif
         use_cli_project(project, true);
         std::cout << "Selected project: " << g.project.string() << "\n";
         return 0;
