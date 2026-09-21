@@ -207,51 +207,78 @@ static std::optional<size_t> interactive_picker(const std::string& title,
     if (output == INVALID_HANDLE_VALUE || !GetConsoleMode(output, &original_mode))
         return fallback_numbered_picker(title, items);
 
-    const bool vt_enabled = SetConsoleMode(output, original_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
-    if (!vt_enabled)
+    if (!SetConsoleMode(output, original_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
         return fallback_numbered_picker(title, items);
 
     struct ConsoleRestore {
         HANDLE output;
         DWORD mode;
         ~ConsoleRestore() {
-            std::cout << "\x1b[?25h\x1b[?1049l";
+            std::cout << "\x1b[?25h";
             std::cout.flush();
             SetConsoleMode(output, mode);
         }
     } restore{output, original_mode};
 
-    std::cout << "\x1b[?1049h\x1b[?25l";
     std::string query = initial_query;
     size_t selected = 0;
-    constexpr size_t max_visible = 12;
+    constexpr size_t max_visible = 8;
+    size_t previous_lines = 0;
 
+    auto clear_previous = [&]() {
+        if (previous_lines == 0) return;
+        std::cout << "\x1b[" << previous_lines << "A";
+        for (size_t i = 0; i < previous_lines; ++i) {
+            std::cout << "\r\x1b[2K";
+            if (i + 1 < previous_lines) std::cout << "\n";
+        }
+        if (previous_lines > 1) std::cout << "\x1b[" << (previous_lines - 1) << "A";
+        std::cout << "\r";
+    };
+
+    auto render = [&](const std::vector<size_t>& matches) {
+        clear_previous();
+
+        size_t start_row = 0;
+        if (!matches.empty() && selected >= max_visible)
+            start_row = selected - max_visible + 1;
+        const size_t end_row = std::min(matches.size(), start_row + max_visible);
+
+        std::vector<std::string> lines;
+        lines.push_back(title);
+        lines.push_back("> " + query);
+
+        if (matches.empty()) {
+            lines.push_back("  No matches");
+        } else {
+            for (size_t row = start_row; row < end_row; ++row) {
+                const bool active = row == selected;
+                lines.push_back(std::string(active ? "> " : "  ") + items[matches[row]]);
+            }
+            if (matches.size() > max_visible)
+                lines.push_back("  " + std::to_string(matches.size()) + " matches");
+        }
+
+        lines.push_back("Type to filter | Up/Down move | Enter select | Esc cancel");
+
+        for (size_t i = 0; i < lines.size(); ++i) {
+            std::cout << "\r\x1b[2K";
+            const bool item_line = i >= 2 && i < 2 + (end_row - start_row);
+            const size_t row = i >= 2 ? i - 2 + start_row : 0;
+            const bool active = item_line && !matches.empty() && row == selected;
+            if (active) std::cout << "\x1b[7m" << lines[i] << "\x1b[0m";
+            else std::cout << lines[i];
+            std::cout << "\n";
+        }
+        std::cout.flush();
+        previous_lines = lines.size();
+    };
+
+    std::cout << "\x1b[?25l";
     for (;;) {
         auto matches = fuzzy_matches(items, query);
         if (selected >= matches.size()) selected = matches.empty() ? 0 : matches.size() - 1;
-
-        std::cout << "\x1b[H\x1b[2J";
-        std::cout << title << "\n";
-        std::cout << "> " << query << "\n\n";
-
-        if (matches.empty()) {
-            std::cout << "  No matches\n";
-        } else {
-            size_t start = 0;
-            if (selected >= max_visible) start = selected - max_visible + 1;
-            const size_t end = std::min(matches.size(), start + max_visible);
-            for (size_t row = start; row < end; ++row) {
-                const bool active = row == selected;
-                std::cout << (active ? "\x1b[7m> " : "  ")
-                          << items[matches[row]]
-                          << (active ? "\x1b[0m" : "") << "\n";
-            }
-            if (matches.size() > max_visible)
-                std::cout << "\n  " << matches.size() << " matches\n";
-        }
-
-        std::cout << "\nType to filter  ↑/↓ move  Enter select  Esc cancel";
-        std::cout.flush();
+        render(matches);
 
         int key = _getwch();
         if (key == 0 || key == 224) {
@@ -261,9 +288,18 @@ static std::optional<size_t> interactive_picker(const std::string& title,
             continue;
         }
 
-        if (key == 27) return std::nullopt;
+        if (key == 27) {
+            clear_previous();
+            std::cout << "\x1b[?25h";
+            return std::nullopt;
+        }
         if (key == 13) {
-            if (!matches.empty()) return matches[selected];
+            if (!matches.empty()) {
+                auto result = matches[selected];
+                clear_previous();
+                std::cout << "\x1b[?25h";
+                return result;
+            }
             continue;
         }
         if (key == 8 || key == 127) {
@@ -281,7 +317,6 @@ static std::optional<size_t> interactive_picker(const std::string& title,
     return fallback_numbered_picker(title, items);
 #endif
 }
-
 
 static std::string normalized_path_key(const fs::path& path) {
     std::error_code ec;
