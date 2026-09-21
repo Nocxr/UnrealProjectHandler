@@ -15,8 +15,8 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <shellapi.h>
 #include <windows.h>
+#include <shellapi.h>
 #endif
 
 namespace fs = std::filesystem;
