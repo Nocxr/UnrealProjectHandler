@@ -76,6 +76,8 @@ If the current directory contains exactly one `.uproject`, `open`, `run`, `build
 
 Project and engine selections made with `uph project select` and `uph engine select` use the same saved UPH settings as the desktop application.
 
+When the desktop app is already running on Windows, `uph editor`, `uph open`, `uph run`, `uph build`, and `uph package` are routed through that running app. Build/package output appears in UPH's existing log/process flow, and the app rejects conflicting requests while another operation is active.
+
 ## macOS
 
 Prerequisites: Xcode Command Line Tools and CMake.
