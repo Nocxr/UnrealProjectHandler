@@ -58,7 +58,7 @@ ifeq ($(OS),Windows_NT)
     CLI_SUBSYSTEM := -mconsole
 
     MKDIR := if not exist build mkdir build
-    CLEAN_UPH := if exist build\uph.exe del /Q build\uph.exe & if exist build\uph-app.exe del /Q build\uph-app.exe & if exist build\uph.res del /Q build\uph.res & if exist build\SDL3.dll del /Q build\SDL3.dll
+    CLEAN_UPH := if exist build\uph.exe del /Q build\uph.exe & if exist build\uph-app.exe del /Q build\uph-app.exe & if exist build\uph.res del /Q build\uph.res
     DEEP_CLEAN := if exist build rmdir /S /Q build
 else
     SDL_TARGETS := $(SDL_BUILD_DIR)/libSDL3.dylib
