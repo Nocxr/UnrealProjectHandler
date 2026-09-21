@@ -1177,8 +1177,9 @@ static void install_unreal_android_package_async(bool launch_after) {
     auto adb = adb_executable();
     AndroidPackageArtifacts artifacts;
     std::string serial;
+    const std::string project_name = g.project.stem().string();
     { std::lock_guard lock(g.adb_mutex); serial = g.adb_serial; artifacts = g.adb_artifacts; }
-    std::thread([adb, serial, artifacts, launch_after] {
+    std::thread([adb, serial, artifacts, launch_after, project_name] {
         if (adb.empty() || serial.empty() || artifacts.apk.empty() || artifacts.package.empty()) {
             log_line("[ERROR] Unreal Android install is missing ADB, device, APK, or package name.");
             g.adb_action_running = false;
@@ -1203,7 +1204,6 @@ static void install_unreal_android_package_async(bool launch_after) {
 
         auto storage = capture_command(p + " shell \"echo $EXTERNAL_STORAGE\"");
         if (!storage.empty()) {
-            auto project_name = g.project.stem().string();
             capture_command(p + " shell rm -r " + quote(fs::path(storage + "/UnrealGame/" + project_name)));
             capture_command(p + " shell rm -r " + quote(fs::path(storage + "/UnrealGame/UECommandLine.txt")));
             capture_command(p + " shell rm -r " + quote(fs::path(storage + "/obb/" + artifacts.package)));
@@ -2270,6 +2270,9 @@ static constexpr ULONG_PTR UPH_COPYDATA_OPEN = 0x55504804;
 static constexpr ULONG_PTR UPH_COPYDATA_RUN = 0x55504805;
 static constexpr ULONG_PTR UPH_COPYDATA_BUILD = 0x55504806;
 static constexpr ULONG_PTR UPH_COPYDATA_PACKAGE = 0x55504807;
+static constexpr ULONG_PTR UPH_COPYDATA_STOP = 0x55504808;
+static constexpr ULONG_PTR UPH_COPYDATA_RERUN = 0x55504809;
+static constexpr ULONG_PTR UPH_COPYDATA_DEPLOY = 0x5550480A;
 
 static HWND g_tray_hwnd = nullptr;
 static WNDPROC g_original_window_proc = nullptr;
@@ -2762,6 +2765,83 @@ static bool ipc_package(const std::map<std::string, std::string>& fields) {
     return true;
 }
 
+static bool ipc_deploy(const std::map<std::string, std::string>& fields) {
+    if (g.process_running || g.adb_action_running) return false;
+
+    std::string serial;
+    {
+        std::lock_guard lock(g.adb_mutex);
+        serial = g.adb_serial;
+    }
+    if (serial.empty() || adb_executable().empty()) {
+        log_line("[ERROR] Deploy requires a selected Android device and ADB.");
+        return false;
+    }
+
+    const auto old_project = g.project, old_engine = g.engine;
+    const auto old_targets = g.targets; const auto old_tools = g.tools;
+    const auto old_output = g.output; const int old_platform = g.package_platform, old_config = g.package_config;
+
+    if (!ipc_prepare_project(fields)) return false;
+    g.package_platform = 2; // Android
+    try {
+        if (auto found = fields.find("config"); found != fields.end())
+            g.package_config = std::clamp(std::stoi(found->second), 0, static_cast<int>(g.configs.size()) - 1);
+    } catch (...) {
+        g.project = old_project; g.engine = old_engine; g.targets = old_targets; g.tools = old_tools;
+        g.output = old_output; g.package_platform = old_platform; g.package_config = old_config;
+        return false;
+    }
+    if (auto found = fields.find("output"); found != fields.end() && !found->second.empty())
+        g.output = found->second;
+
+    const fs::path deploy_project = g.project;
+    const fs::path deploy_output = package_output();
+    const int deploy_config = g.package_config;
+
+    const bool ready = fs::is_regular_file(g.project) && fs::exists(run_uat()) && package_platform_ready(g.package_platform);
+    if (ready && g.clean_output) clean_output();
+    auto command = ready ? package_command() : std::string{};
+
+    g.project = old_project; g.engine = old_engine; g.targets = old_targets; g.tools = old_tools;
+    g.output = old_output; g.package_platform = old_platform; g.package_config = old_config;
+
+    if (!ready || command.empty()) return false;
+
+    run_command_with_prep(command, "Deploy", {}, false, false,
+        [deploy_project, deploy_output, deploy_config](bool success) {
+            if (!success) return;
+
+            const auto saved_project = g.project;
+            const auto saved_output = g.output;
+            const int saved_platform = g.package_platform;
+            const int saved_config = g.package_config;
+
+            g.project = deploy_project;
+            g.output = deploy_output;
+            g.package_platform = 2;
+            g.package_config = deploy_config;
+            refresh_android_artifacts();
+
+            g.project = saved_project;
+            g.output = saved_output;
+            g.package_platform = saved_platform;
+            g.package_config = saved_config;
+
+            install_unreal_android_package_async(true);
+        });
+    return true;
+}
+
+static bool rerun_last_ipc_action() {
+    if (g.process_running || g.last_ipc_command == 0) return false;
+    auto fields = parse_ipc_fields(g.last_ipc_payload);
+    if (g.last_ipc_command == UPH_COPYDATA_BUILD) return ipc_build(fields);
+    if (g.last_ipc_command == UPH_COPYDATA_PACKAGE) return ipc_package(fields);
+    if (g.last_ipc_command == UPH_COPYDATA_DEPLOY) return ipc_deploy(fields);
+    return false;
+}
+
 static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_COPYDATA) {
         auto* copy = reinterpret_cast<COPYDATASTRUCT*>(lparam);
@@ -2779,8 +2859,39 @@ static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wpa
         if (copy->dwData == UPH_COPYDATA_EDITOR) { if (!tray_can_launch_editor()) return FALSE; tray_launch_editor(); return TRUE; }
         if (copy->dwData == UPH_COPYDATA_OPEN) return ipc_launch_project(false, fields) ? TRUE : FALSE;
         if (copy->dwData == UPH_COPYDATA_RUN) return ipc_launch_project(true, fields) ? TRUE : FALSE;
-        if (copy->dwData == UPH_COPYDATA_BUILD) return ipc_build(fields) ? TRUE : FALSE;
-        if (copy->dwData == UPH_COPYDATA_PACKAGE) return ipc_package(fields) ? TRUE : FALSE;
+        if (copy->dwData == UPH_COPYDATA_STOP) {
+            bool stopped = false;
+            if (g.process_running) {
+                g.stop_requested = true;
+                log_line("[SYSTEM] Stop requested from CLI.");
+                stopped = true;
+            }
+            if (g.adb_logcat_running) {
+                stop_adb_logcat();
+                stopped = true;
+            }
+            return stopped ? TRUE : FALSE;
+        }
+        if (copy->dwData == UPH_COPYDATA_RERUN)
+            return rerun_last_ipc_action() ? TRUE : FALSE;
+        if (copy->dwData == UPH_COPYDATA_BUILD) {
+            if (!ipc_build(fields)) return FALSE;
+            g.last_ipc_command = UPH_COPYDATA_BUILD;
+            g.last_ipc_payload = value;
+            return TRUE;
+        }
+        if (copy->dwData == UPH_COPYDATA_PACKAGE) {
+            if (!ipc_package(fields)) return FALSE;
+            g.last_ipc_command = UPH_COPYDATA_PACKAGE;
+            g.last_ipc_payload = value;
+            return TRUE;
+        }
+        if (copy->dwData == UPH_COPYDATA_DEPLOY) {
+            if (!ipc_deploy(fields)) return FALSE;
+            g.last_ipc_command = UPH_COPYDATA_DEPLOY;
+            g.last_ipc_payload = value;
+            return TRUE;
+        }
         return FALSE;
     }
 
