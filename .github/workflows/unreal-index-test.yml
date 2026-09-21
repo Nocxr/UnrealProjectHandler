@@ -47,7 +47,7 @@ jobs:
         shell: cmd
         run: |
           if not exist build mkdir build
-          cl /nologo /std:c++20 /EHsc /W4 src\cli_main.cpp src\unreal_file_index.cpp /Febuild\uph.exe shell32.lib ole32.lib uuid.lib
+          cl /nologo /std:c++20 /EHsc /W4 src\cli_main.cpp src\unreal_file_index.cpp /Febuild\uph.exe shell32.lib ole32.lib uuid.lib user32.lib advapi32.lib
 
       - name: Run index self-test
         shell: cmd
