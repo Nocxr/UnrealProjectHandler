@@ -19,6 +19,14 @@
 #endif
 #include <windows.h>
 #include <winioctl.h>
+
+#if defined(__MINGW32__) || defined(__MINGW64__)
+using MftEnumDataV0 = MFT_ENUM_DATA;
+using UsnRecordV2 = USN_RECORD;
+#else
+using MftEnumDataV0 = MFT_ENUM_DATA_V0;
+using UsnRecordV2 = USN_RECORD_V2;
+#endif
 #endif
 
 namespace uph {
@@ -256,7 +264,7 @@ bool enumerate_ntfs_mft(const fs::path& root,
         return false;
     }
 
-    MFT_ENUM_DATA_V0 query{};
+    MftEnumDataV0 query{};
     query.StartFileReferenceNumber = 0;
     query.LowUsn = 0;
     query.HighUsn = MAXLONGLONG;
@@ -301,8 +309,8 @@ bool enumerate_ntfs_mft(const fs::path& root,
             const auto major_version = *reinterpret_cast<const WORD*>(cursor + sizeof(DWORD));
             if (record_length == 0 || cursor + record_length > end) break;
 
-            if (major_version == 2 && record_length >= sizeof(USN_RECORD_V2)) {
-                const auto* record = reinterpret_cast<const USN_RECORD_V2*>(cursor);
+            if (major_version == 2 && record_length >= sizeof(UsnRecordV2)) {
+                const auto* record = reinterpret_cast<const UsnRecordV2*>(cursor);
                 const auto name_chars = record->FileNameLength / sizeof(wchar_t);
                 const auto* name_ptr = reinterpret_cast<const wchar_t*>(
                     cursor + record->FileNameOffset);
