@@ -2888,7 +2888,10 @@ static LRESULT CALLBACK uph_tray_window_proc(HWND hwnd, UINT message, WPARAM wpa
         }
         if (copy->dwData == UPH_COPYDATA_ADD_PROJECT) {
             fs::path project = value;
-            if (!fs::is_regular_file(project) || lower_copy(project.extension().string()) != ".uproject") return FALSE;
+            auto extension = project.extension().string();
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                           [](unsigned char ch){ return static_cast<char>(std::tolower(ch)); });
+            if (!fs::is_regular_file(project) || extension != ".uproject") return FALSE;
             remember_project(project);
             save_settings();
             log_line("[SYSTEM] Added project: " + project.string());
