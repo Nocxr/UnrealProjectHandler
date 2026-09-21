@@ -35,6 +35,10 @@ static constexpr std::uintptr_t UPH_COPYDATA_PACKAGE = 0x55504807;
 static constexpr std::uintptr_t UPH_COPYDATA_STOP = 0x55504808;
 static constexpr std::uintptr_t UPH_COPYDATA_RERUN = 0x55504809;
 static constexpr std::uintptr_t UPH_COPYDATA_DEPLOY = 0x5550480A;
+static constexpr std::uintptr_t UPH_COPYDATA_ADD_PROJECT = 0x5550480B;
+static constexpr std::uintptr_t UPH_COPYDATA_REMOVE_PROJECT = 0x5550480C;
+static constexpr std::uintptr_t UPH_COPYDATA_ADD_ENGINE = 0x5550480D;
+static constexpr std::uintptr_t UPH_COPYDATA_REMOVE_ENGINE = 0x5550480E;
 
 struct Engine {
     std::string label;
@@ -45,6 +49,8 @@ struct CliState {
     fs::path project;
     std::vector<fs::path> recent_projects;
     fs::path engine;
+    std::vector<fs::path> known_engines;
+    std::vector<fs::path> hidden_engines;
     fs::path output;
     int compile_config = 0;
     int package_config = 0;
@@ -373,6 +379,8 @@ static void load_settings() {
             if (key == "project") g.project = value;
             else if (key == "recent_project" && !value.empty()) g.recent_projects.emplace_back(value);
             else if (key == "engine") g.engine = value;
+            else if (key == "known_engine" && !value.empty()) g.known_engines.emplace_back(value);
+            else if (key == "hidden_engine" && !value.empty()) g.hidden_engines.emplace_back(value);
             else if (key == "output") g.output = value;
             else if (key == "compile_config") g.compile_config = std::stoi(value);
             else if (key == "package_config") g.package_config = std::stoi(value);
@@ -380,6 +388,99 @@ static void load_settings() {
         } catch (...) {}
     }
 }
+
+static void save_cli_selection_state() {
+    std::vector<std::string> preserved;
+    {
+        std::ifstream in(settings_path());
+        std::string line;
+        while (std::getline(in, line)) {
+            auto split = line.find('=');
+            auto key = split == std::string::npos ? line : line.substr(0, split);
+            if (key == "project" || key == "recent_project" || key == "engine" ||
+                key == "known_engine" || key == "hidden_engine")
+                continue;
+            preserved.push_back(line);
+        }
+    }
+
+    std::error_code ec;
+    fs::create_directories(settings_path().parent_path(), ec);
+    std::ofstream out(settings_path(), std::ios::trunc);
+    out << "project=" << g.project.string() << '\n';
+    for (const auto& project : g.recent_projects)
+        if (!project.empty()) out << "recent_project=" << project.string() << '\n';
+    out << "engine=" << g.engine.string() << '\n';
+    for (const auto& engine : g.known_engines)
+        if (!engine.empty()) out << "known_engine=" << engine.string() << '\n';
+    for (const auto& engine : g.hidden_engines)
+        if (!engine.empty()) out << "hidden_engine=" << engine.string() << '\n';
+    for (const auto& line : preserved) out << line << '\n';
+}
+
+static void remember_cli_project(const fs::path& project) {
+    if (project.empty()) return;
+    auto key = normalized_path_key(project);
+    g.recent_projects.erase(std::remove_if(g.recent_projects.begin(), g.recent_projects.end(),
+        [&](const fs::path& item){ return normalized_path_key(item) == key; }), g.recent_projects.end());
+    g.recent_projects.insert(g.recent_projects.begin(), project);
+    if (g.recent_projects.size() > 20) g.recent_projects.resize(20);
+}
+
+static void remember_cli_engine(const fs::path& engine) {
+    auto key = normalized_path_key(engine);
+    g.hidden_engines.erase(std::remove_if(g.hidden_engines.begin(), g.hidden_engines.end(),
+        [&](const fs::path& item){ return normalized_path_key(item) == key; }), g.hidden_engines.end());
+    if (std::none_of(g.known_engines.begin(), g.known_engines.end(),
+                     [&](const fs::path& item){ return normalized_path_key(item) == key; }))
+        g.known_engines.push_back(engine);
+}
+
+static std::string powershell_single_quote(std::string text) {
+    size_t at = 0;
+    while ((at = text.find('\'', at)) != std::string::npos) {
+        text.insert(at, "'");
+        at += 2;
+    }
+    return text;
+}
+
+#ifdef _WIN32
+static std::string capture_powershell_dialog(const std::string& script) {
+    auto command = "powershell -NoProfile -STA -Command \"" + script + "\"";
+    FILE* pipe = _popen(command.c_str(), "r");
+    if (!pipe) return {};
+    std::string output;
+    char buffer[2048];
+    while (fgets(buffer, sizeof(buffer), pipe)) output += buffer;
+    _pclose(pipe);
+    while (!output.empty() && (output.back() == '\r' || output.back() == '\n')) output.pop_back();
+    return output;
+}
+
+static fs::path browse_uproject(const fs::path& initial) {
+    auto start = powershell_single_quote(initial.string());
+    auto script =
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$d=New-Object System.Windows.Forms.OpenFileDialog; "
+        "$d.Filter='Unreal Project (*.uproject)|*.uproject'; "
+        "$d.InitialDirectory='" + start + "'; "
+        "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Write($d.FileName)}";
+    return fs::path(capture_powershell_dialog(script));
+}
+
+static fs::path browse_engine_folder(const fs::path& initial) {
+    auto start = powershell_single_quote(initial.string());
+    auto script =
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$d=New-Object System.Windows.Forms.FolderBrowserDialog; "
+        "$d.Description='Select Unreal Engine root folder'; "
+        "$d.SelectedPath='" + start + "'; "
+        "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Write($d.SelectedPath)}";
+    return fs::path(capture_powershell_dialog(script));
+}
+#endif
+
 
 static fs::path project_in_directory(const fs::path& directory) {
     std::error_code ec;
@@ -487,6 +588,10 @@ static std::vector<Engine> discover_engines() {
     auto add = [&](fs::path path) {
         std::error_code ec;
         if (!valid_engine(path) || excluded_engine_path(path)) return;
+        auto path_key = normalized_path_key(path);
+        if (std::any_of(g.hidden_engines.begin(), g.hidden_engines.end(),
+                        [&](const fs::path& item){ return normalized_path_key(item) == path_key; }))
+            return;
         auto canonical = fs::weakly_canonical(path, ec);
         if (ec) canonical = path;
         auto key = normalized_path_key(canonical);
@@ -496,6 +601,7 @@ static std::vector<Engine> discover_engines() {
     };
 
     if (!g.engine.empty()) add(g.engine);
+    for (const auto& engine : g.known_engines) add(engine);
 #ifdef _WIN32
     for (const auto& path : registry_engine_paths()) add(path);
     for (const char* root : {"C:/Program Files/Epic Games", "D:/Epic Games", "H:/unreal"}) {
@@ -640,9 +746,10 @@ static void print_help() {
         "  uph deploy [project] [config]\n"
         "                              Package Android, install, and launch\n"
         "  uph project list|current|select [name|path]\n"
-        "                              select with no value opens fuzzy picker\n"
+        "  uph project add [path] | remove [name|path]\n"
         "  uph engine list|current|select [name|path]\n"
-        "                              select with no value opens fuzzy picker\n"
+        "  uph engine add [path] | remove [name|path]\n"
+        "                              select/remove with no value opens fuzzy picker\n"
         "  uph editor\n"
         "  uph open [project]\n"
         "  uph run [project]\n"
@@ -701,6 +808,79 @@ static int command_project(int argc, char** argv) {
         return 0;
     }
 
+    if (action == "add") {
+        fs::path project;
+        if (argc >= 4) {
+            fs::path supplied = argv[3];
+            std::error_code ec;
+            if (fs::is_directory(supplied, ec)) project = project_in_directory(supplied);
+            else if (fs::is_regular_file(supplied, ec) && lower_copy(supplied.extension().string()) == ".uproject")
+                project = fs::absolute(supplied, ec);
+        } else {
+            project = current_directory_project();
+#ifdef _WIN32
+            if (project.empty()) {
+                std::error_code ec;
+                project = browse_uproject(fs::current_path(ec));
+            }
+#endif
+        }
+        if (project.empty() || !fs::is_regular_file(project)) {
+            std::cerr << "UPH: no valid .uproject selected.\n";
+            return 2;
+        }
+#ifdef _WIN32
+        if (find_running_uph_window()) {
+            if (!send_uph_copydata(UPH_COPYDATA_ADD_PROJECT, project.string())) {
+                std::cerr << "UPH: the app rejected the project add.\n";
+                return 2;
+            }
+        } else
+#endif
+        {
+            remember_cli_project(project);
+            save_cli_selection_state();
+        }
+        std::cout << "Added project: " << project.string() << '\n';
+        return 0;
+    }
+
+    if (action == "remove") {
+        fs::path project;
+        if (argc >= 4) {
+            project = resolve_project_selector(argv[3]);
+        } else {
+            auto projects = selectable_projects();
+            std::vector<std::string> labels;
+            for (const auto& candidate : projects)
+                labels.push_back(candidate.stem().string() + "  " + candidate.string());
+            auto picked = interactive_picker("Remove Unreal Project", labels);
+            if (!picked) return 1;
+            project = projects[*picked];
+        }
+        if (project.empty()) {
+            std::cerr << "UPH: project not found.\n";
+            return 2;
+        }
+#ifdef _WIN32
+        if (find_running_uph_window()) {
+            if (!send_uph_copydata(UPH_COPYDATA_REMOVE_PROJECT, project.string())) {
+                std::cerr << "UPH: the app rejected the project removal.\n";
+                return 2;
+            }
+        } else
+#endif
+        {
+            auto key = normalized_path_key(project);
+            g.recent_projects.erase(std::remove_if(g.recent_projects.begin(), g.recent_projects.end(),
+                [&](const fs::path& item){ return normalized_path_key(item) == key; }), g.recent_projects.end());
+            if (!g.project.empty() && normalized_path_key(g.project) == key) g.project.clear();
+            save_cli_selection_state();
+        }
+        std::cout << "Removed project: " << project.string() << '\n';
+        return 0;
+    }
+
     if (action == "select") {
         fs::path project;
         if (argc < 4) {
@@ -726,20 +906,26 @@ static int command_project(int argc, char** argv) {
             }
         }
 #ifdef _WIN32
-        if (!ensure_app_for_action() ||
-            !send_uph_copydata(UPH_COPYDATA_SELECT_PROJECT, project.string())) {
-            std::cerr << "UPH: the app rejected the project change.\n";
-            return 2;
+        if (find_running_uph_window()) {
+            if (!send_uph_copydata(UPH_COPYDATA_SELECT_PROJECT, project.string())) {
+                std::cerr << "UPH: the app rejected the project change.\n";
+                return 2;
+            }
+        } else {
+            g.project = project;
+            remember_cli_project(project);
+            save_cli_selection_state();
         }
 #else
-        std::cerr << "UPH: project selection IPC is currently implemented on Windows.\n";
-        return 2;
+        g.project = project;
+        remember_cli_project(project);
+        save_cli_selection_state();
 #endif
         std::cout << "Selected project: " << project.string() << '\n';
         return 0;
     }
 
-    std::cerr << "Usage: uph project list|current|select [name|path]\n";
+    std::cerr << "Usage: uph project list|current|select|add|remove [name|path]\n";
     return 2;
 }
 
@@ -761,6 +947,88 @@ static int command_engine(int argc, char** argv) {
             return 1;
         }
         std::cout << engine_version(g.engine) << '\n' << g.engine.string() << '\n';
+        return 0;
+    }
+
+    if (action == "add") {
+        fs::path engine;
+        if (argc >= 4) {
+            engine = fs::path(argv[3]);
+        } else {
+            std::error_code ec;
+            auto cwd = fs::current_path(ec);
+            if (valid_engine(cwd)) engine = cwd;
+#ifdef _WIN32
+            else engine = browse_engine_folder(cwd);
+#endif
+        }
+        if (!valid_engine(engine) || excluded_engine_path(engine)) {
+            std::cerr << "UPH: selected path is not a usable Unreal Engine root.\n";
+            return 2;
+        }
+        std::error_code ec;
+        engine = fs::weakly_canonical(engine, ec);
+#ifdef _WIN32
+        if (find_running_uph_window()) {
+            if (!send_uph_copydata(UPH_COPYDATA_ADD_ENGINE, engine.string())) {
+                std::cerr << "UPH: the app rejected the engine add.\n";
+                return 2;
+            }
+        } else
+#endif
+        {
+            remember_cli_engine(engine);
+            save_cli_selection_state();
+        }
+        std::cout << "Added engine: " << engine_version(engine) << '\n'
+                  << engine.string() << '\n';
+        return 0;
+    }
+
+    if (action == "remove") {
+        fs::path engine;
+        if (argc >= 4) {
+            if (!resolve_engine_selector(argv[3], engine)) {
+                auto engines = discover_engines();
+                std::vector<std::string> labels;
+                for (const auto& candidate : engines)
+                    labels.push_back(candidate.label + "  " + candidate.path.string());
+                auto picked = interactive_picker("Remove Unreal Engine", labels, argv[3]);
+                if (!picked) return 1;
+                engine = engines[*picked].path;
+            }
+        } else {
+            auto engines = discover_engines();
+            std::vector<std::string> labels;
+            for (const auto& candidate : engines)
+                labels.push_back(candidate.label + "  " + candidate.path.string());
+            auto picked = interactive_picker("Remove Unreal Engine", labels);
+            if (!picked) return 1;
+            engine = engines[*picked].path;
+        }
+        if (engine.empty()) {
+            std::cerr << "UPH: engine not found.\n";
+            return 2;
+        }
+#ifdef _WIN32
+        if (find_running_uph_window()) {
+            if (!send_uph_copydata(UPH_COPYDATA_REMOVE_ENGINE, engine.string())) {
+                std::cerr << "UPH: the app rejected the engine removal.\n";
+                return 2;
+            }
+        } else
+#endif
+        {
+            auto key = normalized_path_key(engine);
+            g.known_engines.erase(std::remove_if(g.known_engines.begin(), g.known_engines.end(),
+                [&](const fs::path& item){ return normalized_path_key(item) == key; }), g.known_engines.end());
+            if (std::none_of(g.hidden_engines.begin(), g.hidden_engines.end(),
+                             [&](const fs::path& item){ return normalized_path_key(item) == key; }))
+                g.hidden_engines.push_back(engine);
+            if (!g.engine.empty() && normalized_path_key(g.engine) == key) g.engine.clear();
+            save_cli_selection_state();
+        }
+        std::cout << "Removed engine: " << engine.string() << '\n';
         return 0;
     }
 
@@ -786,21 +1054,27 @@ static int command_engine(int argc, char** argv) {
             engine = engines[*picked].path;
         }
 #ifdef _WIN32
-        if (!ensure_app_for_action() ||
-            !send_uph_copydata(UPH_COPYDATA_SELECT_ENGINE, engine.string())) {
-            std::cerr << "UPH: the app rejected the engine change.\n";
-            return 2;
+        if (find_running_uph_window()) {
+            if (!send_uph_copydata(UPH_COPYDATA_SELECT_ENGINE, engine.string())) {
+                std::cerr << "UPH: the app rejected the engine change.\n";
+                return 2;
+            }
+        } else {
+            g.engine = engine;
+            remember_cli_engine(engine);
+            save_cli_selection_state();
         }
 #else
-        std::cerr << "UPH: engine selection IPC is currently implemented on Windows.\n";
-        return 2;
+        g.engine = engine;
+        remember_cli_engine(engine);
+        save_cli_selection_state();
 #endif
         std::cout << "Selected engine: " << engine_version(engine) << '\n'
                   << engine.string() << '\n';
         return 0;
     }
 
-    std::cerr << "Usage: uph engine list|current|select [name|path]\n";
+    std::cerr << "Usage: uph engine list|current|select|add|remove [name|path]\n";
     return 2;
 }
 
