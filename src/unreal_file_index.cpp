@@ -624,6 +624,13 @@ UnrealIndexViewStats UnrealFileIndex::view_stats() const {
     return stats;
 }
 
+std::vector<fs::path> UnrealFileIndex::engine_roots() const {
+    std::vector<fs::path> roots;
+    for (const auto& root : infer_engine_roots(records_))
+        roots.emplace_back(root);
+    return roots;
+}
+
 void UnrealFileIndex::replace_records(std::vector<UnrealFileRecord> records) {
     records_ = std::move(records);
     dedupe_and_sort(records_);
