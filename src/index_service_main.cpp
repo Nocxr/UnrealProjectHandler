@@ -365,7 +365,11 @@ bool reconstruct_path(const VolumeState& state,
 
     while (current != 0 && visited.insert(current).second) {
         const auto found = state.directories.find(current);
-        if (found == state.directories.end()) return false;
+        // NTFS does not guarantee that every ancestor/root directory record is
+        // present in the FSCTL_ENUM_USN_DATA result. The standalone scanner
+        // already handles this by keeping the path pieces collected so far.
+        // Do the same here instead of discarding an otherwise valid target.
+        if (found == state.directories.end()) break;
 
         const auto& node = found->second;
         if (!node.name.empty() && node.name != L".")
@@ -625,6 +629,7 @@ int run_index_loop(bool console_mode) {
         append_log("Indexed " + root.string() + " via MFT in " +
                    std::to_string(elapsed) + " ms; targets=" +
                    std::to_string(state.targets.size()) +
+                   "; directories=" + std::to_string(state.directories.size()) +
                    (state.journal_ready ? "; USN live." : "; USN unavailable."));
         volumes.push_back(std::move(state));
     }
@@ -656,8 +661,11 @@ int run_index_loop(bool console_mode) {
 
     write_status("running", records, projects, plugins,
                  volumes.size(), live_count());
+    std::size_t raw_targets = 0;
+    for (const auto& volume : volumes) raw_targets += volume.targets.size();
     append_log("Published shared Unreal index: " +
-               std::to_string(records) + " records.");
+               std::to_string(records) + " records from " +
+               std::to_string(raw_targets) + " raw MFT targets.");
 
     auto last_status_write = std::chrono::steady_clock::now();
 
