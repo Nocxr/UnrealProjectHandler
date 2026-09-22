@@ -91,8 +91,34 @@ static fs::path runtime_status_path() {
     return settings_path().parent_path() / "runtime-status.ini";
 }
 
-static fs::path unreal_index_path() {
+static fs::path user_unreal_index_path() {
     return settings_path().parent_path() / "unreal-files.idx";
+}
+
+static fs::path service_data_dir() {
+#ifdef _WIN32
+    const char* base = std::getenv("PROGRAMDATA");
+    return fs::path(base ? base : "C:\\ProgramData") / "UnrealProjectHandler";
+#else
+    return {};
+#endif
+}
+
+static fs::path service_unreal_index_path() {
+#ifdef _WIN32
+    return service_data_dir() / "unreal-files.idx";
+#else
+    return {};
+#endif
+}
+
+static fs::path unreal_index_path() {
+#ifdef _WIN32
+    std::error_code ec;
+    const auto shared = service_unreal_index_path();
+    if (!shared.empty() && fs::is_regular_file(shared, ec)) return shared;
+#endif
+    return user_unreal_index_path();
 }
 
 static fs::path runtime_log_path() {
@@ -735,6 +761,87 @@ static fs::path current_executable_path() {
     return fs::path(buffer);
 }
 
+
+static fs::path index_service_executable_path() {
+    auto sibling = current_executable_path().parent_path() / "uph-index-service.exe";
+    std::error_code ec;
+    if (fs::is_regular_file(sibling, ec)) return sibling;
+
+    auto installed = service_data_dir() / "uph-index-service.exe";
+    ec.clear();
+    if (fs::is_regular_file(installed, ec)) return installed;
+    return sibling;
+}
+
+static int run_index_service_helper(const std::wstring& argument, bool elevate) {
+    const auto executable = index_service_executable_path();
+    std::error_code ec;
+    if (!fs::is_regular_file(executable, ec)) {
+        std::cerr << "UPH: index service executable not found: "
+                  << executable.string() << '\n'
+                  << "Run: make cli\n";
+        return 2;
+    }
+
+    if (elevate) {
+        SHELLEXECUTEINFOW info{};
+        info.cbSize = sizeof(info);
+        info.fMask = SEE_MASK_NOCLOSEPROCESS;
+        info.lpVerb = L"runas";
+        info.lpFile = executable.wstring().c_str();
+        info.lpParameters = argument.c_str();
+        info.lpDirectory = executable.parent_path().wstring().c_str();
+        info.nShow = SW_HIDE;
+
+        if (!ShellExecuteExW(&info)) {
+            const DWORD code = GetLastError();
+            if (code == ERROR_CANCELLED)
+                std::cerr << "UPH: service command cancelled at the UAC prompt.\n";
+            else
+                std::cerr << "UPH: could not elevate index service command (error "
+                          << code << ").\n";
+            return 2;
+        }
+
+        WaitForSingleObject(info.hProcess, INFINITE);
+        DWORD exit_code = 2;
+        GetExitCodeProcess(info.hProcess, &exit_code);
+        CloseHandle(info.hProcess);
+        return static_cast<int>(exit_code);
+    }
+
+    std::wstring command_line =
+        L"\"" + executable.wstring() + L"\" " + argument;
+    std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
+    mutable_command.push_back(L'\0');
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(
+            executable.wstring().c_str(),
+            mutable_command.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            0,
+            nullptr,
+            executable.parent_path().wstring().c_str(),
+            &startup,
+            &process)) {
+        std::cerr << "UPH: could not run index service helper (error "
+                  << GetLastError() << ").\n";
+        return 2;
+    }
+
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exit_code = 2;
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return static_cast<int>(exit_code);
+}
+
 static fs::path selected_editor_path() {
     if (g.engine.empty()) return {};
     return g.engine / "Engine/Binaries/Win64/UnrealEditor.exe";
@@ -812,7 +919,8 @@ static void print_help() {
         "  uph find [query] [--projects|--plugins] [--limit N]\n"
         "                              Search cached .uproject/.uplugin index\n"
         "  uph index status|rebuild [root...]|clear|test\n"
-        "                              Manage the Unreal file index\n"
+        "  uph index service status|install|start|stop|uninstall\n"
+        "                              Manage the Unreal file index/service\n"
         "  uph stop                    Stop the current tracked UPH operation\n"
         "  uph rerun                   Repeat the last CLI build/package/deploy\n"
         "  uph deploy [project] [config]\n"
@@ -857,13 +965,50 @@ static std::vector<fs::path> selectable_projects() {
 
 static int command_unreal_index(int argc, char** argv) {
     const std::string action = argc >= 3 ? lower_copy(argv[2]) : "status";
-    const auto cache = unreal_index_path();
+
+#ifdef _WIN32
+    if (action == "service") {
+        const std::string service_action =
+            argc >= 4 ? lower_copy(argv[3]) : "status";
+
+        if (service_action == "status")
+            return run_index_service_helper(L"--status", false);
+
+        if (service_action == "install") {
+            const int result = run_index_service_helper(L"--install", true);
+            if (result == 0)
+                std::cout
+                    << "UPH index service installed and started.\n"
+                    << "It is building the shared MFT index now; use "
+                       "uph index service status to inspect it.\n";
+            return result;
+        }
+
+        if (service_action == "start")
+            return run_index_service_helper(L"--start", true);
+        if (service_action == "stop")
+            return run_index_service_helper(L"--stop", true);
+        if (service_action == "uninstall")
+            return run_index_service_helper(L"--uninstall", true);
+
+        std::cerr
+            << "Usage: uph index service "
+               "status|install|start|stop|uninstall\n";
+        return 2;
+    }
+#endif
 
     if (action == "status") {
+        const auto cache = unreal_index_path();
         uph::UnrealFileIndex index;
         if (!index.load(cache)) {
             std::cout << "Unreal file index: not built\n"
                       << "Cache: " << cache.string() << '\n';
+#ifdef _WIN32
+            std::cout
+                << "For fast whole-drive indexing: "
+                   "uph index service install\n";
+#endif
             return 1;
         }
 
@@ -875,28 +1020,48 @@ static int command_unreal_index(int argc, char** argv) {
         }
 
         std::cout << "Unreal file index: ready\n"
-                  << "Cache:    " << cache.string() << '\n'
-                  << "Projects: " << projects << '\n'
+                  << "Cache:    " << cache.string() << '\n';
+#ifdef _WIN32
+        std::cout << "Source:   "
+                  << (cache == service_unreal_index_path()
+                          ? "UPH index service"
+                          : "per-user manual cache")
+                  << '\n';
+#endif
+        std::cout << "Projects: " << projects << '\n'
                   << "Plugins:  " << plugins << '\n'
                   << "Total:    " << index.records().size() << '\n';
         return 0;
     }
 
     if (action == "clear") {
+        const auto cache = user_unreal_index_path();
         std::error_code ec;
         const bool removed = fs::remove(cache, ec);
         if (ec) {
-            std::cerr << "UPH: failed to remove index: " << ec.message() << '\n';
+            std::cerr << "UPH: failed to remove manual index: "
+                      << ec.message() << '\n';
             return 2;
         }
-        std::cout << (removed ? "Cleared Unreal file index.\n" : "Unreal file index was already empty.\n");
+        std::cout
+            << (removed
+                    ? "Cleared per-user manual Unreal file index.\n"
+                    : "Per-user manual Unreal file index was already empty.\n");
+#ifdef _WIN32
+        ec.clear();
+        if (fs::is_regular_file(service_unreal_index_path(), ec))
+            std::cout
+                << "The shared service index remains active. Stop/uninstall "
+                   "the service to remove it.\n";
+#endif
         return 0;
     }
 
     if (action == "test") {
         std::string error;
         if (!uph::run_unreal_file_index_self_test(&error)) {
-            std::cerr << "UPH: index self-test failed: " << error << '\n';
+            std::cerr << "UPH: index self-test failed: "
+                      << error << '\n';
             return 2;
         }
         std::cout << "Unreal file index self-test passed.\n";
@@ -907,28 +1072,49 @@ static int command_unreal_index(int argc, char** argv) {
         std::vector<fs::path> roots;
         for (int i = 3; i < argc; ++i)
             roots.emplace_back(argv[i]);
-        if (roots.empty()) roots = uph::UnrealFileIndex::default_roots();
+        if (roots.empty())
+            roots = uph::UnrealFileIndex::default_roots();
 
         if (roots.empty()) {
-            std::cerr << "UPH: no index roots available. Supply one or more paths.\n";
+            std::cerr
+                << "UPH: no index roots available. Supply one or more paths.\n";
             return 2;
         }
 
         std::cout << "Indexing .uproject and .uplugin files";
-        if (roots.size() == 1) std::cout << " under " << roots.front().string();
-        else std::cout << " across " << roots.size() << " roots";
+        if (roots.size() == 1)
+            std::cout << " under " << roots.front().string();
+        else
+            std::cout << " across " << roots.size() << " roots";
         std::cout << "...\n";
 
         uph::UnrealFileIndex index;
         const auto stats = index.rebuild(roots);
-        if (!index.save(cache)) {
-            std::cerr << "UPH: scan completed but the index could not be saved to "
-                      << cache.string() << '\n';
-            return 2;
-        }
 
         for (const auto& warning : stats.warnings)
             std::cerr << "Warning: " << warning << '\n';
+
+        const auto completed_roots =
+            stats.ntfs_mft_roots + stats.walked_roots;
+        if (completed_roots == 0) {
+            std::cerr
+                << "UPH: no requested root could be indexed.\n";
+#ifdef _WIN32
+            std::cerr
+                << "For a whole NTFS drive, install the privileged live "
+                   "indexer once:\n"
+                << "  uph index service install\n";
+#endif
+            return 2;
+        }
+
+        const auto cache = user_unreal_index_path();
+        if (!index.save(cache)) {
+            std::cerr
+                << "UPH: scan completed but the index could not be saved to "
+                << cache.string() << '\n';
+            return 2;
+        }
 
         std::cout << "Indexed " << stats.records << " Unreal files in "
                   << stats.elapsed_ms << " ms\n"
@@ -936,11 +1122,13 @@ static int command_unreal_index(int argc, char** argv) {
                   << "  Plugins:  " << stats.plugins << '\n'
                   << "  NTFS MFT roots: " << stats.ntfs_mft_roots << '\n'
                   << "  Directory-walk roots: " << stats.walked_roots << '\n'
-                  << "Cache: " << cache.string() << '\n';
-        return 0;
+                  << "Manual cache: " << cache.string() << '\n';
+        return completed_roots == stats.roots ? 0 : 1;
     }
 
-    std::cerr << "Usage: uph index status|rebuild [root...]|clear|test\n";
+    std::cerr
+        << "Usage: uph index "
+           "status|rebuild [root...]|clear|test|service ...\n";
     return 2;
 }
 
@@ -998,8 +1186,10 @@ static int command_find(int argc, char** argv) {
     uph::UnrealFileIndex index;
     if (!index.load(unreal_index_path())) {
         std::cerr << "UPH: Unreal file index has not been built yet.\n"
-                  << "Run: uph index rebuild\n"
-                  << "Or target a drive/root: uph index rebuild H:\\\n";
+#ifdef _WIN32
+                  << "Recommended: uph index service install\n"
+#endif
+                  << "For a smaller manual root: uph index rebuild <path>\n";
         return 2;
     }
 
