@@ -58,6 +58,7 @@ public:
                                          UnrealSearchScope scope = UnrealSearchScope::User) const;
 
     UnrealIndexViewStats view_stats() const;
+    std::vector<fs::path> engine_roots() const;
 
     const std::vector<UnrealFileRecord>& records() const { return records_; }
     void replace_records(std::vector<UnrealFileRecord> records);
