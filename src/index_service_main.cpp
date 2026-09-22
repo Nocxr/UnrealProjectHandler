@@ -1060,22 +1060,22 @@ int run_self_test() {
 
 } // namespace
 
-int wmain(int argc, wchar_t** argv) {
-    std::wstring command = argc >= 2 ? argv[1] : L"--service";
+int main(int argc, char** argv) {
+    const std::string command = argc >= 2 ? argv[1] : "--service";
 
-    if (command == L"--install") return install_service();
-    if (command == L"--uninstall") return uninstall_service();
-    if (command == L"--start") return start_service_command();
-    if (command == L"--stop") return stop_service_command();
-    if (command == L"--status") return print_service_status();
-    if (command == L"--self-test") return run_self_test();
+    if (command == "--install") return install_service();
+    if (command == "--uninstall") return uninstall_service();
+    if (command == "--start") return start_service_command();
+    if (command == "--stop") return stop_service_command();
+    if (command == "--status") return print_service_status();
+    if (command == "--self-test") return run_self_test();
 
-    if (command == L"--console") {
+    if (command == "--console") {
         SetConsoleCtrlHandler(console_control_handler, TRUE);
         return run_index_loop(true);
     }
 
-    if (command != L"--service") {
+    if (command != "--service") {
         std::cerr
             << "Usage: uph-index-service.exe "
                "--service|--console|--install|--uninstall|--start|--stop|--status|--self-test\n";
