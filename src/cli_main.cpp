@@ -919,8 +919,8 @@ static void print_help() {
         "  uph                         Start UPH, or foreground the running app\n"
         "  uph status                  Show saved settings and live app state\n"
         "  uph logs [--follow]         Show/follow UPH runtime logs\n"
-        "  uph find [query] [--projects|--plugins] [--limit N]\n"
-        "                              Search cached .uproject/.uplugin index\n"
+        "  uph find [query] [--projects|--plugins] [--engine|--all] [--limit N]\n"
+        "                              Search useful Unreal descriptors by default\n"
         "  uph index status|rebuild [root...]|clear|test\n"
         "  uph index service status|install|start|stop|uninstall\n"
         "                              Manage the Unreal file index/service\n"
@@ -958,8 +958,8 @@ static std::vector<fs::path> selectable_projects() {
 
     uph::UnrealFileIndex index;
     if (index.load(unreal_index_path())) {
-        for (const auto& record : index.records())
-            if (record.kind == uph::UnrealFileKind::Project) add(record.path);
+        for (const auto& record : index.search("", true, false, 0))
+            add(record.path);
     }
 
     return projects;
@@ -1015,12 +1015,7 @@ static int command_unreal_index(int argc, char** argv) {
             return 1;
         }
 
-        std::size_t projects = 0;
-        std::size_t plugins = 0;
-        for (const auto& record : index.records()) {
-            if (record.kind == uph::UnrealFileKind::Project) ++projects;
-            else ++plugins;
-        }
+        const auto view = index.view_stats();
 
         std::cout << "Unreal file index: ready\n"
                   << "Cache:    " << cache.string() << '\n';
@@ -1031,9 +1026,12 @@ static int command_unreal_index(int argc, char** argv) {
                           : "per-user manual cache")
                   << '\n';
 #endif
-        std::cout << "Projects: " << projects << '\n'
-                  << "Plugins:  " << plugins << '\n'
-                  << "Total:    " << index.records().size() << '\n';
+        std::cout << "User projects:      " << view.user_projects << '\n'
+                  << "User plugins:       " << view.user_plugins << '\n'
+                  << "User total:         " << view.user_records << '\n'
+                  << "Engine descriptors: " << view.engine_records << '\n'
+                  << "Hidden/generated:   " << view.hidden_records << '\n'
+                  << "Raw indexed total:  " << index.records().size() << '\n';
         return 0;
     }
 
@@ -1119,10 +1117,13 @@ static int command_unreal_index(int argc, char** argv) {
             return 2;
         }
 
-        std::cout << "Indexed " << stats.records << " Unreal files in "
+        const auto view = index.view_stats();
+        std::cout << "Indexed " << stats.records << " raw Unreal files in "
                   << stats.elapsed_ms << " ms\n"
-                  << "  Projects: " << stats.projects << '\n'
-                  << "  Plugins:  " << stats.plugins << '\n'
+                  << "  User projects: " << view.user_projects << '\n'
+                  << "  User plugins:  " << view.user_plugins << '\n'
+                  << "  Engine descriptors: " << view.engine_records << '\n'
+                  << "  Hidden/generated: " << view.hidden_records << '\n'
                   << "  NTFS MFT roots: " << stats.ntfs_mft_roots << '\n'
                   << "  Directory-walk roots: " << stats.walked_roots << '\n'
                   << "Manual cache: " << cache.string() << '\n';
@@ -1139,6 +1140,8 @@ static int command_find(int argc, char** argv) {
     bool include_projects = true;
     bool include_plugins = true;
     bool type_filter_set = false;
+    uph::UnrealSearchScope scope = uph::UnrealSearchScope::User;
+    bool scope_set = false;
     std::size_t limit = 50;
     std::vector<std::string> query_parts;
 
@@ -1162,10 +1165,22 @@ static int command_find(int argc, char** argv) {
             include_plugins = true;
             continue;
         }
-        if (value == "--all") {
-            include_projects = true;
-            include_plugins = true;
-            type_filter_set = true;
+        if (value == "--engine") {
+            if (scope_set && scope != uph::UnrealSearchScope::Engine) {
+                std::cerr << "UPH: --engine and --all cannot be combined.\n";
+                return 2;
+            }
+            scope = uph::UnrealSearchScope::Engine;
+            scope_set = true;
+            continue;
+        }
+        if (value == "--all" || value == "--raw") {
+            if (scope_set && scope != uph::UnrealSearchScope::All) {
+                std::cerr << "UPH: --engine and --all cannot be combined.\n";
+                return 2;
+            }
+            scope = uph::UnrealSearchScope::All;
+            scope_set = true;
             continue;
         }
         if (value == "--limit" && i + 1 < argc) {
@@ -1196,7 +1211,8 @@ static int command_find(int argc, char** argv) {
         return 2;
     }
 
-    const auto matches = index.search(query, include_projects, include_plugins, limit);
+    const auto matches = index.search(
+        query, include_projects, include_plugins, limit, scope);
     if (matches.empty()) {
         std::cout << "No matching Unreal projects or plugins.\n";
         return 1;
