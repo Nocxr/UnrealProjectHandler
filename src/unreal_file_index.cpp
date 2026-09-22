@@ -186,6 +186,86 @@ int fuzzy_score(std::string_view text_view, std::string_view query_view) {
     return score - static_cast<int>(text.size() - query.size()) / 8;
 }
 
+
+enum class RecordClass {
+    User,
+    Engine,
+    Hidden
+};
+
+std::string normalized_slash_path(const fs::path& path) {
+    auto value = lower_copy(path.lexically_normal().string());
+    std::replace(value.begin(), value.end(), '\\', '/');
+    return value;
+}
+
+bool is_hidden_record(const UnrealFileRecord& record) {
+    if (record.path.stem().string().empty()) return true;
+
+    const auto path = normalized_slash_path(record.path);
+    static constexpr std::string_view hidden_fragments[] = {
+        "/$recycle.bin/",
+        "/system volume information/",
+        "/appdata/roaming/code/user/history",
+        "/appdata/roaming/cursor/user/history",
+        "/appdata/roaming/vscodium/user/history",
+        "/.vscode/",
+        "/.idea/",
+        "/.git/",
+        "/.svn/",
+        "/.hg/",
+        "/node_modules/",
+        "/intermediate/",
+        "/saved/",
+        "/deriveddatacache/",
+        "/__pycache__/",
+        "/temp/",
+        "/tmp/"
+    };
+
+    for (const auto fragment : hidden_fragments) {
+        if (path.find(fragment) != std::string::npos) return true;
+    }
+
+    // Plugin packaging/build tools commonly create a throwaway HostProject.
+    if (path.find("/hostproject/") != std::string::npos) return true;
+
+    return false;
+}
+
+std::vector<std::string> infer_engine_roots(
+    const std::vector<UnrealFileRecord>& records) {
+    std::set<std::string> roots;
+
+    for (const auto& record : records) {
+        const auto path = normalized_slash_path(record.path);
+        const auto marker = path.find("/engine/");
+        if (marker == std::string::npos || marker == 0) continue;
+        roots.insert(path.substr(0, marker));
+    }
+
+    return {roots.begin(), roots.end()};
+}
+
+bool path_is_under_root(std::string_view path, std::string_view root) {
+    if (path == root) return true;
+    if (path.size() <= root.size()) return false;
+    return path.starts_with(root) && path[root.size()] == '/';
+}
+
+RecordClass classify_record(
+    const UnrealFileRecord& record,
+    const std::vector<std::string>& engine_roots) {
+    if (is_hidden_record(record)) return RecordClass::Hidden;
+
+    const auto path = normalized_slash_path(record.path);
+    for (const auto& root : engine_roots) {
+        if (path_is_under_root(path, root)) return RecordClass::Engine;
+    }
+
+    return RecordClass::User;
+}
+
 #ifdef _WIN32
 struct DirectoryNode {
     std::uint64_t parent = 0;
@@ -476,7 +556,8 @@ UnrealIndexStats UnrealFileIndex::rebuild(const std::vector<fs::path>& roots) {
 std::vector<UnrealFileRecord> UnrealFileIndex::search(const std::string& query,
                                                        bool include_projects,
                                                        bool include_plugins,
-                                                       std::size_t limit) const {
+                                                       std::size_t limit,
+                                                       UnrealSearchScope scope) const {
     struct Scored {
         int score = 0;
         const UnrealFileRecord* record = nullptr;
@@ -484,10 +565,15 @@ std::vector<UnrealFileRecord> UnrealFileIndex::search(const std::string& query,
 
     std::vector<Scored> scored;
     scored.reserve(records_.size());
+    const auto engine_roots = infer_engine_roots(records_);
 
     for (const auto& record : records_) {
         if (record.kind == UnrealFileKind::Project && !include_projects) continue;
         if (record.kind == UnrealFileKind::Plugin && !include_plugins) continue;
+
+        const auto record_class = classify_record(record, engine_roots);
+        if (scope == UnrealSearchScope::User && record_class != RecordClass::User) continue;
+        if (scope == UnrealSearchScope::Engine && record_class != RecordClass::Engine) continue;
 
         int score = 0;
         if (!query.empty()) {
@@ -511,6 +597,29 @@ std::vector<UnrealFileRecord> UnrealFileIndex::search(const std::string& query,
     result.reserve(scored.size());
     for (const auto& item : scored) result.push_back(*item.record);
     return result;
+}
+
+UnrealIndexViewStats UnrealFileIndex::view_stats() const {
+    UnrealIndexViewStats stats;
+    const auto engine_roots = infer_engine_roots(records_);
+
+    for (const auto& record : records_) {
+        switch (classify_record(record, engine_roots)) {
+            case RecordClass::User:
+                ++stats.user_records;
+                if (record.kind == UnrealFileKind::Project) ++stats.user_projects;
+                else ++stats.user_plugins;
+                break;
+            case RecordClass::Engine:
+                ++stats.engine_records;
+                break;
+            case RecordClass::Hidden:
+                ++stats.hidden_records;
+                break;
+        }
+    }
+
+    return stats;
 }
 
 void UnrealFileIndex::replace_records(std::vector<UnrealFileRecord> records) {
