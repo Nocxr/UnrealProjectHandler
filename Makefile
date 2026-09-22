@@ -10,6 +10,7 @@ SERVICE_TARGET :=
 TARGETS := $(APP_TARGET) $(CLI_TARGET)
 
 APP_SOURCES := src/main.cpp \
+	src/unreal_file_index.cpp \
 	$(IMGUI_DIR)/imgui.cpp \
 	$(IMGUI_DIR)/imgui_draw.cpp \
 	$(IMGUI_DIR)/imgui_tables.cpp \
