@@ -690,14 +690,16 @@ bool run_unreal_file_index_self_test(std::string* error_message) {
         return fail("failed to load index cache");
     }
 
-    const auto projects = loaded.search("testproject", true, false, 10);
+    const auto projects = loaded.search(
+        "testproject", true, false, 10, UnrealSearchScope::All);
     if (projects.size() != 1 || projects.front().kind != UnrealFileKind::Project ||
         projects.front().path.filename() != project.filename()) {
         fs::remove_all(root, ec);
         return fail("project search returned the wrong result");
     }
 
-    const auto plugins = loaded.search("fancy", false, true, 10);
+    const auto plugins = loaded.search(
+        "fancy", false, true, 10, UnrealSearchScope::All);
     if (plugins.size() != 1 || plugins.front().kind != UnrealFileKind::Plugin ||
         plugins.front().path.filename() != plugin.filename()) {
         fs::remove_all(root, ec);
