@@ -1048,7 +1048,8 @@ int print_service_status() {
     std::cout << "UPH index service: "
               << service_state_name(status.dwCurrentState) << '\n'
               << "Service cache: " << cache_path().string() << '\n'
-              << "Service log:   " << log_path().string() << '\n';
+              << "Service log:   " << log_path().string() << '\n'
+              << "Counts below are raw descriptors; uph index status shows filtered user counts.\n";
 
     std::ifstream in(status_path());
     if (in) {
