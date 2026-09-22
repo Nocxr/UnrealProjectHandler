@@ -14,9 +14,23 @@ enum class UnrealFileKind {
     Plugin
 };
 
+enum class UnrealSearchScope {
+    User,
+    Engine,
+    All
+};
+
 struct UnrealFileRecord {
     UnrealFileKind kind = UnrealFileKind::Project;
     fs::path path;
+};
+
+struct UnrealIndexViewStats {
+    std::size_t user_records = 0;
+    std::size_t user_projects = 0;
+    std::size_t user_plugins = 0;
+    std::size_t engine_records = 0;
+    std::size_t hidden_records = 0;
 };
 
 struct UnrealIndexStats {
@@ -40,7 +54,10 @@ public:
     std::vector<UnrealFileRecord> search(const std::string& query,
                                          bool include_projects = true,
                                          bool include_plugins = true,
-                                         std::size_t limit = 200) const;
+                                         std::size_t limit = 200,
+                                         UnrealSearchScope scope = UnrealSearchScope::User) const;
+
+    UnrealIndexViewStats view_stats() const;
 
     const std::vector<UnrealFileRecord>& records() const { return records_; }
     void replace_records(std::vector<UnrealFileRecord> records);
