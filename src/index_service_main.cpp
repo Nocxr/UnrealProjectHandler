@@ -4,9 +4,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -262,6 +264,12 @@ bool scan_volume(const fs::path& root, VolumeState& state, std::string& error) {
     fresh.handle = open_volume(root, error);
     if (fresh.handle == INVALID_HANDLE_VALUE) return false;
 
+    // Capture the journal position before MFT enumeration. Any create/delete/
+    // rename that races the initial scan will then be replayed afterward.
+    std::string journal_warning;
+    if (!query_journal(fresh, journal_warning) && !journal_warning.empty())
+        append_log(journal_warning);
+
     MFT_ENUM_DATA query{};
     query.StartFileReferenceNumber = 0;
     query.LowUsn = 0;
@@ -343,10 +351,6 @@ bool scan_volume(const fs::path& root, VolumeState& state, std::string& error) {
         error = "MFT enumeration returned no records for " + root.string();
         return false;
     }
-
-    std::string journal_warning;
-    if (!query_journal(fresh, journal_warning) && !journal_warning.empty())
-        append_log(journal_warning);
 
     state = std::move(fresh);
     return true;
@@ -506,7 +510,9 @@ PollResult poll_volume(VolumeState& state, std::string& error) {
         }
 
         error = "USN journal read failed for " + state.root.string() +
-                " (error " + std::to_string(code) + ")";
+                " (error " + std::to_string(code) +
+                "); live updates disabled until service restart.";
+        state.journal_ready = false;
         return PollResult::NoChange;
     }
 
