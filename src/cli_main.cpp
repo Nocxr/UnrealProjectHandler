@@ -256,99 +256,133 @@ static std::optional<size_t> interactive_picker(const std::string& title,
         HANDLE output;
         DWORD mode;
         ~ConsoleRestore() {
-            std::cout << "\x1b[?25h";
+            std::cout << "\x1b[0m\x1b[?25h\x1b[?1049l";
             std::cout.flush();
             SetConsoleMode(output, mode);
         }
     } restore{output, original_mode};
 
+    auto split_item = [](const std::string& item) {
+        const auto separator = item.rfind("  ");
+        if (separator == std::string::npos)
+            return std::pair<std::string, std::string>{item, {}};
+        return std::pair<std::string, std::string>{
+            item.substr(0, separator),
+            item.substr(separator + 2)
+        };
+    };
+
+    auto visible_rows = [&]() -> size_t {
+        CONSOLE_SCREEN_BUFFER_INFO info{};
+        if (!GetConsoleScreenBufferInfo(output, &info)) return 7;
+        const int height = info.srWindow.Bottom - info.srWindow.Top + 1;
+        // Header/filter/footer use about six rows; each result uses two rows.
+        const int available = std::max(6, height - 6);
+        return static_cast<size_t>(std::clamp(available / 2, 3, 10));
+    };
+
     std::string query = initial_query;
     size_t selected = 0;
-    constexpr size_t max_visible = 8;
-    size_t previous_lines = 0;
-
-    auto clear_previous = [&]() {
-        if (previous_lines == 0) return;
-        std::cout << "\x1b[" << previous_lines << "A";
-        for (size_t i = 0; i < previous_lines; ++i) {
-            std::cout << "\r\x1b[2K";
-            if (i + 1 < previous_lines) std::cout << "\n";
-        }
-        if (previous_lines > 1) std::cout << "\x1b[" << (previous_lines - 1) << "A";
-        std::cout << "\r";
-    };
 
     auto render = [&](const std::vector<size_t>& matches) {
-        clear_previous();
-
+        const size_t max_visible = visible_rows();
         size_t start_row = 0;
-        if (!matches.empty() && selected >= max_visible)
-            start_row = selected - max_visible + 1;
+        if (!matches.empty()) {
+            if (selected >= max_visible)
+                start_row = selected - max_visible + 1;
+            if (matches.size() > max_visible)
+                start_row = std::min(start_row, matches.size() - max_visible);
+        }
         const size_t end_row = std::min(matches.size(), start_row + max_visible);
 
-        std::vector<std::string> lines;
-        lines.push_back(title);
-        lines.push_back("> " + query);
+        // Alternate screen + full redraw keeps navigation out of terminal
+        // scrollback and avoids cursor bookkeeping getting out of sync.
+        std::cout << "\x1b[H\x1b[2J";
+        std::cout << "\x1b[1;36m" << title << "\x1b[0m";
+        if (!matches.empty()) {
+            std::cout << "  \x1b[2m"
+                      << (selected + 1) << "/" << matches.size()
+                      << "\x1b[0m";
+        }
+        std::cout << "\n";
+
+        std::cout << "\x1b[2mFilter:\x1b[0m "
+                  << (query.empty() ? "\x1b[2m(type to search)\x1b[0m" : query)
+                  << "\n\n";
 
         if (matches.empty()) {
-            lines.push_back("  No matches");
+            std::cout << "  \x1b[2mNo matches\x1b[0m\n";
         } else {
             for (size_t row = start_row; row < end_row; ++row) {
+                const auto [primary, secondary] = split_item(items[matches[row]]);
                 const bool active = row == selected;
-                lines.push_back(std::string(active ? "> " : "  ") + items[matches[row]]);
+
+                if (active) {
+                    std::cout << "\x1b[1;32m> " << primary << "\x1b[0m\n";
+                    if (!secondary.empty())
+                        std::cout << "  \x1b[2m" << secondary << "\x1b[0m\n";
+                    else
+                        std::cout << "\n";
+                } else {
+                    std::cout << "  " << primary << "\n";
+                    if (!secondary.empty())
+                        std::cout << "  \x1b[2m" << secondary << "\x1b[0m\n";
+                    else
+                        std::cout << "\n";
+                }
             }
-            if (matches.size() > max_visible)
-                lines.push_back("  " + std::to_string(matches.size()) + " matches");
         }
 
-        lines.push_back("Type to filter | Up/Down move | Enter select | Esc cancel");
-
-        for (size_t i = 0; i < lines.size(); ++i) {
-            std::cout << "\r\x1b[2K";
-            const bool item_line = i >= 2 && i < 2 + (end_row - start_row);
-            const size_t row = i >= 2 ? i - 2 + start_row : 0;
-            const bool active = item_line && !matches.empty() && row == selected;
-            if (active) std::cout << "\x1b[7m" << lines[i] << "\x1b[0m";
-            else std::cout << lines[i];
-            std::cout << "\n";
-        }
+        std::cout << "\n\x1b[2m"
+                  << "Type to filter  |  Up/Down move  |  PgUp/PgDn jump  |  Enter select  |  Esc cancel"
+                  << "\x1b[0m";
         std::cout.flush();
-        previous_lines = lines.size();
     };
 
-    std::cout << "\x1b[?25l";
+    std::cout << "\x1b[?1049h\x1b[?25l";
+
     for (;;) {
         auto matches = fuzzy_matches(items, query);
-        if (selected >= matches.size()) selected = matches.empty() ? 0 : matches.size() - 1;
+        if (selected >= matches.size())
+            selected = matches.empty() ? 0 : matches.size() - 1;
         render(matches);
 
         int key = _getwch();
         if (key == 0 || key == 224) {
-            int extended = _getwch();
-            if (extended == 72 && selected > 0) --selected;
-            else if (extended == 80 && !matches.empty() && selected + 1 < matches.size()) ++selected;
-            continue;
-        }
-
-        if (key == 27) {
-            clear_previous();
-            std::cout << "\x1b[?25h";
-            return std::nullopt;
-        }
-        if (key == 13) {
-            if (!matches.empty()) {
-                auto result = matches[selected];
-                clear_previous();
-                std::cout << "\x1b[?25h";
-                return result;
+            const int extended = _getwch();
+            if (extended == 72 && selected > 0) {
+                --selected; // Up
+            } else if (extended == 80 && !matches.empty() && selected + 1 < matches.size()) {
+                ++selected; // Down
+            } else if (extended == 73 && selected > 0) {
+                const size_t jump = visible_rows();
+                selected = selected > jump ? selected - jump : 0; // Page Up
+            } else if (extended == 81 && !matches.empty()) {
+                const size_t jump = visible_rows();
+                selected = std::min(selected + jump, matches.size() - 1); // Page Down
+            } else if (extended == 71) {
+                selected = 0; // Home
+            } else if (extended == 79 && !matches.empty()) {
+                selected = matches.size() - 1; // End
             }
             continue;
         }
+
+        if (key == 27)
+            return std::nullopt;
+
+        if (key == 13) {
+            if (!matches.empty())
+                return matches[selected];
+            continue;
+        }
+
         if (key == 8 || key == 127) {
             if (!query.empty()) query.pop_back();
             selected = 0;
             continue;
         }
+
         if (key >= 32 && key <= 126) {
             query.push_back(static_cast<char>(key));
             selected = 0;
