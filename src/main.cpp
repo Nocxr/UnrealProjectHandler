@@ -5,6 +5,7 @@
 #include "imgui.h"
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl3.h"
+#include "unreal_file_index.h"
 
 #include <algorithm>
 #include <array>
@@ -74,8 +75,10 @@ struct LogEntry { std::string text; bool error = false; };
 struct AppState {
     fs::path project;
     std::vector<fs::path> recent_projects;
+    std::vector<fs::path> indexed_projects;
     fs::path engine;
     std::vector<fs::path> known_engines;
+    std::vector<fs::path> indexed_engine_roots;
     std::vector<fs::path> hidden_engines;
     fs::path output;
     std::vector<Engine> engines;
@@ -776,6 +779,54 @@ static void inspect_tooling() {
     );
 }
 
+static fs::path shared_unreal_index_path() {
+#ifdef _WIN32
+    const char* program_data = std::getenv("PROGRAMDATA");
+    fs::path shared = fs::path(program_data ? program_data : "C:\\ProgramData") /
+                      "UnrealProjectHandler" / "unreal-files.idx";
+    std::error_code ec;
+    if (fs::is_regular_file(shared, ec)) return shared;
+#endif
+    return app_config_dir() / "unreal-files.idx";
+}
+
+static bool same_path_list(const std::vector<fs::path>& a,
+                           const std::vector<fs::path>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (normalized_path_key(a[i]) != normalized_path_key(b[i])) return false;
+    return true;
+}
+
+static bool refresh_index_discovery() {
+    uph::UnrealFileIndex index;
+    if (!index.load(shared_unreal_index_path())) {
+        const bool engines_changed = !g.indexed_engine_roots.empty();
+        g.indexed_projects.clear();
+        g.indexed_engine_roots.clear();
+        return engines_changed;
+    }
+
+    std::vector<fs::path> projects;
+    for (const auto& record : index.search("", true, false, 0)) {
+        std::error_code ec;
+        if (fs::is_regular_file(record.path, ec))
+            projects.push_back(record.path);
+    }
+
+    std::vector<fs::path> engine_roots;
+    for (const auto& root : index.engine_roots()) {
+        if (valid_engine(root))
+            engine_roots.push_back(root);
+    }
+
+    const bool engines_changed =
+        !same_path_list(g.indexed_engine_roots, engine_roots);
+    g.indexed_projects = std::move(projects);
+    g.indexed_engine_roots = std::move(engine_roots);
+    return engines_changed;
+}
+
 static void discover_engines() {
     g.engines.clear();
     auto add = [](const fs::path& path) {
@@ -793,6 +844,7 @@ static void discover_engines() {
     };
     if (!g.engine.empty()) add(g.engine);
     for (const auto& engine : g.known_engines) add(engine);
+    for (const auto& engine : g.indexed_engine_roots) add(engine);
 #ifdef _WIN32
     for (const auto& path : registry_engine_paths()) add(path);
     for (const char* root : {"C:/Program Files/Epic Games", "D:/Epic Games"}) {
@@ -4753,50 +4805,138 @@ static std::string current_project_label() {
 }
 
 static void project_combo_items() {
+    static char filter[160]{};
     fs::path selected;
     int remove_index = -1;
 
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    ImGui::InputTextWithHint("##project_combo_filter", "Filter projects...", filter, sizeof(filter));
+
+    std::string wanted = filter;
+    std::transform(wanted.begin(), wanted.end(), wanted.begin(),
+        [](unsigned char ch){ return static_cast<char>(std::tolower(ch)); });
+
+    auto matches = [&](const fs::path& project) {
+        if (wanted.empty()) return true;
+        auto text = project.stem().string() + " " + project.string();
+        std::transform(text.begin(), text.end(), text.begin(),
+            [](unsigned char ch){ return static_cast<char>(std::tolower(ch)); });
+        return text.find(wanted) != std::string::npos;
+    };
+
+    std::set<std::string> recent_keys;
+    bool showed_recent = false;
     for (int i = 0; i < (int)g.recent_projects.size(); ++i) {
         const auto& project = g.recent_projects[i];
-        ImGui::PushID(i);
-        bool available = fs::is_regular_file(project);
-        bool active = normalized_path_key(project) == normalized_path_key(g.project);
+        recent_keys.insert(normalized_path_key(project));
+        if (!matches(project)) continue;
+
+        if (!showed_recent) {
+            ImGui::SeparatorText("Recent");
+            showed_recent = true;
+        }
+
+        const auto id = project.string();
+        ImGui::PushID(id.c_str());
+        const bool available = fs::is_regular_file(project);
+        const bool active = normalized_path_key(project) == normalized_path_key(g.project);
         auto label = project.stem().string() + (available ? "" : " (missing)");
 
-        float remove_width = ImGui::CalcTextSize("X").x + ImGui::GetStyle().FramePadding.x * 2.0f +
-                             ImGui::GetStyle().ItemSpacing.x;
-        ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - remove_width));
+        const float remove_width =
+            ImGui::CalcTextSize("X").x + ImGui::GetStyle().FramePadding.x * 2.0f +
+            ImGui::GetStyle().ItemSpacing.x;
+
         if (!available) ImGui::BeginDisabled();
-        if (ImGui::Selectable(label.c_str(), active, ImGuiSelectableFlags_None, ImVec2(ImGui::GetContentRegionAvail().x - remove_width, 0)))
+        if (ImGui::Selectable(label.c_str(), active, ImGuiSelectableFlags_None,
+                              ImVec2(std::max(80.0f, ImGui::GetContentRegionAvail().x - remove_width), 0)))
             selected = project;
         if (!available) ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", project.string().c_str());
+
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", project.string().c_str());
 
         ImGui::SameLine();
         if (ImGui::SmallButton("X")) remove_index = i;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove this project from the recent-project list.");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Remove from recent projects. It can still appear from the live index.");
         ImGui::PopID();
     }
+
+    bool showed_indexed = false;
+    for (const auto& project : g.indexed_projects) {
+        if (recent_keys.contains(normalized_path_key(project)) || !matches(project))
+            continue;
+
+        if (!showed_indexed) {
+            ImGui::SeparatorText("Indexed");
+            showed_indexed = true;
+        }
+
+        const auto id = project.string();
+        ImGui::PushID(id.c_str());
+        const bool active = normalized_path_key(project) == normalized_path_key(g.project);
+        auto label = project.stem().string();
+        if (ImGui::Selectable(label.c_str(), active))
+            selected = project;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", project.string().c_str());
+        ImGui::PopID();
+    }
+
+    if (!showed_recent && !showed_indexed && filter[0] != '\0')
+        ImGui::TextDisabled("No matching projects.");
 
     if (remove_index >= 0 && remove_index < (int)g.recent_projects.size()) {
         g.recent_projects.erase(g.recent_projects.begin() + remove_index);
         save_settings();
     }
 
-    if (!g.recent_projects.empty()) ImGui::Separator();
-    if (ImGui::Selectable("Browse for project...")) pick_project();
+    ImGui::Separator();
+    if (ImGui::Selectable("Browse for project..."))
+        pick_project();
 
-    if (!selected.empty()) select_project(selected);
+    if (!selected.empty()) {
+        filter[0] = '\0';
+        select_project(selected);
+    }
 }
 
 static void engine_combo_items() {
+    static char filter[128]{};
     const Engine* selected = nullptr;
+
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    ImGui::InputTextWithHint("##engine_combo_filter", "Filter engines...", filter, sizeof(filter));
+
+    std::string wanted = filter;
+    std::transform(wanted.begin(), wanted.end(), wanted.begin(),
+        [](unsigned char ch){ return static_cast<char>(std::tolower(ch)); });
+
+    bool showed_any = false;
     for (const auto& engine : g.engines) {
-        ImGui::PushID(&engine);
-        if (ImGui::Selectable(engine_display_label(engine).c_str(), engine.path == g.engine)) selected = &engine;
+        auto label = engine_display_label(engine);
+        auto searchable = label + " " + engine.path.string();
+        std::transform(searchable.begin(), searchable.end(), searchable.begin(),
+            [](unsigned char ch){ return static_cast<char>(std::tolower(ch)); });
+        if (!wanted.empty() && searchable.find(wanted) == std::string::npos)
+            continue;
+
+        showed_any = true;
+        const auto id = engine.path.string();
+        ImGui::PushID(id.c_str());
+        if (ImGui::Selectable(label.c_str(),
+                              normalized_path_key(engine.path) == normalized_path_key(g.engine)))
+            selected = &engine;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", engine.path.string().c_str());
         ImGui::PopID();
     }
+
+    if (!showed_any && filter[0] != '\0')
+        ImGui::TextDisabled("No matching engines.");
+
     if (selected) {
+        filter[0] = '\0';
         g.engine = selected->path;
         g.plugin_scan_cache.clear();
         discover_engines();
@@ -5592,6 +5732,7 @@ int main(int, char**) {
     load_settings();
     if (!g.project.empty()) remember_project(g.project);
     load_tool_catalog();
+    refresh_index_discovery();
     discover_engines();
     if (!g.project.empty()) match_project_engine(g.project);
     inspect_project();
@@ -5610,8 +5751,14 @@ int main(int, char**) {
     log_line("[SYSTEM] UPH native started.");
     bool running = true;
     auto last_runtime_status_write = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    auto last_index_refresh = std::chrono::steady_clock::now() - std::chrono::seconds(3);
     while (running) {
         auto frame_started = std::chrono::steady_clock::now();
+        if (frame_started - last_index_refresh >= std::chrono::seconds(2)) {
+            const bool engines_changed = refresh_index_discovery();
+            if (engines_changed) discover_engines();
+            last_index_refresh = frame_started;
+        }
         if (frame_started - last_runtime_status_write >= std::chrono::milliseconds(500)) {
             write_runtime_status(true);
             last_runtime_status_write = frame_started;
