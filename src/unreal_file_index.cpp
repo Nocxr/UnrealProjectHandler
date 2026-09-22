@@ -200,7 +200,9 @@ std::string normalized_slash_path(const fs::path& path) {
 }
 
 bool is_hidden_record(const UnrealFileRecord& record) {
-    if (record.path.stem().string().empty()) return true;
+    const auto filename = lower_copy(record.path.filename().string());
+    if (filename.empty() || filename == ".uproject" || filename == ".uplugin")
+        return true;
 
     const auto path = normalized_slash_path(record.path);
     static constexpr std::string_view hidden_fragments[] = {
