@@ -125,6 +125,8 @@ The service is registered for automatic Windows startup. Its installed executabl
 
 The service keeps a file-reference/directory map in memory, so `.uproject` / `.uplugin` creates, deletes, moves, file renames, and parent-directory renames can be applied incrementally without rescanning the drive. If the USN journal is replaced or falls behind, that volume is automatically rebuilt from the MFT.
 
+The raw service cache deliberately keeps every descriptor it can see. Normal `uph find` and `uph project select` filter that raw cache into a useful user view: Unreal Engine installations/source trees, editor history, generated `HostProject` trees, cache/build directories, and invalid empty descriptor names are hidden. Use `uph find --engine` for engine-provided descriptors or `uph find --all` for the literal raw cache.
+
 Manual indexing is still supported for tests and smaller roots:
 
 ```powershell
