@@ -97,22 +97,44 @@ Removed discovered engines are persisted as hidden paths so launcher/registry di
 
 ### Unreal file index
 
-UPH can maintain a tiny machine-local index containing only Unreal project and plugin descriptors:
+On Windows, the recommended mode is the small privileged **UPH Unreal File Index** service. UPH itself stays non-admin. The service performs a fast MFT snapshot of fixed NTFS volumes, then keeps the index current from the NTFS USN change journal.
 
 ```powershell
-uph index rebuild                 # index all fixed local drives
-uph index rebuild H:\            # index one drive/root
-uph index rebuild H:\projects D:\work
-uph index status
-uph index test                    # synthetic scanner/cache/search self-test
-uph index clear
+make cli
+.\build\uph.exe index service install   # one UAC prompt; installs + starts service
+.\build\uph.exe index service status
+.\build\uph.exe index status
 
-uph find Ulu
-uph find ScriptRuntime --plugins
-uph find Hollow --projects
-uph find --limit 200              # interactive fuzzy picker over indexed files
+.\build\uph.exe find Ulu
+.\build\uph.exe find ScriptRuntime --plugins
+.\build\uph.exe find Hollow --projects
+.\build\uph.exe find --limit 200
 ```
 
-On Windows, whole NTFS drive roots first use direct MFT enumeration via `FSCTL_ENUM_USN_DATA`, avoiding a normal recursive directory walk when raw-volume access is available. If Windows denies raw-volume access or a supplied root is not a whole NTFS drive, UPH falls back to a permission-tolerant directory scan. The resulting cache lives beside UPH's other per-user configuration files as `unreal-files.idx`.
+Service lifecycle commands are:
 
-Indexed projects are also included automatically in `uph project select`, so a project does not have to be manually registered before it can be found.
+```powershell
+uph index service status
+uph index service install
+uph index service start
+uph index service stop
+uph index service uninstall
+```
+
+The service is registered for automatic Windows startup. Its installed executable, shared cache, status file, and log live under `%PROGRAMDATA%\UnrealProjectHandler\`. Search commands automatically prefer the shared service cache when it exists.
+
+The service keeps a file-reference/directory map in memory, so `.uproject` / `.uplugin` creates, deletes, moves, file renames, and parent-directory renames can be applied incrementally without rescanning the drive. If the USN journal is replaced or falls behind, that volume is automatically rebuilt from the MFT.
+
+Manual indexing is still supported for tests and smaller roots:
+
+```powershell
+uph index rebuild H:\projects
+uph index rebuild D:\work\SomeTree
+uph index status
+uph index test
+uph index clear
+```
+
+A whole NTFS drive no longer falls back to a potentially multi-minute recursive directory walk when raw-volume access is denied. Use the index service for whole-drive indexing. Non-drive-root paths still use the permission-tolerant directory scanner.
+
+Indexed projects are included automatically in `uph project select`, so a project does not have to be manually registered before it can be found.
