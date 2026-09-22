@@ -33,8 +33,8 @@ jobs:
           printf '{}\n' > "$root/Game/SampleProject.uproject"
           printf '{}\n' > "$root/Game/Plugins/SamplePlugin/SamplePlugin.uplugin"
           ./build/uph index rebuild "$root"
-          ./build/uph find SampleProject --projects
-          ./build/uph find SamplePlugin --plugins
+          ./build/uph find SampleProject --projects --all
+          ./build/uph find SamplePlugin --plugins --all
 
   windows-cli-index-test:
     runs-on: windows-latest
@@ -80,5 +80,5 @@ jobs:
           '{}' | Set-Content (Join-Path $root "Game\SampleProject.uproject")
           '{}' | Set-Content (Join-Path $root "Game\Plugins\SamplePlugin\SamplePlugin.uplugin")
           .\build\uph.exe index rebuild $root
-          .\build\uph.exe find SampleProject --projects
-          .\build\uph.exe find SamplePlugin --plugins
+          .\build\uph.exe find SampleProject --projects --all
+          .\build\uph.exe find SamplePlugin --plugins --all
