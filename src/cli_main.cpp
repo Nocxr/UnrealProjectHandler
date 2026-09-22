@@ -784,13 +784,16 @@ static int run_index_service_helper(const std::wstring& argument, bool elevate) 
     }
 
     if (elevate) {
+        const auto executable_w = executable.wstring();
+        const auto directory_w = executable.parent_path().wstring();
+
         SHELLEXECUTEINFOW info{};
         info.cbSize = sizeof(info);
         info.fMask = SEE_MASK_NOCLOSEPROCESS;
         info.lpVerb = L"runas";
-        info.lpFile = executable.wstring().c_str();
+        info.lpFile = executable_w.c_str();
         info.lpParameters = argument.c_str();
-        info.lpDirectory = executable.parent_path().wstring().c_str();
+        info.lpDirectory = directory_w.c_str();
         info.nShow = SW_HIDE;
 
         if (!ShellExecuteExW(&info)) {
