@@ -4878,6 +4878,9 @@ static void project_combo_items() {
 
         ImGui::SameLine();
         if (ImGui::SmallButton("X")) remove_index = i;
+        ImGui::Indent(10.0f);
+        ImGui::TextDisabled("%s", project.string().c_str());
+        ImGui::Unindent(10.0f);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Remove from recent projects. It can still appear from the live index.");
         ImGui::PopID();
@@ -4901,6 +4904,9 @@ static void project_combo_items() {
             selected = project;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", project.string().c_str());
+        ImGui::Indent(10.0f);
+        ImGui::TextDisabled("%s", project.string().c_str());
+        ImGui::Unindent(10.0f);
         ImGui::PopID();
     }
 
@@ -4942,7 +4948,11 @@ static void engine_combo_items() {
         if (!wanted.empty() && searchable.find(wanted) == std::string::npos)
             continue;
 
-        showed_any = true;
+        if (!showed_any) {
+            ImGui::SeparatorText("Detected");
+            showed_any = true;
+        }
+
         const auto id = engine.path.string();
         ImGui::PushID(id.c_str());
         if (ImGui::Selectable(label.c_str(),
@@ -4950,11 +4960,18 @@ static void engine_combo_items() {
             selected = &engine;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", engine.path.string().c_str());
+        ImGui::Indent(10.0f);
+        ImGui::TextDisabled("%s", engine.path.string().c_str());
+        ImGui::Unindent(10.0f);
         ImGui::PopID();
     }
 
     if (!showed_any && filter[0] != '\0')
         ImGui::TextDisabled("No matching engines.");
+
+    ImGui::Separator();
+    if (ImGui::Selectable("Add / browse for engine..."))
+        pick_folder(DialogKind::Engine, g.engine);
 
     if (selected) {
         filter[0] = '\0';
