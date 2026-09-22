@@ -625,10 +625,27 @@ UnrealIndexViewStats UnrealFileIndex::view_stats() const {
 }
 
 std::vector<fs::path> UnrealFileIndex::engine_roots() const {
-    std::vector<fs::path> roots;
-    for (const auto& root : infer_engine_roots(records_))
-        roots.emplace_back(root);
-    return roots;
+    std::map<std::string, fs::path> roots;
+
+    for (const auto& record : records_) {
+        const auto normalized = normalized_slash_path(record.path);
+        const auto marker = normalized.find("/engine/");
+        if (marker == std::string::npos || marker == 0) continue;
+
+        auto original = record.path.lexically_normal().generic_string();
+        if (marker > original.size()) continue;
+
+        auto root = fs::path(original.substr(0, marker));
+        roots.emplace(normalized_key(root), std::move(root));
+    }
+
+    std::vector<fs::path> result;
+    result.reserve(roots.size());
+    for (const auto& [key, root] : roots) {
+        (void)key;
+        result.push_back(root);
+    }
+    return result;
 }
 
 void UnrealFileIndex::replace_records(std::vector<UnrealFileRecord> records) {
