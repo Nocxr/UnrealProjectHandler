@@ -798,13 +798,34 @@ static bool same_path_list(const std::vector<fs::path>& a,
     return true;
 }
 
-static bool refresh_index_discovery() {
+static bool refresh_index_discovery(bool force = false) {
+    static fs::path last_path;
+    static fs::file_time_type last_write{};
+    static bool have_stamp = false;
+
+    const auto index_path = shared_unreal_index_path();
+    std::error_code stamp_ec;
+    const auto write_time = fs::last_write_time(index_path, stamp_ec);
+
+    if (!force && !stamp_ec && have_stamp &&
+        normalized_path_key(index_path) == normalized_path_key(last_path) &&
+        write_time == last_write)
+        return false;
+
     uph::UnrealFileIndex index;
-    if (!index.load(shared_unreal_index_path())) {
+    if (!index.load(index_path)) {
         const bool engines_changed = !g.indexed_engine_roots.empty();
         g.indexed_projects.clear();
         g.indexed_engine_roots.clear();
+        have_stamp = false;
+        last_path.clear();
         return engines_changed;
+    }
+
+    if (!stamp_ec) {
+        last_path = index_path;
+        last_write = write_time;
+        have_stamp = true;
     }
 
     std::vector<fs::path> projects;
@@ -4946,7 +4967,10 @@ static void engine_combo_items() {
 
 static void draw_engine_ui() {
     ImGui::TextDisabled("Installed Unreal Engine versions");
-    if (ImGui::Button("Refresh Engines")) discover_engines();
+    if (ImGui::Button("Refresh Engines")) {
+        refresh_index_discovery(true);
+        discover_engines();
+    }
     ImGui::SameLine();
     if (ImGui::Button("Add Engine...")) pick_folder(DialogKind::Engine, g.engine);
 
