@@ -712,6 +712,12 @@ static std::vector<Engine> discover_engines() {
 
     if (!g.engine.empty()) add(g.engine);
     for (const auto& engine : g.known_engines) add(engine);
+
+    uph::UnrealFileIndex index;
+    if (index.load(unreal_index_path())) {
+        for (const auto& root : index.engine_roots()) add(root);
+    }
+
 #ifdef _WIN32
     for (const auto& path : registry_engine_paths()) add(path);
     for (const char* root : {"C:/Program Files/Epic Games", "D:/Epic Games", "H:/unreal"}) {
