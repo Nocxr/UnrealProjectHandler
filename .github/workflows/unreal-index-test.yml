@@ -56,6 +56,16 @@ jobs:
           build\uph-mingw.exe index test
           build\uph-index-service-mingw.exe --self-test
 
+      - name: Fetch GUI headers
+        shell: cmd
+        run: git submodule update --init --depth 1 third_party/imgui third_party/SDL
+
+      - name: Syntax-check GUI with shared index
+        shell: powershell
+        run: |
+          & "C:\mingw64\bin\g++.exe" -std=c++20 -Wall -Wextra -Wpedantic -fsyntax-only -Ithird_party/SDL/include -Ithird_party/imgui -Ithird_party/imgui/backends src/main.cpp src/unreal_file_index.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
