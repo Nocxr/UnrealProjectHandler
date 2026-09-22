@@ -43,6 +43,7 @@ public:
                                          std::size_t limit = 200) const;
 
     const std::vector<UnrealFileRecord>& records() const { return records_; }
+    void replace_records(std::vector<UnrealFileRecord> records);
 
     static std::vector<fs::path> default_roots();
 
