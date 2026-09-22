@@ -260,7 +260,8 @@ bool enumerate_ntfs_mft(const fs::path& root,
 
     if (volume == INVALID_HANDLE_VALUE) {
         warning = "NTFS MFT access unavailable for " + root.string() +
-                  " (error " + std::to_string(GetLastError()) + "); using directory walk.";
+                  " (error " + std::to_string(GetLastError()) +
+                  "). Install/start the UPH index service for fast whole-drive indexing.";
         return false;
     }
 
@@ -290,7 +291,8 @@ bool enumerate_ntfs_mft(const fs::path& root,
             const auto error = GetLastError();
             if (error != ERROR_HANDLE_EOF && error != ERROR_NO_MORE_FILES && !received_any) {
                 warning = "NTFS MFT enumeration failed for " + root.string() +
-                          " (error " + std::to_string(error) + "); using directory walk.";
+                          " (error " + std::to_string(error) +
+                          "). The UPH index service can rebuild this volume with elevated access.";
                 CloseHandle(volume);
                 return false;
             }
@@ -339,7 +341,7 @@ bool enumerate_ntfs_mft(const fs::path& root,
 
     if (!received_any) {
         warning = "NTFS MFT enumeration returned no records for " + root.string() +
-                  "; using directory walk.";
+                  "; refusing a slow whole-drive fallback.";
         return false;
     }
 
@@ -395,10 +397,17 @@ bool UnrealFileIndex::save(const fs::path& cache_path) const {
     out.close();
     if (!out) return false;
 
-    fs::remove(cache_path, ec);
-    ec.clear();
+#ifdef _WIN32
+    const auto destination_w = cache_path.wstring();
+    const auto temporary_w = temporary.wstring();
+    if (MoveFileExW(temporary_w.c_str(), destination_w.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return true;
+    ec = std::error_code(static_cast<int>(GetLastError()), std::system_category());
+#else
     fs::rename(temporary, cache_path, ec);
     if (!ec) return true;
+#endif
 
     ec.clear();
     fs::copy_file(temporary, cache_path, fs::copy_options::overwrite_existing, ec);
@@ -430,10 +439,16 @@ UnrealIndexStats UnrealFileIndex::rebuild(const std::vector<fs::path>& roots) {
 
         bool fast_path = false;
 #ifdef _WIN32
+        const bool whole_ntfs_volume = is_drive_root(root) && is_ntfs_volume(root);
         std::string warning;
         fast_path = enumerate_ntfs_mft(root, records_, warning);
         if (fast_path) {
             ++stats.ntfs_mft_roots;
+        } else if (whole_ntfs_volume) {
+            if (!warning.empty()) stats.warnings.push_back(std::move(warning));
+            else stats.warnings.push_back(
+                "Fast NTFS indexing was unavailable for " + root.string() +
+                "; refusing a slow whole-drive directory walk.");
         } else {
             if (!warning.empty()) stats.warnings.push_back(std::move(warning));
             walk_root(root, records_, stats.warnings);
@@ -496,6 +511,11 @@ std::vector<UnrealFileRecord> UnrealFileIndex::search(const std::string& query,
     result.reserve(scored.size());
     for (const auto& item : scored) result.push_back(*item.record);
     return result;
+}
+
+void UnrealFileIndex::replace_records(std::vector<UnrealFileRecord> records) {
+    records_ = std::move(records);
+    dedupe_and_sort(records_);
 }
 
 std::vector<fs::path> UnrealFileIndex::default_roots() {
