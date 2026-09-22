@@ -704,6 +704,44 @@ bool run_unreal_file_index_self_test(std::string* error_message) {
         return fail("plugin search returned the wrong result");
     }
 
+    UnrealFileIndex classified;
+    classified.replace_records({
+        {UnrealFileKind::Project, fs::path("H:\\projects\\unreal\\MyGame\\MyGame.uproject")},
+        {UnrealFileKind::Plugin, fs::path("H:\\projects\\unreal\\MyPlugin\\MyPlugin.uplugin")},
+        {UnrealFileKind::Plugin, fs::path("H:\\unreal\\UE_5.8\\Engine\\Plugins\\Runtime\\EngineThing.uplugin")},
+        {UnrealFileKind::Project, fs::path("H:\\unreal\\UE_5.8\\Samples\\Games\\Lyra\\Lyra.uproject")},
+        {UnrealFileKind::Project, fs::path("C:\\Users\\Test\\AppData\\Roaming\\Code\\User\\History-abc\\Old.uproject")},
+        {UnrealFileKind::Project, fs::path("H:\\projects\\PluginDev\\HostProject\\HostProject.uproject")},
+        {UnrealFileKind::Project, fs::path("/broken/.uproject")}
+    });
+
+    const auto user_view = classified.search("", true, true, 0);
+    if (user_view.size() != 2) {
+        fs::remove_all(root, ec);
+        return fail("default search did not filter engine/generated descriptors");
+    }
+
+    const auto engine_view = classified.search(
+        "", true, true, 0, UnrealSearchScope::Engine);
+    if (engine_view.size() != 2) {
+        fs::remove_all(root, ec);
+        return fail("engine search scope did not isolate engine descriptors");
+    }
+
+    const auto all_view = classified.search(
+        "", true, true, 0, UnrealSearchScope::All);
+    if (all_view.size() != 7) {
+        fs::remove_all(root, ec);
+        return fail("raw search scope did not preserve all descriptors");
+    }
+
+    const auto view_stats = classified.view_stats();
+    if (view_stats.user_projects != 1 || view_stats.user_plugins != 1 ||
+        view_stats.engine_records != 2 || view_stats.hidden_records != 3) {
+        fs::remove_all(root, ec);
+        return fail("filtered index stats are incorrect");
+    }
+
     fs::remove_all(root, ec);
     if (error_message) error_message->clear();
     return true;
