@@ -1,147 +1,134 @@
-CXX ?= clang++
-CC ?= clang
-IMGUI_DIR := third_party/imgui
-SDL_DIR := third_party/SDL
-SDL_BUILD_DIR := build/SDL
+# Project settings; keep shared command semantics identical across repos.
+PROJECT_NAME := UnrealProjectHandler
+APP_NAME := uph-app
+COMMAND_NAME := uph-app
+BACKEND := legacy
+EXTRA_HELP := app cli service clean-all
+EXTRA_EXECUTABLES = $(BUILD_DIR)/uph.exe;$(BUILD_DIR)/uph-index-service.exe
 
-APP_TARGET := build/uph-app
-CLI_TARGET := build/uph
-SERVICE_TARGET :=
-TARGETS := $(APP_TARGET) $(CLI_TARGET)
-
-APP_SOURCES := src/main.cpp \
-	src/unreal_file_index.cpp \
-	$(IMGUI_DIR)/imgui.cpp \
-	$(IMGUI_DIR)/imgui_draw.cpp \
-	$(IMGUI_DIR)/imgui_tables.cpp \
-	$(IMGUI_DIR)/imgui_widgets.cpp \
-	$(IMGUI_DIR)/backends/imgui_impl_sdl3.cpp \
-	$(IMGUI_DIR)/backends/imgui_impl_opengl3.cpp
-
-CLI_SOURCES := src/cli_main.cpp src/unreal_file_index.cpp
-SERVICE_SOURCES := src/index_service_main.cpp src/unreal_file_index.cpp
-
-WINDOWS_RESOURCES :=
-SDL_TARGETS :=
-RUNTIME_FILES :=
-SDL_CMAKE_GENERATOR :=
-APP_SUBSYSTEM :=
-CLI_SUBSYSTEM :=
-CLI_LIBS :=
-SERVICE_LIBS :=
+# Shared C/C++ commands. Project-specific settings live above this block.
+.DEFAULT_GOAL := all
+.NOTPARALLEL:
+CMAKE ?= cmake
+CTEST ?= ctest
+CONFIG ?= Release
+GENERATOR ?= Ninja
+BUILD_DIR ?= build
+ARGS ?=
+CMAKE_ARGS ?=
+BUILD_ARGS ?=
+EXTRA_EXECUTABLES ?=
+TEST_COMMAND ?= $(CTEST) --test-dir "$(BUILD_DIR)" -C "$(CONFIG)" --output-on-failure --no-tests=error
 
 ifeq ($(OS),Windows_NT)
-    SCOOP_ROOT ?= $(USERPROFILE)/scoop
-    GCC_BIN ?= $(SCOOP_ROOT)/apps/gcc/current/bin
-    MAKE_PROGRAM ?= $(SCOOP_ROOT)/shims/make.exe
-    ifneq ($(wildcard $(GCC_BIN)/gcc.exe),)
-        CC := $(GCC_BIN)/gcc.exe
-    endif
-    ifneq ($(wildcard $(GCC_BIN)/g++.exe),)
-        CXX := $(GCC_BIN)/g++.exe
-        export PATH := $(GCC_BIN);$(PATH)
-    endif
-    ifneq ($(wildcard $(GCC_BIN)/windres.exe),)
-        WINDRES := $(GCC_BIN)/windres.exe
-    endif
-    WINDRES ?= windres
-
-    WINDOWS_RESOURCES := build/uph.res
-    SDL_TARGETS := $(SDL_BUILD_DIR)/libSDL3.dll.a $(SDL_BUILD_DIR)/SDL3.dll
-    RUNTIME_FILES := build/SDL3.dll
-    SDL_CMAKE_GENERATOR := MinGW Makefiles
-
-    APP_TARGET := build/uph-app.exe
-    CLI_TARGET := build/uph.exe
-    SERVICE_TARGET := build/uph-index-service.exe
-    TARGETS := $(APP_TARGET) $(CLI_TARGET) $(SERVICE_TARGET)
-
-    SDL_CFLAGS := -I$(SDL_DIR)/include
-    APP_LIBS := -L$(SDL_BUILD_DIR) -lSDL3 -lopengl32 -lshell32
-    CLI_LIBS := -lshell32 -lole32 -luuid -luser32 -ladvapi32
-    SERVICE_LIBS := -ladvapi32
-    APP_SUBSYSTEM := -mwindows
-    CLI_SUBSYSTEM := -mconsole
-
-    MKDIR := if not exist build mkdir build
-    CLEAN_UPH := if exist build\uph.exe del /Q build\uph.exe & if exist build\uph-index-service.exe del /Q build\uph-index-service.exe & if exist build\uph-app.exe del /Q build\uph-app.exe & if exist build\uph.res del /Q build\uph.res
-    DEEP_CLEAN := if exist build rmdir /S /Q build
+EXE ?= $(BUILD_DIR)/$(APP_NAME).exe
+HELPER := powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/Project-Commands.ps1"
+STOP_CMD = $(HELPER) -Action Stop -Executable "$(EXE)" -ExtraExecutables "$(EXTRA_EXECUTABLES)"
+RUN_CMD = $(HELPER) -Action Run -Executable "$(EXE)" -RunArguments '$(ARGS)'
+CLEAN_CMD = $(HELPER) -Action Clean -BuildDir "$(BUILD_DIR)"
+INSTALL_CMD ?= $(HELPER) -Action Install -Executable "$(EXE)" -CommandName "$(COMMAND_NAME)" -ProjectName "$(PROJECT_NAME)"
+UNINSTALL_CMD ?= $(HELPER) -Action Uninstall -CommandName "$(COMMAND_NAME)"
 else
-    SDL_TARGETS := $(SDL_BUILD_DIR)/libSDL3.dylib
-    SDL_CMAKE_GENERATOR := Unix Makefiles
-    MAKE_PROGRAM ?= make
-    SDL_CFLAGS := -I$(SDL_DIR)/include
-    APP_LIBS := -L$(SDL_BUILD_DIR) -Wl,-rpath,$(abspath $(SDL_BUILD_DIR)) -lSDL3 \
-		-framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo
-    CLI_LIBS :=
-    MKDIR := mkdir -p build
-    CLEAN_UPH := $(RM) -f $(APP_TARGET) $(CLI_TARGET)
-    DEEP_CLEAN := $(RM) -r build
+UNAME_S := $(shell uname -s)
+EXE ?= $(BUILD_DIR)/$(APP_NAME)
+STOP_CMD = sh scripts/project-commands.sh stop "$(EXE)"
+RUN_CMD = "$(EXE)" $(ARGS)
+ifeq ($(UNAME_S),Darwin)
+ifneq ($(MAC_APP),)
+EXE := $(BUILD_DIR)/$(MAC_APP).app/Contents/MacOS/$(APP_NAME)
+RUN_CMD = open "$(BUILD_DIR)/$(MAC_APP).app" --args $(ARGS)
+endif
+endif
+CLEAN_CMD = sh scripts/project-commands.sh clean "$(BUILD_DIR)"
+INSTALL_CMD ?= sh scripts/project-commands.sh install "$(EXE)" "$(COMMAND_NAME)"
+UNINSTALL_CMD ?= sh scripts/project-commands.sh uninstall "$(EXE)" "$(COMMAND_NAME)"
 endif
 
-COMMON_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wpedantic
-APP_CXXFLAGS := $(COMMON_CXXFLAGS) $(SDL_CFLAGS) -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
-CLI_CXXFLAGS := $(COMMON_CXXFLAGS)
+.PHONY: all help configure build run stop kill clean rebuild debug release test install uninstall
+all: build
 
-.PHONY: all app cli service run install clean clean-all rebuild
-all: app cli
+help:
+	@echo "$(PROJECT_NAME): shared C/C++ Makefile commands"
+	@echo "  make / make build   Configure and build (default: Release)"
+	@echo "  make run            Build and launch; ARGS supplies arguments"
+	@echo "  make stop / kill    Stop this checkout's running executable"
+	@echo "  make clean          Stop and remove the build directory"
+	@echo "  make rebuild        Clean and build; does not launch"
+	@echo "  make debug/release  Build the selected configuration"
+	@echo "  make test           Build and run existing tests; fail if none exist"
+	@echo "  make install        Build and register a command pointing to this checkout"
+	@echo "  make uninstall      Remove the registered command"
+	@echo "  Overrides: CONFIG BUILD_DIR GENERATOR ARGS CMAKE_ARGS BUILD_ARGS"
+	@echo "  Project targets: $(EXTRA_HELP)"
 
-app: $(APP_TARGET)
+ifeq ($(BACKEND),legacy)
+configure:
+	@echo "$(PROJECT_NAME) uses its existing compiler backend; no separate configure step."
+	$(CMAKE) -DCONFIG="$(CONFIG)" -DBUILD_DIR="$(BUILD_DIR)" -P scripts/Configure-UPH.cmake
 
+build: stop configure
+	$(MAKE) -f Makefile.backend all $(BUILD_ARGS)
+
+test: build
+	@echo "No automated test runner is configured for $(PROJECT_NAME)."
+	@$(CMAKE) -E false
+
+install: build
+	$(INSTALL_CMD)
 ifeq ($(OS),Windows_NT)
-cli: $(CLI_TARGET) $(SERVICE_TARGET)
-service: $(SERVICE_TARGET)
+	$(HELPER) -Action Install -Executable "$(BUILD_DIR)/uph.exe" -CommandName "uph" -ProjectName "$(PROJECT_NAME)"
+	$(HELPER) -Action Install -Executable "$(BUILD_DIR)/uph-index-service.exe" -CommandName "uph-index-service" -ProjectName "$(PROJECT_NAME)"
 else
-cli: $(CLI_TARGET)
-service:
-	@echo "UPH index service is Windows-only."
+	sh scripts/project-commands.sh install "$(BUILD_DIR)/uph" uph
 endif
 
-$(APP_TARGET): $(APP_SOURCES) $(WINDOWS_RESOURCES) $(SDL_TARGETS) $(RUNTIME_FILES)
-	@$(MKDIR)
-	$(CXX) $(APP_CXXFLAGS) $(APP_SOURCES) $(WINDOWS_RESOURCES) -o $@ $(APP_LIBS) $(APP_SUBSYSTEM)
-
-$(CLI_TARGET): $(CLI_SOURCES)
-	@$(MKDIR)
-	$(CXX) $(CLI_CXXFLAGS) $(CLI_SOURCES) -o $@ $(CLI_LIBS) $(CLI_SUBSYSTEM)
-
+uninstall:
+	$(UNINSTALL_CMD)
 ifeq ($(OS),Windows_NT)
-$(SERVICE_TARGET): $(SERVICE_SOURCES)
-	@$(MKDIR)
-	$(CXX) $(CLI_CXXFLAGS) $(SERVICE_SOURCES) -o $@ $(SERVICE_LIBS) $(CLI_SUBSYSTEM)
-endif
-
-$(SDL_TARGETS): $(SDL_DIR)/CMakeLists.txt
-	cmake -S $(SDL_DIR) -B $(SDL_BUILD_DIR) -G "$(SDL_CMAKE_GENERATOR)" -DCMAKE_MAKE_PROGRAM="$(MAKE_PROGRAM)" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$(CC)" -DCMAKE_CXX_COMPILER="$(CXX)" -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF
-	cmake --build $(SDL_BUILD_DIR) --config Release
-
-ifeq ($(OS),Windows_NT)
-build/SDL3.dll: $(SDL_BUILD_DIR)/SDL3.dll
-	@$(MKDIR)
-	powershell -NoProfile -Command "Copy-Item -Force '$<' '$@'"
-
-$(WINDOWS_RESOURCES): src/uph.rc src/uph.ico
-	@$(MKDIR)
-	$(WINDRES) $< -O coff -o $@
-
-install: all
-	powershell -NoProfile -ExecutionPolicy Bypass -Command "$$dest=Join-Path $$env:LOCALAPPDATA 'UPH\bin'; New-Item -ItemType Directory -Force -Path $$dest | Out-Null; Copy-Item -Force '$(CLI_TARGET)' (Join-Path $$dest 'uph.exe'); Copy-Item -Force '$(SERVICE_TARGET)' (Join-Path $$dest 'uph-index-service.exe'); Copy-Item -Force '$(APP_TARGET)' (Join-Path $$dest 'uph-app.exe'); Copy-Item -Force 'build/SDL3.dll' (Join-Path $$dest 'SDL3.dll'); $$userPath=[Environment]::GetEnvironmentVariable('Path','User'); $$parts=@($$userPath -split ';' | Where-Object { $$_ }); if ($$parts -notcontains $$dest) { [Environment]::SetEnvironmentVariable('Path', (($$parts + $$dest) -join ';'), 'User'); Write-Host 'Added' $$dest 'to your user PATH. Open a new terminal before using uph globally.' } else { Write-Host 'UPH bin is already on your user PATH.' }; Write-Host 'Installed UPH to' $$dest"
+	$(HELPER) -Action Uninstall -CommandName uph
+	$(HELPER) -Action Uninstall -CommandName uph-index-service
 else
-install: all
-	@mkdir -p "$$HOME/.local/bin"
-	@cp -f "$(CLI_TARGET)" "$$HOME/.local/bin/uph"
-	@cp -f "$(APP_TARGET)" "$$HOME/.local/bin/uph-app"
-	@echo "Installed UPH to $$HOME/.local/bin (ensure it is on PATH)."
+	sh scripts/project-commands.sh uninstall "$(BUILD_DIR)/uph" uph
+endif
+else
+configure:
+	$(CMAKE) -S . -B "$(BUILD_DIR)" -G "$(GENERATOR)" -DCMAKE_BUILD_TYPE="$(CONFIG)" $(CMAKE_ARGS)
+
+build: stop configure
+	$(CMAKE) --build "$(BUILD_DIR)" --config "$(CONFIG)" --parallel $(BUILD_ARGS)
+
+test: build
+	$(TEST_COMMAND)
+
+install: build
+	$(INSTALL_CMD)
+
+uninstall:
+	$(UNINSTALL_CMD)
 endif
 
-run: all
-	./$(CLI_TARGET)
+run: build
+	$(RUN_CMD)
 
-clean:
-	$(CLEAN_UPH)
+stop:
+	$(STOP_CMD)
 
-clean-all:
-	$(DEEP_CLEAN)
+kill: stop
+
+clean: stop
+	$(CLEAN_CMD)
 
 rebuild: clean
-	$(MAKE) all
+	$(MAKE) build
+
+debug:
+	$(MAKE) build CONFIG=Debug
+
+release:
+	$(MAKE) build CONFIG=Release
+
+# Preserve the existing UPH compiler backend and its multi-binary install.
+.PHONY: app cli service clean-all
+app cli service: stop
+	$(MAKE) -f Makefile.backend $@
+clean-all: clean
